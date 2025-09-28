@@ -1,0 +1,62 @@
+{
+  "name": "lemon-tls",
+  "version": "0.1.0",
+  "description": "JavaScript TLS 1.3/1.2 implementation for Node.js, with full control over cryptographic keys and record layer",
+  "main": "index.js",
+  "type": "commonjs",
+  "keywords": [
+    "openssl",
+    "boringssl",
+    "cryptlib",
+    "rustls",
+    "low-level",
+    "https",
+    "ssl",
+    "tls",
+    "tls13",
+    "tls12",
+    "nodejs",
+    "javascript",
+    "crypto",
+    "x509",
+    "handshake",
+    "alpn",
+    "sni",
+    "hkdf",
+    "aead",
+    "quic",
+    "http3",
+    "dtls",
+    "sctp",
+    "secure",
+    "network",
+    "backend",
+    "server"
+  ],
+  "author": "colocohen",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/lemon-tls.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/lemon-tls/issues"
+  },
+  "homepage": "https://github.com/colocohen/lemon-tls",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    },
+    {
+      "type": "opencollective",
+      "url": "https://opencollective.com/colocohen"
+    }
+  ],
+  "dependencies": {
+    "@noble/curves": "^2.0.0",
+    "@noble/hashes": "^2.0.0",
+    "@stablelib/aes": "^2.0.1",
+    "@stablelib/gcm": "^2.0.1"
+  }
+}

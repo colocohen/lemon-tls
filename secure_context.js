@@ -1,6 +1,6 @@
-var fs = require('fs');
-var path = require('path');
-var crypto = require('crypto');
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 function looksLikePath(x) {
   return typeof x === 'string' && (x.indexOf('\n') === -1) && (x.length < 4096) &&
@@ -193,4 +193,4 @@ function createSecureContext(options) {
   };
 }
 
-module.exports = createSecureContext;
+export default createSecureContext;

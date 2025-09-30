@@ -1,34 +1,32 @@
-var nobleHashes={
-  hmac: require("@noble/hashes/hmac.js")['hmac'],
-  hkdf: require("@noble/hashes/hkdf.js")['hkdf'],
-  hkdf_extract: require("@noble/hashes/hkdf.js")['extract'],
-  hkdf_expand: require("@noble/hashes/hkdf.js")['expand'],
-  sha256: require("@noble/hashes/sha2.js")['sha256'],
-};
+import { hmac } from '@noble/hashes/hmac.js';
+import { hkdf, extract as hkdf_extract, expand as hkdf_expand } from '@noble/hashes/hkdf.js';
+import { sha256, sha384 } from '@noble/hashes/sha2.js';
 
-var { p256 } = require('@noble/curves/nist.js');
-var { x25519 } = require('@noble/curves/ed25519');
-var { sha256, sha384 } = require('@noble/hashes/sha2');
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 
-var crypto = require('crypto');
+var nobleHashes = { hmac, hkdf, hkdf_extract, hkdf_expand, sha256 };
 
-var {
+import * as crypto from 'crypto';
+
+import {
   TLS_CIPHER_SUITES,
   build_cert_verify_tbs,
   get_handshake_finished,
   derive_handshake_traffic_secrets,
   derive_app_traffic_secrets
-} = require('./crypto');
+} from './crypto.js';
 
-
-var {
+import {
   concatUint8Arrays,
   arraybufferEqual,
   arraysEqual
-} = require('./utils');
+} from './utils.js';
 
 
-var wire = require('./wire');
+import * as wire from './wire.js';
+
+//var wire = require('./wire');
 
 /** מינימל-Emitter בסגנון שלך */
 function Emitter(){
@@ -1438,4 +1436,5 @@ function TLSSession(options){
   return this;
 }
 
-module.exports = TLSSession;
+export default TLSSession;
+

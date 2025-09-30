@@ -1,15 +1,12 @@
+import TLSSession from './tls_session.js';
 
-var TLSSession = require('./tls_session');
+import { AES } from '@stablelib/aes';
+import { GCM } from '@stablelib/gcm';
 
-var { AES } = require('@stablelib/aes');
-var { GCM } = require('@stablelib/gcm');
-
-var {
-    TLS_CIPHER_SUITES,
-    hkdf_expand_label
-} = require('./crypto');
-
-
+import {
+  TLS_CIPHER_SUITES,
+  hkdf_expand_label
+} from './crypto.js';
 
 function Emitter(){
   var listeners = {};
@@ -453,4 +450,4 @@ function TLSSocket(duplex, options){
     return this;
 }
 
-module.exports = TLSSocket;
+export default TLSSocket;

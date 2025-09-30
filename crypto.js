@@ -1,12 +1,22 @@
-var { hmac: nobleHmac } = require('@noble/hashes/hmac');
-var { hkdf, extract: hkdf_extract_noble, expand: hkdf_expand_noble } = require('@noble/hashes/hkdf');
-var { sha256, sha384 } = require('@noble/hashes/sha2');
-var { p256 } = require('@noble/curves/nist');       // אם תרצה להשתמש בהמשך
-var { x25519 } = require('@noble/curves/ed25519');  // אם תרצה להשתמש בהמשך
 
-var {
-  concatUint8Arrays,
-} = require('./utils');
+import {
+  concatUint8Arrays
+} from './utils.js';
+
+import { hmac as nobleHmac } from '@noble/hashes/hmac.js';
+import { hkdf, extract as hkdf_extract_noble, expand as hkdf_expand_noble } from '@noble/hashes/hkdf.js';
+import { sha256, sha384 } from '@noble/hashes/sha2.js';
+
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519, x25519 } from '@noble/curves/ed25519.js';
+
+var nobleHashes = { 
+  hmac: nobleHmac,
+  hkdf: hkdf,
+  hkdf_extract: hkdf_extract_noble,
+  hkdf_expand: hkdf_expand_noble,
+  sha256: sha256,
+};
 
 
 
@@ -365,19 +375,17 @@ function get_handshake_finished(hashName, traffic_secret, transcript) {
 }
 
 // --- Exports ---
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    TLS_CIPHER_SUITES,
-    getHashFn,
-    getHashLen,
-    hmac,
-    hkdf_extract,
-    hkdf_expand,
-    build_hkdf_label,
-    hkdf_expand_label,
-    derive_handshake_traffic_secrets,
-    derive_app_traffic_secrets,
-    build_cert_verify_tbs,
-    get_handshake_finished
-  };
-}
+export {
+  TLS_CIPHER_SUITES,
+  getHashFn,
+  getHashLen,
+  hmac,
+  hkdf_extract,
+  hkdf_expand,
+  build_hkdf_label,
+  hkdf_expand_label,
+  derive_handshake_traffic_secrets,
+  derive_app_traffic_secrets,
+  build_cert_verify_tbs,
+  get_handshake_finished
+};

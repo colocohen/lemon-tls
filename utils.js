@@ -81,7 +81,8 @@ function arraysEqual(a, b) {
 };
 
 
-module.exports = {
+
+export {
   concatUint8Arrays,
   arraybufferEqual,
   arraysEqual

@@ -42,12 +42,11 @@ npm i lemon-tls
 
 ## 🚀 Example
 ```js
-var fs = require('fs');
-var net = require("net");
-var tls = require('lemon-tls');
+import net from 'node:net';
+import fs from 'node:fs';
+import tls from 'lemon-tls';
 
 // Example: TLS server over TCP
-
 var server = net.createServer(function(tcp){
   
   var socket = new tls.TLSSocket(tcp, { 
@@ -68,7 +67,6 @@ var server = net.createServer(function(tcp){
     console.log('[SRV] secure handshake established');
     
     socket.write(new TextEncoder().encode('hi'));
-
   });
 
   socket.on('data', function(c){

@@ -1,15 +1,18 @@
 
-var TLSSession = require('./tls_session');
-var TLSSocket = require('./tls_socket');
-var createSecureContext = require('./secure_context');
+import TLSSession from './tls_session.js';
+import TLSSocket from './tls_socket.js';
+import createSecureContext from './secure_context.js';
 //var {createServer} = require('./tls_server');
 //var constants = require('./constants');
 
-module.exports = {
-  TLSSession: TLSSession,
-  TLSSocket: TLSSocket,
-  createSecureContext: createSecureContext,
-  //createServer: createServer
-  //DEFAULT_CIPHERS: constants.DEFAULT_CIPHERS,
-  //DEFAULT_SIGALGS: constants.DEFAULT_SIGALGS
+export { TLSSocket, TLSSession, createSecureContext };
+
+export default {
+  TLSSocket,
+  TLSSession,
+  createSecureContext
 };
+
+  // createServer,
+  // DEFAULT_CIPHERS: constants.DEFAULT_CIPHERS,
+  // DEFAULT_SIGALGS: constants.DEFAULT_SIGALGS

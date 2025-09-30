@@ -1,8 +1,7 @@
 
-
-var {
-  concatUint8Arrays,
-} = require('./utils');
+import {
+  concatUint8Arrays
+} from './utils.js';
 
 
 var TLS_VERSION = {
@@ -1320,62 +1319,59 @@ function parse_message(buf) {
 
 
 
-
 /* ================================ Exports ================================= */
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    TLS_VERSION,
-    TLS_MESSAGE_TYPE,
-    TLS_EXT,
+export {
+  TLS_VERSION,
+  TLS_MESSAGE_TYPE,
+  TLS_EXT,
 
-    w_u8,
-    w_u16,
-    w_u24,
-    w_bytes,
-    r_u8,
-    r_u16,
-    r_u24,
-    r_bytes,
-    veclen,
-    readVec,
+  w_u8,
+  w_u16,
+  w_u24,
+  w_bytes,
+  r_u8,
+  r_u16,
+  r_u24,
+  r_bytes,
+  veclen,
+  readVec,
 
-    exts,
-    build_extensions,
-    parse_extensions,
+  exts,
+  build_extensions,
+  parse_extensions,
 
-    build_message,
-    parse_message,
-    build_hello,
-    parse_hello,
+  build_message,
+  parse_message,
+  build_hello,
+  parse_hello,
 
-    build_certificate,
-    parse_certificate,
+  build_certificate,
+  parse_certificate,
 
-    build_certificate_verify,
-    parse_certificate_verify,
+  build_certificate_verify,
+  parse_certificate_verify,
 
-    build_new_session_ticket,
-    parse_new_session_ticket,
+  build_new_session_ticket,
+  parse_new_session_ticket,
 
-    build_certificate_request,
-    parse_certificate_request,
+  build_certificate_request,
+  parse_certificate_request,
 
-    
-    build_hello_retry_request,
+  build_hello_retry_request,
 
-    build_server_key_exchange_ecdhe,
-    parse_server_key_exchange,
+  build_server_key_exchange_ecdhe,
+  parse_server_key_exchange,
 
-    build_client_key_exchange_ecdhe,
-    parse_client_key_exchange_ecdhe,
+  build_client_key_exchange_ecdhe,
+  parse_client_key_exchange_ecdhe,
 
-    build_client_key_exchange_rsa,
-    parse_client_key_exchange_rsa,
+  build_client_key_exchange_rsa,
+  parse_client_key_exchange_rsa,
 
-    build_new_session_ticket_tls12,
-    parse_new_session_ticket_tls12
-  };
-}
+  build_new_session_ticket_tls12,
+  parse_new_session_ticket_tls12
+};
+
 
 
 

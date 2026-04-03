@@ -28,7 +28,7 @@ import * as wire from './wire.js';
 // Extracted modules
 import { pick_scheme, sign_with_scheme } from './session/signing.js';
 import createSecureContext from './secure_context.js';
-import { x25519_get_public_key, x25519_get_shared_secret, p256_generate_keypair, p256_get_shared_secret } from './session/ecdh.js';
+import { x25519_get_public_key, x25519_get_shared_secret, p256_generate_keypair, p256_get_shared_secret, p384_generate_keypair, p384_get_shared_secret } from './session/ecdh.js';
 import { build_tls_message, parse_tls_message } from './session/message.js';
 
 
@@ -57,7 +57,7 @@ function TLSSession(options){
 
     //local stuff...
     local_sni: options.servername || null,
-    local_session_id: null,
+    local_session_id: 'sessionId' in options ? options.sessionId : null,
 
     local_random: null,
     local_extensions: [],
@@ -267,18 +267,25 @@ function TLSSession(options){
         if (!hrrCipher) hrrCipher = 0x1301;
         let hashName = TLS_CIPHER_SUITES[hrrCipher] ? TLS_CIPHER_SUITES[hrrCipher].hash : 'sha256';
 
-        // Replace transcript: CH1 → message_hash
+        // Replace transcript: CH1 → message_hash (RFC 8446 §4.4.1)
+        // BUG FIX: The HRR was already pushed to transcript at the top of this block (line 195).
+        // We must remove it before hashing, since message_hash = Hash(ClientHello1) only.
+        let hrrData = context.transcript.pop(); // remove HRR
         let ch1_hash = getHashFn(hashName)(concatUint8Arrays(context.transcript));
         let message_hash = wire.build_message(wire.TLS_MESSAGE_TYPE.MESSAGE_HASH, ch1_hash);
-        context.transcript = [message_hash, data]; // message_hash + HRR
+        context.transcript = [message_hash, hrrData]; // message_hash + HRR
 
-        // Find the requested group from HRR extensions
+        // Find the requested group from HRR key_share extension
+        // After wire.js fix, key_groups contains [{group: N, key_exchange: empty}] for HRR
         let requestedGroup = null;
-        if (message.supported_groups && message.supported_groups.length > 0) {
-          requestedGroup = message.supported_groups[0];
-        } else if (message.key_groups && message.key_groups.length > 0) {
+        if (message.key_groups && message.key_groups.length > 0) {
           requestedGroup = message.key_groups[0].group;
+        } else if (message.supported_groups && message.supported_groups.length > 0) {
+          requestedGroup = message.supported_groups[0];
         }
+
+        // Extract cookie from HRR (if present, must be echoed in CH2)
+        let hrrCookie = message.cookie || null;
 
         if (requestedGroup) {
           // Generate key for the requested group
@@ -292,20 +299,51 @@ function TLSSession(options){
             let kp = p256_generate_keypair();
             newKeyGroup = { group: requestedGroup, public_key: kp.public_key, private_key: kp.private_key };
             context.local_key_groups[requestedGroup] = { public_key: kp.public_key, private_key: kp.private_key };
+          } else if (requestedGroup === 0x0018) {
+            let kp = p384_generate_keypair();
+            newKeyGroup = { group: requestedGroup, public_key: kp.public_key, private_key: kp.private_key };
+            context.local_key_groups[requestedGroup] = { public_key: kp.public_key, private_key: kp.private_key };
           }
 
           if (newKeyGroup) {
-            // Build and send new ClientHello (CH2) with key_share for requested group
+            // Build and send new ClientHello (CH2) with:
+            // - key_share for requested group
+            // - cookie (if HRR included one)
+            // - ALPN (same as CH1)
+            // - custom extensions (QUIC transport params etc.)
+            // - same cipher_suites, session_id, random as CH1
             let extensions = [
               { type: 'SUPPORTED_VERSIONS', value: context.local_supported_versions },
               { type: 'SUPPORTED_GROUPS', value: context.local_supported_groups },
               { type: 'KEY_SHARE', value: [{ group: requestedGroup, key_exchange: newKeyGroup.public_key }] },
-              { type: 'SIGNATURE_ALGORITHMS', value: context.local_supported_signature_algorithms.length > 0 ?
-                  context.local_supported_signature_algorithms : [0x0804, 0x0805, 0x0806, 0x0403, 0x0503, 0x0603, 0x0401, 0x0501, 0x0601] },
+              { type: 'SIGNATURE_ALGORITHMS', value: [
+                  // Must match CH1 exactly (RFC 8446 §4.1.2)
+                  0x0804, 0x0805, 0x0806,
+                  0x0403, 0x0503, 0x0603,
+                  0x0807, 0x0808,
+                  0x0401, 0x0501, 0x0601
+              ] },
               { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) },
-              { type: 23, data: new Uint8Array(0) },
+              { type: 23, data: new Uint8Array(0) }, // extended_master_secret
             ];
+
+            // SNI (must be first)
             if (context.local_sni) extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
+
+            // ALPN (same as CH1 — required for QUIC/h3)
+            if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
+              extensions.push({ type: 'ALPN', value: context.local_supported_alpns });
+            }
+
+            // Cookie from HRR (RFC 8446 §4.2.2 — MUST echo if present)
+            if (hrrCookie) {
+              extensions.push({ type: 'COOKIE', value: hrrCookie });
+            }
+
+            // Custom extensions (e.g. QUIC transport params 0x39)
+            for (let ci in context.local_extensions) {
+              extensions.push(context.local_extensions[ci]);
+            }
 
             let ch2 = build_tls_message({
               type: 'client_hello',
@@ -780,6 +818,9 @@ function TLSSession(options){
         if(context.remote_app_traffic_secret==null && options.remote_app_traffic_secret!==null){
           context.remote_app_traffic_secret=options.remote_app_traffic_secret;
           has_changed=true;
+          if(context.local_app_traffic_secret!==null){
+            ev.emit('appSecrets', context.local_app_traffic_secret, context.remote_app_traffic_secret);
+          }
         }
       }
 
@@ -787,6 +828,9 @@ function TLSSession(options){
         if(context.local_app_traffic_secret==null && options.local_app_traffic_secret!==null){
           context.local_app_traffic_secret=options.local_app_traffic_secret;
           has_changed=true;
+          if(context.remote_app_traffic_secret!==null){
+            ev.emit('appSecrets', context.local_app_traffic_secret, context.remote_app_traffic_secret);
+          }
         }
       }
 
@@ -948,6 +992,20 @@ function TLSSession(options){
             }
           ];
 
+        } else if (context.selected_group === 0x0018) {
+
+          let kp = p384_generate_keypair();
+          let private_key = kp.private_key;
+          let public_key  = kp.public_key;
+
+          params_to_set['add_local_key_groups']=[
+            {
+              group: context.selected_group,
+              private_key: private_key,
+              public_key: public_key
+            }
+          ];
+
         }
 
         
@@ -971,6 +1029,12 @@ function TLSSession(options){
           } else if (context.selected_group === 0x0017) { // secp256r1 (P-256)
 
             let ecdhe_shared_secret = p256_get_shared_secret(local_private_key, remote_public_key);
+
+            params_to_set['ecdhe_shared_secret']=ecdhe_shared_secret;
+
+          } else if (context.selected_group === 0x0018) { // secp384r1 (P-384)
+
+            let ecdhe_shared_secret = p384_get_shared_secret(local_private_key, remote_public_key);
 
             params_to_set['ecdhe_shared_secret']=ecdhe_shared_secret;
 
@@ -1003,6 +1067,7 @@ function TLSSession(options){
             cipher_suite: context.selected_cipher_suite,
             selected_version: wire.TLS_VERSION.TLS1_3,
             selected_group: context.selected_group,
+            session_id: context.remote_session_id,
           });
           let hrr_data = wire.build_message(wire.TLS_MESSAGE_TYPE.SERVER_HELLO, hrr_body);
           context.transcript.push(hrr_data);
@@ -1027,7 +1092,10 @@ function TLSSession(options){
           if(context.selected_version!==null && context.selected_cipher_suite!==null && context.selected_session_id!==null){
             if(context.selected_version === wire.TLS_VERSION.TLS1_3){
               if(context.selected_group in context.local_key_groups==true && context.local_key_groups[context.selected_group].public_key!==null){
-                can_send_hello=true;
+                // After HRR, don't send ServerHello until CH2 provides the requested key_share
+                if (!context.helloRetried || (context.selected_group in context.remote_key_groups)) {
+                  can_send_hello=true;
+                }
               }
             }else if(context.selected_version === wire.TLS_VERSION.TLS1_2){
               can_send_hello=true;
@@ -1926,6 +1994,16 @@ function TLSSession(options){
         extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
       }
 
+      // Add ALPN if provided (e.g. 'h3' for QUIC)
+      if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
+        extensions.push({ type: 'ALPN', value: context.local_supported_alpns });
+      }
+
+      // Add custom extensions (e.g. QUIC transport params 0x39)
+      for (let i in context.local_extensions) {
+        extensions.push(context.local_extensions[i]);
+      }
+
       // PSK resumption: check if session/psk was provided
       let pskData = options.session || options.psk || null;
       let message_data;
@@ -2144,7 +2222,7 @@ function TLSSession(options){
         cipher: context.selected_cipher_suite,
         cipherName: cipherInfo ? cipherInfo.name : null,
         group: context.selected_group,
-        groupName: context.selected_group === 0x001d ? 'X25519' : context.selected_group === 0x0017 ? 'P-256' : null,
+        groupName: context.selected_group === 0x001d ? 'X25519' : context.selected_group === 0x0017 ? 'P-256' : context.selected_group === 0x0018 ? 'P-384' : null,
         signatureAlgorithm: context.selected_signature_algorithm,
         alpn: context.selected_alpn,
         sni: context.selected_sni || context.local_sni,

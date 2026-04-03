@@ -220,6 +220,7 @@ exts.SIGNATURE_ALGORITHMS = { encode: null, decode: null };
 exts.PSK_KEY_EXCHANGE_MODES = { encode: null, decode: null };
 exts.KEY_SHARE = { encode: null, decode: null };
 exts.ALPN = { encode: null, decode: null };
+exts.COOKIE = { encode: null, decode: null };
 exts.RENEGOTIATION_INFO = { encode: null, decode: null };
 
 /* ------------------------------ SERVER_NAME (0) ------------------------------ */
@@ -527,6 +528,13 @@ exts.KEY_SHARE.encode = function (value) {
 };
 
 exts.KEY_SHARE.decode = function (data) {
+  // HelloRetryRequest form: just NamedGroup (2 bytes, no key_exchange)
+  if (data.length === 2) {
+    let g, off = 0;
+    [g, off] = r_u16(data, off);
+    return [{ group: g, key_exchange: new Uint8Array(0) }];
+  }
+
   // Try ServerHello form: group(2) + len(2) + key
   if (data.length >= 4) {
     let g, off = 0;
@@ -625,6 +633,19 @@ exts.RENEGOTIATION_INFO.decode = function (data) {
   let v;
   [v, off] = readVec(data, off, 1);
   return v; // return raw bytes (Uint8Array)
+};
+
+/* -------------------------------- COOKIE (44) -------------------------------- */
+exts.COOKIE.encode = function (value) {
+  let v = toU8(value || new Uint8Array(0));
+  return veclen(2, v);
+};
+
+exts.COOKIE.decode = function (data) {
+  let off = 0;
+  let v;
+  [v, off] = readVec(data, off, 2);
+  return v; // Uint8Array — opaque cookie
 };
 
 /* ============================= Extensions helpers ============================= */
@@ -1204,21 +1225,23 @@ function parse_certificate_request(body) {
 
 /* ============================== TLS 1.3 HelloRetryRequest ============================== */
 function build_hello_retry_request(params) {
-  // params: { cipher_suite, selected_version, selected_group, cookie?: Uint8Array|string, other_exts?: list }
+  // params: { cipher_suite, selected_version, selected_group, session_id?, cookie?, other_exts? }
   let rnd = TLS13_HRR_RANDOM;
-  const sid = new Uint8Array(0);
+  let sid = (params && params.session_id) ? toU8(params.session_id) : new Uint8Array(0);
   let legacy_version = TLS_VERSION.TLS1_2;
 
   let extList = [];
   // supported_versions (selected)
   extList.push({ type: 'SUPPORTED_VERSIONS', value: (params && params.selected_version) || TLS_VERSION.TLS1_3 });
-  // key_share: only selected_group (no key)
+  // key_share: HRR format = just NamedGroup (2 bytes), NOT ServerHello format
   if (params && params.selected_group != null) {
-    extList.push({ type: 'KEY_SHARE', value: { selected_group: params.selected_group, key_exchange: new Uint8Array(0) } });
+    let ks_data = new Uint8Array(2);
+    ks_data[0] = (params.selected_group >> 8) & 0xff;
+    ks_data[1] = params.selected_group & 0xff;
+    extList.push({ type: 0x0033, data: ks_data });
   }
   // cookie if supplied
   if (params && params.cookie) {
-    if (!exts.COOKIE) { exts.COOKIE = { encode: function(v){ return veclen(2, toU8(v||'')); }, decode: function(d){ let off=0,v; [v,off]=readVec(d,0,2); return v; } }; }
     extList.push({ type: 'COOKIE', value: params.cookie });
   }
   // other extensions passthrough
@@ -1229,12 +1252,13 @@ function build_hello_retry_request(params) {
   let extsBuf = build_extensions(extList);
   let cipher_suite = (params && typeof params.cipher_suite==='number') ? params.cipher_suite : 0x1301;
 
-  // Wire = legacy_version + random + sid + cipher_suite + compression(0) + extensions
-  const out = new Uint8Array(2 + 32 + 1 + 0 + 2 + 1 + extsBuf.length);
+  // Wire = legacy_version + random + sid_len + sid + cipher_suite + compression(0) + extensions
+  const out = new Uint8Array(2 + 32 + 1 + sid.length + 2 + 1 + extsBuf.length);
   let off = 0;
   off = w_u16(out, off, legacy_version);
   off = w_bytes(out, off, rnd);
-  off = w_u8(out, off, 0);
+  off = w_u8(out, off, sid.length);
+  if (sid.length > 0) off = w_bytes(out, off, sid);
   off = w_u16(out, off, cipher_suite);
   off = w_u8(out, off, 0);
   off = w_bytes(out, off, extsBuf);

@@ -53,9 +53,33 @@ function p256_get_shared_secret(localPrivateRaw, remotePublicRaw) {
   return new Uint8Array(ecdh.computeSecret(Buffer.from(remotePublicRaw)));
 }
 
+/**
+ * Generate a P-384 keypair. Returns { private_key: Uint8Array(48), public_key: Uint8Array(97) }.
+ * Public key is uncompressed format (0x04 || x || y).
+ */
+function p384_generate_keypair() {
+  let ecdh = crypto.createECDH('secp384r1');
+  ecdh.generateKeys();
+  return {
+    private_key: new Uint8Array(ecdh.getPrivateKey()),
+    public_key: new Uint8Array(ecdh.getPublicKey(null, 'uncompressed'))
+  };
+}
+
+/**
+ * Compute P-384 shared secret (raw x-coordinate, 48 bytes).
+ */
+function p384_get_shared_secret(localPrivateRaw, remotePublicRaw) {
+  let ecdh = crypto.createECDH('secp384r1');
+  ecdh.setPrivateKey(Buffer.from(localPrivateRaw));
+  return new Uint8Array(ecdh.computeSecret(Buffer.from(remotePublicRaw)));
+}
+
 export {
   x25519_get_public_key,
   x25519_get_shared_secret,
   p256_generate_keypair,
-  p256_get_shared_secret
+  p256_get_shared_secret,
+  p384_generate_keypair,
+  p384_get_shared_secret
 };

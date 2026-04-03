@@ -1,37 +1,96 @@
 {
   "name": "lemon-tls",
-  "version": "0.1.1",
-  "description": "JavaScript TLS 1.3/1.2 implementation for Node.js, with full control over cryptographic keys and record layer",
+  "version": "0.2.0",
+  "description": "Zero-dependency TLS 1.3/1.2 implementation for Node.js — full control over cryptographic keys, record layer, and handshake. Drop-in replacement for node:tls with advanced options impossible in OpenSSL.",
   "main": "index.js",
   "type": "module",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.cjs",
+      "default": "./index.js"
+    },
+    "./wire": "./src/wire.js",
+    "./crypto": "./src/crypto.js",
+    "./record": "./src/record.js",
+    "./session": "./src/tls_session.js"
+  },
+  "scripts": {
+    "test": "node tests/test_all.js",
+    "test:https": "node tests/test_https.js",
+    "test:compat": "node tests/test_compat.js",
+    "test:all": "node tests/test_all.js && node tests/test_compat.js"
+  },
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "lemontls.svg"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "keywords": [
-    "openssl",
-    "boringssl",
-    "cryptlib",
-    "rustls",
-    "low-level",
-    "https",
-    "ssl",
     "tls",
     "tls13",
     "tls12",
-    "nodejs",
-    "javascript",
+    "tls-1.3",
+    "tls-1.2",
+    "ssl",
+    "https",
+    "secure",
     "crypto",
-    "x509",
+    "cryptography",
+    "encryption",
     "handshake",
-    "alpn",
-    "sni",
+    "x509",
+    "certificate",
+    "mtls",
+    "mutual-tls",
+    "client-certificate",
+    "psk",
+    "session-resumption",
+    "session-tickets",
+    "key-update",
+    "hello-retry-request",
     "hkdf",
     "aead",
+    "aes-gcm",
+    "chacha20",
+    "chacha20-poly1305",
+    "x25519",
+    "p256",
+    "ecdhe",
+    "rsa-pss",
+    "ecdsa",
+    "sni",
+    "alpn",
+    "ja3",
+    "ja3-fingerprint",
+    "fingerprint",
+    "certificate-pinning",
+    "keylog",
+    "wireshark",
     "quic",
     "http3",
     "dtls",
-    "sctp",
-    "secure",
+    "record-layer",
+    "pure-javascript",
+    "zero-dependencies",
+    "no-openssl",
+    "no-native",
+    "nodejs",
+    "node",
+    "javascript",
+    "security",
     "network",
-    "backend",
-    "server"
+    "protocol",
+    "drop-in-replacement"
   ],
   "author": "colocohen",
   "license": "Apache-2.0",
@@ -51,12 +110,11 @@
     {
       "type": "opencollective",
       "url": "https://opencollective.com/colocohen"
+    },
+    {
+      "type": "buymeacoffee",
+      "url": "https://buymeacoffee.com/colocohen"
     }
   ],
-  "dependencies": {
-    "@noble/curves": "^2.0.0",
-    "@noble/hashes": "^2.0.1",
-    "@stablelib/aes": "^2.0.1",
-    "@stablelib/gcm": "^2.0.1"
-  }
+  "dependencies": {}
 }

@@ -554,6 +554,16 @@ function get_handshake_finished(hashName, traffic_secret, transcript) {
 
 
 // ============================================================
+//  DTLS 1.3: record number encryption key (RFC 9147 §5.9)
+// ============================================================
+
+function derive_sn_key(hashName, traffic_secret, cipher_suite) {
+  let keylen = TLS_CIPHER_SUITES[cipher_suite].keylen;
+  return hkdf_expand_label(hashName, traffic_secret, 'sn', new Uint8Array(0), keylen);
+}
+
+
+// ============================================================
 //  Exports — identical API surface
 // ============================================================
 
@@ -576,5 +586,6 @@ export {
   compute_psk_binder,
   derive_handshake_traffic_secrets_psk,
   build_cert_verify_tbs,
-  get_handshake_finished
+  get_handshake_finished,
+  derive_sn_key,
 };

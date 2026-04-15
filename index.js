@@ -20,6 +20,14 @@ import {
   DEFAULT_MAX_VERSION,
 } from './src/compat.js';
 
+// DTLS
+import DTLSSession from './src/dtls_session.js';
+import {
+  DTLSSocket,
+  createDTLSServer,
+  connectDTLS,
+} from './src/dtls_socket.js';
+
 /**
  * Crypto primitives for QUIC and custom transport consumers.
  */
@@ -45,15 +53,16 @@ export {
   crypto,
   wire,
   record,
+
+  // DTLS
+  DTLSSession,
+  DTLSSocket,
+  createDTLSServer,
+  connectDTLS,
 };
 
 /**
- * Default export — Node.js tls API compatible.
- *
- * Usage:
- *   import tls from 'lemon-tls';
- *   tls.connect(443, 'example.com', { ... });
- *   tls.createServer({ key, cert }, (socket) => { ... });
+ * Default export — Node.js tls API compatible + DTLS.
  */
 export default {
   TLSSocket,
@@ -67,4 +76,10 @@ export default {
   crypto,
   wire,
   record,
+
+  // DTLS
+  DTLSSession,
+  DTLSSocket,
+  createDTLSServer,
+  connectDTLS,
 };

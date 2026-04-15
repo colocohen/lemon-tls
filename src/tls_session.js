@@ -108,6 +108,7 @@ function TLSSession(options){
 
 
     transcript: [],
+    transcriptHook: null,  // DTLSSession sets this to transform transcript entries
 
 
     //both
@@ -162,6 +163,9 @@ function TLSSession(options){
     // HelloRetryRequest
     helloRetried: false,                      // true if HRR was sent/received
 
+    // DTLS cookie (set by DTLSSession via set_context)
+    dtls_cookie: undefined,                   // Uint8Array or undefined
+
     // TLS 1.3 resumption
     tls13_master_secret: null,
     resumption_master_secret: null,
@@ -172,6 +176,19 @@ function TLSSession(options){
     psk_accepted: false,     // server accepted PSK → abbreviated handshake
     isResumed: false,        // true if PSK was accepted
   };
+
+  /**
+   * Push a handshake message to the transcript.
+   * If a transcriptHook is set (by DTLSSession), it transforms the data first.
+   * This allows DTLS 1.2 to store DTLS-format entries (with reconstruction data)
+   * while TLS and DTLS 1.3 store standard TLS-format entries.
+   */
+  function pushTranscript(data) {
+    if (context.transcriptHook) {
+      data = context.transcriptHook(data);
+    }
+    context.transcript.push(data);
+  }
 
   function process_income_message(data){
 
@@ -192,7 +209,7 @@ function TLSSession(options){
 
     if((context.isServer==false && message.type=='server_hello') || (context.isServer==true && message.type=='client_hello')){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
       // Save raw ClientHello + emit event (server side)
       if (context.isServer && message.type === 'client_hello') {
@@ -350,11 +367,12 @@ function TLSSession(options){
               version: 0x0303,
               random: context.local_random,
               session_id: context.local_session_id,
+              cookie: context.dtls_cookie,
               cipher_suite: context.local_supported_cipher_suites,
               extensions: extensions,
             });
 
-            context.transcript.push(ch2);
+            pushTranscript(ch2);
             ev.emit('message', 0, context.message_sent_seq, 'hello', ch2);
             context.message_sent_seq++;
           }
@@ -368,7 +386,9 @@ function TLSSession(options){
         remote_random: message.random || null,
         remote_sni: message.sni || null,
         remote_session_id: message.session_id || null,
-        remote_supported_versions: message.supported_versions || [],
+        remote_supported_versions: (message.supported_versions && message.supported_versions.length > 0)
+          ? message.supported_versions
+          : (message.legacy_version ? [message.legacy_version] : []),
         remote_supported_alpns: message.alpn || [],
         remote_supported_cipher_suites: message.cipher_suites || [],
         remote_supported_signature_algorithms: message.signature_algorithms || [],
@@ -396,21 +416,27 @@ function TLSSession(options){
 
     }else if(message.type=='client_key_exchange' || message.type=='server_key_exchange'){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
       if ([0xC02F,0xC02B,0xC030,0xC02C,0xC013,0xC014,0xC009,0xC00A].includes(context.selected_cipher_suite)==true) {//ECDHE
 
         // ServerKeyExchange carries the group; ClientKeyExchange does not (server already chose it)
         let kex_group = message.group || context.selected_group;
 
-        set_context({
+        let kex_updates = {
           add_remote_key_groups: [
             {
               group: kex_group,
               public_key: message.public_key
             }
           ],
-        });
+        };
+        // TLS 1.2 client: selected_group isn't set from ServerHello (no supported_groups ext).
+        // Set it from the SKE group so the reactive loop can generate a keypair and build CKE.
+        if (context.selected_group === null && kex_group) {
+          kex_updates.selected_group = kex_group;
+        }
+        set_context(kex_updates);
 
       }else if ([0x009E,0x009F,0x0033,0x0039,0x0067,0x006B].includes(context.selected_cipher_suite)==true) {//DHE
 
@@ -426,7 +452,7 @@ function TLSSession(options){
 
     }else if(message.type=='server_hello_done'){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
 
       set_context({
@@ -435,7 +461,7 @@ function TLSSession(options){
 
     }else if(message.type=='encrypted_extensions'){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
       set_context({
         remote_supported_groups: message.supported_groups || [],
@@ -443,7 +469,7 @@ function TLSSession(options){
 
     }else if(message.type=='certificate'){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
       set_context({
         remote_cert_chain: message.entries,
@@ -458,7 +484,7 @@ function TLSSession(options){
 
     }else if(message.type=='certificate_verify'){
 
-      context.transcript.push(data);
+      pushTranscript(data);
 
     }else if(message.type=='finished'){
 
@@ -487,7 +513,7 @@ function TLSSession(options){
     }else if(message.type=='key_update'){
 
       // Peer is updating their traffic secret (we update our read key)
-      if(context.state==='connected' && context.selected_version === wire.TLS_VERSION.TLS1_3){
+      if(context.state==='connected' && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
         let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
         let hashLen = getHashLen(hashName);
         let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen);
@@ -512,7 +538,7 @@ function TLSSession(options){
 
       // Server is requesting a client certificate (TLS 1.3)
       if(!context.isServer){
-        context.transcript.push(data);
+        pushTranscript(data);
         context.certificateRequested = true;
         context.certificateRequestContext = message.certificate_request_context || new Uint8Array(0);
         context.certificateRequestSigAlgs = message.signature_algorithms || [];
@@ -871,7 +897,10 @@ function TLSSession(options){
         }
       }
 
-      
+      if('dtls_cookie' in options){
+        context.dtls_cookie=options.dtls_cookie;
+        has_changed=true;
+      }
 
 
     }
@@ -900,6 +929,16 @@ function TLSSession(options){
         }
 
         if('selected_version' in params_to_set==false || params_to_set.selected_version==null){
+        }
+
+        // TLS 1.2: clear key_share groups from ClientHello.
+        // key_share is a TLS 1.3 extension; in TLS 1.2, keys come from CKE/SKE.
+        // Without this, the server would compute the shared secret too early
+        // (using CH key_share instead of waiting for CKE).
+        if (context.isServer && params_to_set.selected_version !== null &&
+            params_to_set.selected_version !== wire.TLS_VERSION.TLS1_3 &&
+            params_to_set.selected_version !== wire.DTLS_VERSION.DTLS1_3) {
+          context.remote_key_groups = {};
         }
       }
 
@@ -1050,7 +1089,7 @@ function TLSSession(options){
       if(context.isServer==true){
 
         // HelloRetryRequest: if we selected a group but client didn't send a key_share for it
-        if(context.hello_sent==false && !context.helloRetried && context.selected_version === wire.TLS_VERSION.TLS1_3 &&
+        if(context.hello_sent==false && !context.helloRetried && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) &&
            context.selected_group !== null && context.selected_cipher_suite !== null &&
            !(context.selected_group in context.remote_key_groups)){
 
@@ -1065,12 +1104,12 @@ function TLSSession(options){
           // Build and send HRR (it's a ServerHello with magic random)
           let hrr_body = wire.build_hello_retry_request({
             cipher_suite: context.selected_cipher_suite,
-            selected_version: wire.TLS_VERSION.TLS1_3,
+            selected_version: context.selected_version,
             selected_group: context.selected_group,
             session_id: context.remote_session_id,
           });
           let hrr_data = wire.build_message(wire.TLS_MESSAGE_TYPE.SERVER_HELLO, hrr_body);
-          context.transcript.push(hrr_data);
+          pushTranscript(hrr_data);
 
           ev.emit('message', 0, context.message_sent_seq, 'hello_retry_request', hrr_data);
           context.message_sent_seq++;
@@ -1090,14 +1129,14 @@ function TLSSession(options){
         if(context.hello_sent==false){
           
           if(context.selected_version!==null && context.selected_cipher_suite!==null && context.selected_session_id!==null){
-            if(context.selected_version === wire.TLS_VERSION.TLS1_3){
+            if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
               if(context.selected_group in context.local_key_groups==true && context.local_key_groups[context.selected_group].public_key!==null){
                 // After HRR, don't send ServerHello until CH2 provides the requested key_share
                 if (!context.helloRetried || (context.selected_group in context.remote_key_groups)) {
                   can_send_hello=true;
                 }
               }
-            }else if(context.selected_version === wire.TLS_VERSION.TLS1_2){
+            }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
               can_send_hello=true;
             }
           }
@@ -1111,12 +1150,12 @@ function TLSSession(options){
 
           let build_message_params=null;
 
-          if(context.selected_version==wire.TLS_VERSION.TLS1_3){
+          if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
 
             let shExtensions = [
               { 
                 type: 'SUPPORTED_VERSIONS', 
-                value: wire.TLS_VERSION.TLS1_3
+                value: context.selected_version
               },
               {
                 type: 'KEY_SHARE', 
@@ -1142,7 +1181,7 @@ function TLSSession(options){
             };
             
 
-          }else if(context.selected_version==wire.TLS_VERSION.TLS1_2){
+          }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
 
             
             // TLS 1.2 ServerHello: no SUPPORTED_VERSIONS or KEY_SHARE.
@@ -1184,7 +1223,7 @@ function TLSSession(options){
 
             let message_data = build_tls_message(build_message_params);
 
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             context.hello_sent=true;
 
@@ -1204,7 +1243,7 @@ function TLSSession(options){
 
       //get base_secret
       if (context.base_secret==null && context.selected_cipher_suite !== null){
-        if(context.selected_version == wire.TLS_VERSION.TLS1_3 && (context.ecdhe_shared_secret !== null)){
+        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && (context.ecdhe_shared_secret !== null)){
 
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
           let result;
@@ -1226,7 +1265,7 @@ function TLSSession(options){
             params_to_set['remote_handshake_traffic_secret']=result.server_handshake_traffic_secret;
           }
 
-        }else if(context.selected_version === wire.TLS_VERSION.TLS1_2 && context.local_random!==null && context.remote_random!==null){
+        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.local_random!==null && context.remote_random!==null){
           if(context.ecdhe_shared_secret !== null){
 
 
@@ -1246,7 +1285,11 @@ function TLSSession(options){
               if(context.isServer || context.key_exchange_sent){
                 let hashFn  = getHashFn(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
 
-                let transcript_hash = hashFn(concatUint8Arrays(context.transcript));
+                // Use snapshot up to CKE if available (excludes CertificateVerify)
+                let emsTranscript = context._emsTranscriptLen
+                  ? context.transcript.slice(0, context._emsTranscriptLen)
+                  : context.transcript;
+                let transcript_hash = hashFn(concatUint8Arrays(emsTranscript));
 
                 let master_secret = tls12_prf(context.ecdhe_shared_secret, "extended master secret", transcript_hash, 48, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
 
@@ -1270,7 +1313,7 @@ function TLSSession(options){
 
 
       //send encrypted_extensions...
-      if (context.isServer==true && context.selected_version === wire.TLS_VERSION.TLS1_3){
+      if (context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
         if(context.encrypted_exts_sent==false && context.hello_sent==true && context.local_handshake_traffic_secret!==null){
 
           let extensions=[];
@@ -1288,7 +1331,7 @@ function TLSSession(options){
             extensions: extensions
           });
 
-          context.transcript.push(message_data);
+          pushTranscript(message_data);
 
           context.encrypted_exts_sent=true;
 
@@ -1302,31 +1345,31 @@ function TLSSession(options){
 
       //send certificate... (skip for PSK resumption — no cert needed)
       // But first: send CertificateRequest if requestCert is set (TLS 1.3 only, between EE and Cert)
-      if(context.isServer==true && context.requestCert==true && !context.certificateRequestSent && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null && context.selected_version === wire.TLS_VERSION.TLS1_3 && !context.psk_accepted){
+      if(context.isServer==true && context.requestCert==true && !context.certificateRequestSent && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && !context.psk_accepted){
         let cr_data = build_tls_message({
           type: 'certificate_request',
           certificate_request_context: new Uint8Array(0),
           signature_algorithms: context.local_supported_signature_algorithms,
         });
-        context.transcript.push(cr_data);
+        pushTranscript(cr_data);
         context.certificateRequestSent = true;
         ev.emit('message', 1, context.message_sent_seq, 'certificate_request', cr_data);
         context.message_sent_seq++;
       }
 
       if(context.isServer==true && context.cert_sent==false && context.local_cert_chain!==null && !context.psk_accepted){
-        if((context.selected_version === wire.TLS_VERSION.TLS1_3 && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null) || (context.selected_version === wire.TLS_VERSION.TLS1_2 && context.hello_sent==true)){
+        if(((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null) || ((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.hello_sent==true)){
 
           let message_data = build_tls_message({
             type: 'certificate',
             version: context.selected_version,
             entries: context.local_cert_chain
           });
-          context.transcript.push(message_data);
+          pushTranscript(message_data);
 
           context.cert_sent=true;
 
-          if (context.selected_version === wire.TLS_VERSION.TLS1_3){
+          if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
             ev.emit('message',1,context.message_sent_seq,'certificate',message_data);
           }else{
             ev.emit('message',0,context.message_sent_seq,'certificate',message_data);
@@ -1344,7 +1387,7 @@ function TLSSession(options){
 
 
       //send certificate verify...
-      if (context.isServer==true && context.selected_version === wire.TLS_VERSION.TLS1_3){
+      if (context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
         if(context.cert_sent==true && context.cert_verify_sent==false && context.local_cert_chain!==null && context.local_handshake_traffic_secret!==null && context.selected_cipher_suite!==null){
 
           let tbs_data = build_cert_verify_tbs(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash,true,concatUint8Arrays(context.transcript));
@@ -1454,7 +1497,7 @@ function TLSSession(options){
 
             
 
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             context.cert_verify_sent=true;
 
@@ -1477,10 +1520,44 @@ function TLSSession(options){
 
 
       // client/server key exchange - 1.2 only...
-      if (context.key_exchange_sent == false && context.selected_version == wire.TLS_VERSION.TLS1_2) {
+      if (context.key_exchange_sent == false && (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)) {
         if(context.selected_group!==null && context.selected_group in context.local_key_groups==true && context.local_key_groups[context.selected_group].public_key!==null){
 
           if (context.isServer==false && context.remote_hello_done==true) {
+
+            // TLS 1.2: send Certificate before CKE if server requested client auth
+            if (context.certificateRequested && !context.clientCertSent) {
+              context.clientCertSent = true;
+
+              // Build TLS 1.2 Certificate message
+              let certEntries = [];
+              if (context.local_cert_chain && context.local_cert_chain.length > 0) {
+                certEntries = context.local_cert_chain;
+              }
+              // TLS 1.2 Certificate: certificate_list<0..2^24-1>
+              //   Each entry: cert_length<3> + cert_der
+              let totalLen = 0;
+              for (let ci = 0; ci < certEntries.length; ci++) {
+                totalLen += 3 + certEntries[ci].cert.length;
+              }
+              let certBody = new Uint8Array(3 + totalLen);
+              certBody[0] = (totalLen >> 16) & 0xff;
+              certBody[1] = (totalLen >> 8) & 0xff;
+              certBody[2] = totalLen & 0xff;
+              let off = 3;
+              for (let ci = 0; ci < certEntries.length; ci++) {
+                let der = certEntries[ci].cert;
+                certBody[off] = (der.length >> 16) & 0xff;
+                certBody[off+1] = (der.length >> 8) & 0xff;
+                certBody[off+2] = der.length & 0xff;
+                certBody.set(der, off + 3);
+                off += 3 + der.length;
+              }
+              let cert_data = wire.build_message(wire.TLS_MESSAGE_TYPE.CERTIFICATE, certBody);
+              pushTranscript(cert_data);
+              ev.emit('message', 0, context.message_sent_seq, 'certificate', cert_data);
+              context.message_sent_seq++;
+            }
 
             let public_key = context.local_key_groups[context.selected_group].public_key;
 
@@ -1488,14 +1565,44 @@ function TLSSession(options){
               type: 'client_key_exchange',
               public_key: public_key,
             });
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             // Set via params_to_set to trigger re-evaluation (EMS needs this)
             params_to_set['key_exchange_sent'] = true;
+
+            // Save transcript length for EMS: session_hash includes up to CKE only (RFC 7627)
+            context._emsTranscriptLen = context.transcript.length;
             
             ev.emit('message', 0, context.message_sent_seq, 'client_key_exchange', message_data);
 
             context.message_sent_seq++;
+
+            // TLS 1.2 CertificateVerify: if we sent a non-empty Certificate, prove we own the private key
+            if (context.certificateRequested && context.cert_private_key && context.local_cert_chain && context.local_cert_chain.length > 0) {
+              // sign_with_scheme hashes internally, so pass RAW transcript (not pre-hashed)
+              let transcript_data = concatUint8Arrays(context.transcript);
+
+              // Pick scheme matching our cert + server's requested algorithms
+              let cert_key_obj = crypto.createPrivateKey({ key: Buffer.from(context.cert_private_key), format: 'der', type: 'pkcs8' });
+              let reqAlgs = context.certificateRequestSigAlgs.length > 0
+                ? context.certificateRequestSigAlgs
+                : context.local_supported_signature_algorithms;
+              let scheme = pick_scheme(wire.TLS_VERSION.TLS1_2, cert_key_obj, reqAlgs);
+              let signature = sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme, transcript_data, cert_key_obj);
+
+              // Build CertificateVerify: scheme(2) + sig_length(2) + sig
+              let cvBody = new Uint8Array(2 + 2 + signature.length);
+              cvBody[0] = (scheme >> 8) & 0xff;
+              cvBody[1] = scheme & 0xff;
+              cvBody[2] = (signature.length >> 8) & 0xff;
+              cvBody[3] = signature.length & 0xff;
+              cvBody.set(signature, 4);
+
+              let cv_data = wire.build_message(wire.TLS_MESSAGE_TYPE.CERTIFICATE_VERIFY, cvBody);
+              pushTranscript(cv_data);
+              ev.emit('message', 0, context.message_sent_seq, 'certificate_verify', cv_data);
+              context.message_sent_seq++;
+            }
 
 
           }else if (context.isServer==true && context.cert_sent == true) {
@@ -1528,7 +1635,7 @@ function TLSSession(options){
               sig_alg: scheme12,
               signature: sig_data
             });
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             context.key_exchange_sent = true;
             
@@ -1541,16 +1648,16 @@ function TLSSession(options){
       }
 
       //server hello done - 1.2 only...
-      if(context.isServer==true && context.selected_version == wire.TLS_VERSION.TLS1_2){
+      if(context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
         if(context.hello_done_sent==false && context.key_exchange_sent==true){
 
           let message_data = build_tls_message({
             type: 'server_hello_done'});
-          context.transcript.push(message_data);
+          pushTranscript(message_data);
 
           context.hello_done_sent=true;
 
-          ev.emit('message',0,context.message_sent_seq,'certificate',message_data);
+          ev.emit('message',0,context.message_sent_seq,'server_hello_done',message_data);
 
           context.message_sent_seq++;
 
@@ -1574,7 +1681,7 @@ function TLSSession(options){
             entries: certCtx.certificateChain,
             certificate_request_context: context.certificateRequestContext || new Uint8Array(0),
           });
-          context.transcript.push(cert_data);
+          pushTranscript(cert_data);
           ev.emit('message', 1, context.message_sent_seq, 'certificate', cert_data);
           context.message_sent_seq++;
 
@@ -1588,7 +1695,7 @@ function TLSSession(options){
             scheme: scheme,
             signature: signature,
           });
-          context.transcript.push(cv_data);
+          pushTranscript(cv_data);
           ev.emit('message', 1, context.message_sent_seq, 'certificate_verify', cv_data);
           context.message_sent_seq++;
         } else {
@@ -1599,7 +1706,7 @@ function TLSSession(options){
             entries: [],
             certificate_request_context: context.certificateRequestContext || new Uint8Array(0),
           });
-          context.transcript.push(cert_data);
+          pushTranscript(cert_data);
           ev.emit('message', 1, context.message_sent_seq, 'certificate', cert_data);
           context.message_sent_seq++;
         }
@@ -1609,7 +1716,7 @@ function TLSSession(options){
       // base_secret may be null after app secrets are derived, so we also check handshake secret.
       if (context.finished_sent==false && context.selected_cipher_suite!==null && (context.base_secret!==null || context.local_handshake_traffic_secret!==null)){
 
-        if(context.selected_version === wire.TLS_VERSION.TLS1_3 && context.local_handshake_traffic_secret!==null){
+        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.local_handshake_traffic_secret!==null){
 
           if((context.isServer==false && context.remote_finished_ok==true && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (context.isServer==true && context.cert_verify_sent==true && context.local_cert_chain!==null) || (context.isServer==true && context.psk_accepted==true && context.encrypted_exts_sent==true)){
 
@@ -1621,7 +1728,7 @@ function TLSSession(options){
               data: finished_data
             });
 
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             context.finished_sent=true;
 
@@ -1631,7 +1738,7 @@ function TLSSession(options){
 
           }
 
-        }else if(context.selected_version === wire.TLS_VERSION.TLS1_2){
+        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
 
           if((context.isServer==true && context.remote_finished_ok==true) || (context.isServer==false && context.key_exchange_sent==true)){
 
@@ -1651,7 +1758,7 @@ function TLSSession(options){
               data: finished_data
             });
 
-            context.transcript.push(message_data);
+            pushTranscript(message_data);
 
             context.finished_sent=true;
 
@@ -1666,7 +1773,7 @@ function TLSSession(options){
       }
 
       //get app traffic secret...
-      if (context.selected_version === wire.TLS_VERSION.TLS1_3){
+      if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
         if(context.base_secret!==null && context.local_app_traffic_secret==null && context.remote_app_traffic_secret==null){
 
           if((context.isServer==true && context.finished_sent==true && context.remote_finished_ok==false) || (context.isServer==false && context.finished_sent==false && context.remote_finished_ok==true)){
@@ -1692,7 +1799,7 @@ function TLSSession(options){
       //expected_remote_finished...
       if (context.expected_remote_finished==null && context.selected_cipher_suite!==null){
 
-        if(context.selected_version == wire.TLS_VERSION.TLS1_3 && context.remote_handshake_traffic_secret!==null){
+        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.remote_handshake_traffic_secret!==null){
 
           if((context.isServer==true && context.finished_sent==true) || (context.isServer==false && context.remote_finished !== null)){
 
@@ -1700,7 +1807,7 @@ function TLSSession(options){
 
           }
 
-        }else if(context.selected_version === wire.TLS_VERSION.TLS1_2 && context.base_secret!==null){
+        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.base_secret!==null){
 
           if(context.remote_finished!==null){
 
@@ -1736,7 +1843,7 @@ function TLSSession(options){
             data: context.remote_finished
           });
 
-          context.transcript.push(message_data);
+          pushTranscript(message_data);
 
           params_to_set['remote_finished_ok']=true;
 
@@ -1755,13 +1862,13 @@ function TLSSession(options){
 
 
 
-      if(context.state!=='connected' && context.remote_finished_ok==true && ((context.selected_version === wire.TLS_VERSION.TLS1_3 && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || context.selected_version === wire.TLS_VERSION.TLS1_2)){
+      if(context.state!=='connected' && context.remote_finished_ok==true && (((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2))){
         context.state='connected';
         context.handshakeEndTime = Date.now();
         ev.emit('secureConnect');
 
         // TLS 1.3: compute resumption_master_secret (both client and server need it)
-        if (context.selected_version === wire.TLS_VERSION.TLS1_3 && context.tls13_master_secret && !context.resumption_master_secret) {
+        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.tls13_master_secret && !context.resumption_master_secret) {
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
           context.resumption_master_secret = derive_resumption_master_secret(
             hashName, context.tls13_master_secret, concatUint8Arrays(context.transcript)
@@ -1769,7 +1876,7 @@ function TLSSession(options){
         }
 
         // TLS 1.3 server: send NewSessionTicket
-        if (context.selected_version === wire.TLS_VERSION.TLS1_3 && context.isServer && !context.session_ticket_sent && !context.noTickets && context.resumption_master_secret) {
+        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.isServer && !context.session_ticket_sent && !context.noTickets && context.resumption_master_secret) {
           context.session_ticket_sent = true;
 
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
@@ -2044,6 +2151,7 @@ function TLSSession(options){
           version: 0x0303,
           random: context.local_random,
           session_id: context.local_session_id,
+          cookie: context.dtls_cookie,
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -2068,13 +2176,14 @@ function TLSSession(options){
           version: 0x0303,
           random: context.local_random,
           session_id: context.local_session_id,
+          cookie: context.dtls_cookie,
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
         message_data = build_tls_message(build_message_params);
       }
 
-      context.transcript.push(message_data);
+      pushTranscript(message_data);
 
       context.hello_sent=true;
 
@@ -2218,7 +2327,7 @@ function TLSSession(options){
       let cipherInfo = context.selected_cipher_suite ? TLS_CIPHER_SUITES[context.selected_cipher_suite] : null;
       return {
         version: context.selected_version,
-        versionName: context.selected_version === 0x0304 ? 'TLSv1.3' : context.selected_version === 0x0303 ? 'TLSv1.2' : null,
+        versionName: context.selected_version === 0x0304 ? 'TLSv1.3' : context.selected_version === 0xFEFC ? 'DTLSv1.3' : context.selected_version === 0x0303 ? 'TLSv1.2' : context.selected_version === 0xFEFD ? 'DTLSv1.2' : null,
         cipher: context.selected_cipher_suite,
         cipherName: cipherInfo ? cipherInfo.name : null,
         group: context.selected_group,
@@ -2255,7 +2364,7 @@ function TLSSession(options){
 
     /** Request a TLS 1.3 Key Update. requestPeer=true means ask the other side to update too. */
     requestKeyUpdate: function(requestPeer){
-      if (context.state !== 'connected' || context.selected_version !== wire.TLS_VERSION.TLS1_3) return;
+      if (context.state !== 'connected' || (context.selected_version !== wire.TLS_VERSION.TLS1_3 && context.selected_version !== wire.DTLS_VERSION.DTLS1_3)) return;
       let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
       let hashLen = getHashLen(hashName);
 

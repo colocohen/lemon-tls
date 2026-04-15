@@ -97,10 +97,12 @@ function build_tls_message(params) {
 
   if (params.type == 'server_hello') {
     type = wire.TLS_MESSAGE_TYPE.SERVER_HELLO;
-    body = wire.build_hello('server', params);
+    params.kind = 'server';
+    body = wire.build_hello(params);
   } else if (params.type == 'client_hello') {
     type = wire.TLS_MESSAGE_TYPE.CLIENT_HELLO;
-    body = wire.build_hello('client', params);
+    params.kind = 'client';
+    body = wire.build_hello(params);
   } else if (params.type == 'server_key_exchange') {
     type = wire.TLS_MESSAGE_TYPE.SERVER_KEY_EXCHANGE;
     body = wire.build_server_key_exchange_ecdhe(params);
@@ -145,7 +147,8 @@ function parse_tls_message(data) {
   let message = wire.parse_message(data);
 
   if (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO || message.type == wire.TLS_MESSAGE_TYPE.SERVER_HELLO) {
-    let hello = wire.parse_hello(message.type, message.body);
+    let kind = (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO) ? 'client' : 'server';
+    let hello = wire.parse_hello({ kind: kind, body: message.body });
     out = normalize_hello(hello);
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.SERVER_KEY_EXCHANGE) {

@@ -11,6 +11,12 @@ const TLS_VERSION = {
   TLS1_3: 0x0304
 };
 
+const DTLS_VERSION = {
+  DTLS1_0: 0xFEFF,
+  DTLS1_2: 0xFEFD,
+  DTLS1_3: 0xFEFC
+};
+
 const TLS_CONTENT_TYPE = {
   CHANGE_CIPHER_SPEC: 20,
   ALERT: 21,
@@ -122,6 +128,18 @@ function w_u24(buf, off, v) {
   buf[off++] = (v >>> 16) & 0xFF;
   buf[off++] = (v >>> 8) & 0xFF;
   buf[off++] = v & 0xFF;
+  return off;
+}
+
+function w_u48(buf, off, v) {
+  let hi = Math.floor(v / 0x100000000);
+  let lo = v >>> 0;
+  buf[off++] = (hi >>> 8) & 0xFF;
+  buf[off++] = hi & 0xFF;
+  buf[off++] = (lo >>> 24) & 0xFF;
+  buf[off++] = (lo >>> 16) & 0xFF;
+  buf[off++] = (lo >>> 8) & 0xFF;
+  buf[off++] = lo & 0xFF;
   return off;
 }
 
@@ -739,10 +757,13 @@ function parse_extensions(buf) {
 
 
 /* ================================ Hello I/O ================================ */
-function build_hello(kind, params) {
+function build_hello(params) {
   params = params || {};
+  let kind = params.kind;
 
-  let legacy_version = TLS_VERSION.TLS1_2; // even for TLS1.3 legacy fields
+  let isDtls = (params.cookie !== undefined) ||
+               (params.version !== undefined && (params.version & 0xFF00) === 0xFE00);
+  let legacy_version = isDtls ? DTLS_VERSION.DTLS1_2 : TLS_VERSION.TLS1_2;
 
   let sid = toU8(params.session_id || "");
   if (sid.length > 32) sid = sid.subarray(0, 32);
@@ -767,8 +788,19 @@ function build_hello(kind, params) {
       oc = w_u8(compBlock, oc, comp[j]);
     }
 
+    // DTLS cookie field (between session_id and cipher_suites)
+    let cookieBuf = null;
+    if (params.cookie !== undefined) {
+      let cookie = toU8(params.cookie);
+      cookieBuf = new Uint8Array(1 + cookie.length);
+      cookieBuf[0] = cookie.length;
+      if (cookie.length > 0) cookieBuf.set(cookie, 1);
+    }
+
     const out = new Uint8Array(
-      2 + 32 + 1 + sid.length + csBlock.length + compBlock.length + extsBuf.length
+      2 + 32 + 1 + sid.length +
+      (cookieBuf ? cookieBuf.length : 0) +
+      csBlock.length + compBlock.length + extsBuf.length
     );
 
     let off = 0;
@@ -776,6 +808,7 @@ function build_hello(kind, params) {
     off = w_bytes(out, off, params.random);
     off = w_u8(out, off, sid.length);
     off = w_bytes(out, off, sid);
+    if (cookieBuf) off = w_bytes(out, off, cookieBuf);
     off = w_bytes(out, off, csBlock);
     off = w_bytes(out, off, compBlock);
     off = w_bytes(out, off, extsBuf);
@@ -803,11 +836,13 @@ function build_hello(kind, params) {
   throw new Error('build_hello: kind must be "client" or "server"');
 }
 
-function parse_hello(hsType, body) {
-  let isClient = (hsType === TLS_MESSAGE_TYPE.CLIENT_HELLO || hsType === 'client_hello');
+function parse_hello(params) {
+  let hsType = params.kind;
+  let body = params.body;
+  let isClient = (hsType === 'client' || hsType === TLS_MESSAGE_TYPE.CLIENT_HELLO || hsType === 'client_hello');
   let off = 0;
 
-  // --- שדות משותפים ---
+  // --- shared fields ---
   let legacy_version; [legacy_version, off] = r_u16(body, off);
   let random;         [random,         off] = r_bytes(body, off, 32);
   let sidLen;         [sidLen,         off] = r_u8(body, off);
@@ -817,8 +852,20 @@ function parse_hello(hsType, body) {
   let legacy_compression = [];
   let type = isClient ? 'client_hello' : 'server_hello';
 
+  // DTLS cookie — auto-detect by version (DTLS versions have 0xFE in high byte)
+  let dtls_cookie = null;
+  let isDTLS = (legacy_version & 0xFF00) === 0xFE00;
+
   if (isClient) {
     // --- ClientHello ---
+    // DTLS ClientHello has a cookie field between session_id and cipher_suites
+    if (isDTLS) {
+      let cookieLen; [cookieLen, off] = r_u8(body, off);
+      if (cookieLen > 0) {
+        [dtls_cookie, off] = r_bytes(body, off, cookieLen);
+      }
+    }
+
     let csLen; [csLen, off] = r_u16(body, off);
     let csEnd = off + csLen;
     while (off < csEnd) {
@@ -858,9 +905,10 @@ function parse_hello(hsType, body) {
     version: version,                     // single (u16)
     random: random,                       // single (Uint8Array(32))
     session_id: session_id,               // single (Uint8Array)
+    dtls_cookie: dtls_cookie,             // Uint8Array or null (DTLS only)
     cipher_suites: cipher_suites,         // array
     legacy_compression: legacy_compression, // array
-    extensions: extensions                // array (לא נוגעים בפנים)
+    extensions: extensions                // array
   };
 }
 
@@ -1456,9 +1504,89 @@ function parse_key_update(body) {
 }
 
 
+/* ============================== DTLS Handshake Message ============================== */
+
+/**
+ * Build a DTLS handshake message from a TLS message.
+ * Adds 8-byte reconstruction header: msg_seq(2) + frag_offset(3) + frag_length(3).
+ *
+ * tls_msg: Uint8Array — TLS format: type(1) + length(3) + body
+ * msg_seq: u16 — handshake message sequence number
+ * frag_offset: optional, defaults to 0
+ * frag_length: optional, defaults to full body length
+ */
+function build_dtls_handshake(tls_msg, msg_seq, frag_offset, frag_length) {
+  let type = tls_msg[0];
+  let total_length = (tls_msg[1] << 16) | (tls_msg[2] << 8) | tls_msg[3];
+  let body = tls_msg.subarray(4);
+
+  if (frag_offset === undefined) frag_offset = 0;
+  if (frag_length === undefined) frag_length = body.length;
+
+  let frag_body = body.subarray(frag_offset, frag_offset + frag_length);
+
+  let out = new Uint8Array(12 + frag_body.length);
+  let off = 0;
+  off = w_u8(out, off, type);
+  off = w_u24(out, off, total_length);
+  off = w_u16(out, off, msg_seq);
+  off = w_u24(out, off, frag_offset);
+  off = w_u24(out, off, frag_length);
+  off = w_bytes(out, off, frag_body);
+  return out;
+}
+
+/**
+ * Parse a DTLS handshake message.
+ * Returns { type, length, msg_seq, frag_offset, frag_length, body }.
+ */
+function parse_dtls_handshake(buf) {
+  let off = 0;
+  let type;       [type, off]       = r_u8(buf, off);
+  let length;     [length, off]     = r_u24(buf, off);
+  let msg_seq;    [msg_seq, off]    = r_u16(buf, off);
+  let frag_offset;[frag_offset, off]= r_u24(buf, off);
+  let frag_length;[frag_length, off]= r_u24(buf, off);
+  let body;       [body, off]       = r_bytes(buf, off, frag_length);
+  return { type, length, msg_seq, frag_offset, frag_length, body };
+}
+
+
+/* ============================== DTLS 1.2 HelloVerifyRequest ============================== */
+
+/**
+ * Build HelloVerifyRequest body (DTLS 1.2 — message type 3).
+ * params: { server_version?, cookie: Uint8Array }
+ */
+function build_hello_verify_request(params) {
+  let version = (params && params.server_version) || DTLS_VERSION.DTLS1_2;
+  let cookie = toU8(params && params.cookie || new Uint8Array(0));
+  let out = new Uint8Array(2 + 1 + cookie.length);
+  let off = 0;
+  off = w_u16(out, off, version);
+  off = w_u8(out, off, cookie.length);
+  if (cookie.length > 0) off = w_bytes(out, off, cookie);
+  return out;
+}
+
+/**
+ * Parse HelloVerifyRequest body.
+ * Returns { server_version, cookie }.
+ */
+function parse_hello_verify_request(body) {
+  let off = 0;
+  let server_version; [server_version, off] = r_u16(body, off);
+  let cookieLen;      [cookieLen, off] = r_u8(body, off);
+  let cookie = new Uint8Array(0);
+  if (cookieLen > 0) { [cookie, off] = r_bytes(body, off, cookieLen); }
+  return { server_version, cookie };
+}
+
+
 /* ================================ Exports ================================= */
 export {
   TLS_VERSION,
+  DTLS_VERSION,
   TLS_CONTENT_TYPE,
   TLS_ALERT_LEVEL,
   TLS_ALERT,
@@ -1468,6 +1596,7 @@ export {
   w_u8,
   w_u16,
   w_u24,
+  w_u48,
   w_bytes,
   r_u8,
   r_u16,
@@ -1516,8 +1645,10 @@ export {
 
   build_key_update,
   parse_key_update,
+
+  // DTLS
+  build_dtls_handshake,
+  parse_dtls_handshake,
+  build_hello_verify_request,
+  parse_hello_verify_request,
 };
-
-
-
-

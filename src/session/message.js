@@ -68,6 +68,15 @@ function normalize_hello(hello) {
         out.heartbeat = value;
       } else if (name === 'USE_SRTP') {
         out.use_srtp = value;
+      } else if (name === 'SESSION_TICKET') {
+        // RFC 5077: opaque ticket bytes (TLS 1.2)
+        // Empty in ClientHello = client supports tickets / non-empty = resume using this ticket
+        // Empty in ServerHello = server will send NewSessionTicket
+        out.session_ticket = value;
+        out.session_ticket_supported = true;
+      } else if (name === 'EXTENDED_MASTER_SECRET') {
+        // RFC 7627: presence signals EMS support
+        out.extended_master_secret = true;
       } else {
         if (!('unknown' in out)) out.unknown = [];
         out.unknown.push(e);
@@ -133,6 +142,12 @@ function build_tls_message(params) {
   } else if (params.type == 'hello_retry_request') {
     type = wire.TLS_MESSAGE_TYPE.SERVER_HELLO; // HRR uses ServerHello type with magic random
     body = wire.build_hello_retry_request(params);
+  } else if (params.type == 'new_session_ticket_tls12') {
+    type = wire.TLS_MESSAGE_TYPE.NEW_SESSION_TICKET;
+    body = wire.build_new_session_ticket_tls12(params);
+  } else if (params.type == 'new_session_ticket') {
+    type = wire.TLS_MESSAGE_TYPE.NEW_SESSION_TICKET;
+    body = wire.build_new_session_ticket(params);
   }
 
   return wire.build_message(type, body);
@@ -141,8 +156,11 @@ function build_tls_message(params) {
 
 /**
  * Parse a raw TLS handshake message into a typed object.
+ * @param {Uint8Array} data            — handshake message bytes
+ * @param {number}     [negotiatedVersion] — optional; 0x0303 for TLS 1.2, 0x0304 for TLS 1.3.
+ *                                           Needed to disambiguate NewSessionTicket wire format.
  */
-function parse_tls_message(data) {
+function parse_tls_message(data, negotiatedVersion) {
   let out = {};
   let message = wire.parse_message(data);
 
@@ -183,7 +201,14 @@ function parse_tls_message(data) {
     out.body = message.body;
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.NEW_SESSION_TICKET) {
-    out = wire.parse_new_session_ticket(message.body);
+    // TLS 1.2 and 1.3 have different wire formats for this message.
+    // TLS 1.3: ticket_lifetime | ticket_age_add | ticket_nonce | ticket | extensions
+    // TLS 1.2: ticket_lifetime_hint | ticket                     (RFC 5077)
+    if (negotiatedVersion === 0x0303) {
+      out = wire.parse_new_session_ticket_tls12(message.body);
+    } else {
+      out = wire.parse_new_session_ticket(message.body);
+    }
     out.type = 'new_session_ticket';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.KEY_UPDATE) {

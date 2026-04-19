@@ -4,15 +4,21 @@ import { EventEmitter } from 'node:events';
 import {
   TLS_CIPHER_SUITES,
   build_cert_verify_tbs,
+  build_cert_verify_tbs_with_hash,
   get_handshake_finished,
+  get_handshake_finished_with_hash,
   tls12_prf,
   derive_handshake_traffic_secrets,
+  derive_handshake_traffic_secrets_with_hash,
   derive_app_traffic_secrets,
+  derive_app_traffic_secrets_with_hash,
   derive_resumption_master_secret,
+  derive_resumption_master_secret_with_hash,
   derive_psk,
   derive_binder_key,
   compute_psk_binder,
   derive_handshake_traffic_secrets_psk,
+  derive_handshake_traffic_secrets_psk_with_hash,
   hkdf_expand_label,
   getHashFn,
 } from './crypto.js';
@@ -30,6 +36,17 @@ import { pick_scheme, sign_with_scheme } from './session/signing.js';
 import createSecureContext from './secure_context.js';
 import { x25519_get_public_key, x25519_get_shared_secret, p256_generate_keypair, p256_get_shared_secret, p384_generate_keypair, p384_get_shared_secret } from './session/ecdh.js';
 import { build_tls_message, parse_tls_message } from './session/message.js';
+import { encrypt_session_blob, decrypt_session_blob, encode_client_session, decode_client_session } from './session/ticket.js';
+
+// Debug logging — enabled via LEMON_DEBUG=1 env var
+const LEMON_DEBUG = typeof process !== 'undefined' && process.env && process.env.LEMON_DEBUG === '1';
+function dbg(tag, ...args) { if (LEMON_DEBUG) console.error('[LEMON ' + tag + ']', ...args); }
+function hexPreview(buf, max) {
+  if (!buf) return 'null';
+  let b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  let n = Math.min(b.length, max || 32);
+  return b.slice(0, n).toString('hex') + (b.length > n ? `... (${b.length} bytes)` : ` (${b.length} bytes)`);
+}
 
 
 function TLSSession(options){
@@ -45,7 +62,9 @@ function TLSSession(options){
     ca: options.ca || null, // CA certificates (PEM strings or Buffers)
 
     SNICallback: options.SNICallback || null,
-    ticketKeys: options.ticketKeys || null, // 48 bytes for ticket encryption
+    ticketKeys: options.ticketKeys || null, // 48 bytes: [0:16]=key_name, [16:48]=AES-256-GCM key
+    ticketLifetime: options.ticketLifetime != null ? (options.ticketLifetime >>> 0) : 7200, // seconds
+    sessionTickets: options.sessionTickets !== false, // default true (was noTickets inverted)
 
     // Advanced options
     maxHandshakeSize: options.maxHandshakeSize || 0, // 0 = no limit
@@ -110,6 +129,18 @@ function TLSSession(options){
     transcript: [],
     transcriptHook: null,  // DTLSSession sets this to transform transcript entries
 
+    // Incremental transcript hash — running crypto.Hash object that we update
+    // each time a handshake message is pushed. Replaces the previous pattern of
+    // `concatUint8Arrays(transcript)` + `hashFn(...)` on every key-derivation
+    // step, which re-hashed and re-allocated the entire transcript each time
+    // (~5 times per handshake, several KB each).
+    //
+    // The array `transcript` is still maintained in parallel for cases that
+    // need it (HRR rewind, TLS 1.2 EMS snapshot via transcript.length, logging).
+    // Only the HASH path uses this incremental object. Reset on HRR.
+    transcriptHash: null,          // crypto.Hash object (lazy init when hashName is known)
+    transcriptHashName: null,      // hash algorithm currently tracked ('sha256' / 'sha384')
+
 
     //both
     hello_sent: false,
@@ -171,23 +202,141 @@ function TLSSession(options){
     resumption_master_secret: null,
     ticket_nonce_counter: 0,
     session_ticket_sent: false,
-    noTickets: !!options.noTickets,
     psk_offered: null,       // client: { identity, psk, cipher } offered in ClientHello
     psk_accepted: false,     // server accepted PSK → abbreviated handshake
-    isResumed: false,        // true if PSK was accepted
+    isResumed: false,        // true if PSK was accepted (1.3) or abbreviated handshake (1.2)
+
+    // TLS 1.2 resumption
+    tls12_abbreviated: false,         // doing abbreviated handshake (server side)
+    tls12_resume_state: null,         // loaded session state (from SessionID or Ticket): { version, cipher, master_secret, extended_master_secret, sni, alpn, timestamp }
+    tls12_session_ticket_requested: false,  // client sent SessionTicket extension (empty or with data)
+    tls12_session_ticket_offered: null,     // client sent non-empty SessionTicket (raw bytes) — server tries to decrypt
+    tls12_newsession_sent: false,           // server sent NewSessionTicket message (TLS 1.2)
+    tls12_session_id_for_store: null,       // session_id to emit with 'newSession' (32 bytes, server-generated)
+    tls12_session_id_emitted: false,        // 'newSession' event already fired
+    tls12_client_session_emitted: false,    // client-side 'session' event fired (TLS 1.2 Session ID or ticket)
+    tls12_resume_pending: false,            // waiting for 'resumeSession' async callback
+    tls12_client_session: null,             // client: saved session to resume with (parsed sessionData)
   };
+
+  /**
+   * Emit NSS SSLKEYLOGFILE lines on 'keylog' event (Node.js TLSSocket compat).
+   * Used by Wireshark and similar tools to decrypt TLS traffic.
+   *
+   * Format: "LABEL <client_random_hex> <secret_hex>\n"
+   *   - TLS 1.2: CLIENT_RANDOM <cr> <master_secret>
+   *   - TLS 1.3: CLIENT_HANDSHAKE_TRAFFIC_SECRET / SERVER_HANDSHAKE_TRAFFIC_SECRET
+   *              CLIENT_TRAFFIC_SECRET_0        / SERVER_TRAFFIC_SECRET_0
+   *
+   * All three functions are zero-allocation when no 'keylog' listeners are attached
+   * (single listenerCount check at entry), so leaving this infrastructure in place
+   * has no measurable cost in production.
+   */
+  function _emitKeylogPair(labelClient, labelServer, secretClient, secretServer) {
+    if (ev.listenerCount('keylog') === 0) return;
+    let clientRandom = context.isServer ? context.remote_random : context.local_random;
+    if (!clientRandom) return;
+    // Compute clientRandom hex once — both lines share it
+    let crHex = Buffer.from(clientRandom).toString('hex');
+    if (secretClient) {
+      let line = labelClient + ' ' + crHex + ' ' + Buffer.from(secretClient).toString('hex') + '\n';
+      ev.emit('keylog', Buffer.from(line));
+    }
+    if (secretServer) {
+      let line = labelServer + ' ' + crHex + ' ' + Buffer.from(secretServer).toString('hex') + '\n';
+      ev.emit('keylog', Buffer.from(line));
+    }
+  }
+
+  /** TLS 1.3: emit CLIENT_HANDSHAKE_TRAFFIC_SECRET + SERVER_HANDSHAKE_TRAFFIC_SECRET. */
+  function _emitHandshakeKeylog() {
+    _emitKeylogPair(
+      'CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET',
+      context.isServer ? context.remote_handshake_traffic_secret : context.local_handshake_traffic_secret,
+      context.isServer ? context.local_handshake_traffic_secret  : context.remote_handshake_traffic_secret
+    );
+  }
+
+  /** TLS 1.3: emit CLIENT_TRAFFIC_SECRET_0 + SERVER_TRAFFIC_SECRET_0. */
+  function _emitAppKeylog() {
+    _emitKeylogPair(
+      'CLIENT_TRAFFIC_SECRET_0', 'SERVER_TRAFFIC_SECRET_0',
+      context.isServer ? context.remote_app_traffic_secret : context.local_app_traffic_secret,
+      context.isServer ? context.local_app_traffic_secret  : context.remote_app_traffic_secret
+    );
+  }
+
+  /** TLS 1.2: emit CLIENT_RANDOM <client_random> <master_secret>. */
+  function _emitKeylog(label, secret) {
+    if (ev.listenerCount('keylog') === 0) return;
+    let clientRandom = context.isServer ? context.remote_random : context.local_random;
+    if (!clientRandom || !secret) return;
+    let line = label + ' ' +
+      Buffer.from(clientRandom).toString('hex') + ' ' +
+      Buffer.from(secret).toString('hex') + '\n';
+    ev.emit('keylog', Buffer.from(line));
+  }
 
   /**
    * Push a handshake message to the transcript.
    * If a transcriptHook is set (by DTLSSession), it transforms the data first.
    * This allows DTLS 1.2 to store DTLS-format entries (with reconstruction data)
    * while TLS and DTLS 1.3 store standard TLS-format entries.
+   *
+   * Also updates the incremental transcript hash if it's been initialized,
+   * so subsequent calls to get_transcript_hash() run in O(1) clone+digest time
+   * instead of re-hashing the entire transcript.
    */
   function pushTranscript(data) {
     if (context.transcriptHook) {
       data = context.transcriptHook(data);
     }
     context.transcript.push(data);
+    if (context.transcriptHash !== null) {
+      context.transcriptHash.update(data);
+    }
+  }
+
+  /**
+   * Returns the transcript hash using the incremental running hash object.
+   * Initializes the running hash on first call (replaying any pre-existing
+   * messages), then uses Hash.copy()+digest() on subsequent calls so the
+   * running hash keeps accepting more updates.
+   *
+   * Perf vs old pattern `getHashFn(h)(concatUint8Arrays(transcript))`:
+   *   - Avoids concat — which allocates a buffer holding ALL transcript bytes
+   *   - Avoids hashing the entire transcript from scratch every time
+   *   - Hash.copy() duplicates only the hash state (~hashLen bytes)
+   *
+   * For a typical handshake with 6-8 messages of a few KB total and ~5 hash
+   * computations during key derivation, this saves ~20KB of allocations and
+   * re-hashes the same bytes 4 fewer times.
+   */
+  function get_transcript_hash(hashName) {
+    if (context.transcriptHash !== null && context.transcriptHashName === hashName) {
+      return new Uint8Array(context.transcriptHash.copy().digest());
+    }
+    // Lazy init: create a fresh hash and replay existing transcript into it.
+    // After this, pushTranscript() updates the hash incrementally.
+    context.transcriptHash = crypto.createHash(hashName);
+    context.transcriptHashName = hashName;
+    for (let i = 0; i < context.transcript.length; i++) {
+      context.transcriptHash.update(context.transcript[i]);
+    }
+    return new Uint8Array(context.transcriptHash.copy().digest());
+  }
+
+  /**
+   * Reset the incremental transcript hash. Called after HRR reshape, where the
+   * transcript array is replaced with [message_hash(CH1), HRR] and the running
+   * hash must be restarted to match.
+   */
+  function reset_transcript_hash(hashName) {
+    context.transcriptHash = crypto.createHash(hashName);
+    context.transcriptHashName = hashName;
+    for (let i = 0; i < context.transcript.length; i++) {
+      context.transcriptHash.update(context.transcript[i]);
+    }
   }
 
   function process_income_message(data){
@@ -202,7 +351,7 @@ function TLSSession(options){
       return;
     }
 
-    let message = parse_tls_message(data);
+    let message = parse_tls_message(data, context.selected_version);
 
     // Emit 'handshakeMessage' hook for every message
     ev.emit('handshakeMessage', message.type, data, message);
@@ -233,10 +382,20 @@ function TLSSession(options){
         let pskIdentity = message.pre_shared_key.identities[0];
         let pskBinder = message.pre_shared_key.binders ? message.pre_shared_key.binders[0] : null;
 
+        dbg('SRV-PSK', 'received identity:', hexPreview(pskIdentity.identity, 24),
+            'age:', (pskIdentity.age || 0) >>> 0,
+            'received binder:', hexPreview(pskBinder, 16));
+
         let pskResult = null;
-        ev.emit('psk', pskIdentity.identity, function(result) {
+        ev.emit('psk', {
+          identity: pskIdentity.identity,
+          obfuscatedAge: (pskIdentity.age || 0) >>> 0
+        }, function(result) {
           pskResult = result;
         });
+
+        dbg('SRV-PSK', 'pskResult:', pskResult ? `psk=${hexPreview(pskResult.psk, 8)} cipher=0x${pskResult.cipher?.toString(16)}` : 'null (decrypt failed)');
+
         if (pskResult && pskResult.psk) {
           let pskCipher = pskResult.cipher || 0x1301;
           let hashName = TLS_CIPHER_SUITES[pskCipher] ? TLS_CIPHER_SUITES[pskCipher].hash : 'sha256';
@@ -247,12 +406,20 @@ function TLSSession(options){
           let truncatedCH = data.slice(0, data.length - bindersSize);
           let expectedBinder = compute_psk_binder(hashName, binder_key, truncatedCH);
 
+          dbg('SRV-PSK', 'hash:', hashName, 'hashLen:', hashLen,
+              'truncatedCH len:', truncatedCH.length,
+              'full CH len:', data.length);
+          dbg('SRV-PSK', 'expected binder:', hexPreview(expectedBinder, 16));
+          dbg('SRV-PSK', 'received binder:', hexPreview(pskBinder, 16));
+
           let binderOk = pskBinder && expectedBinder.length === pskBinder.length;
           if (binderOk) {
             for (let bi = 0; bi < expectedBinder.length; bi++) {
               if (expectedBinder[bi] !== pskBinder[bi]) { binderOk = false; break; }
             }
           }
+
+          dbg('SRV-PSK', binderOk ? '✓ BINDER MATCH — psk_accepted' : '✗ BINDER MISMATCH — full handshake');
 
           if (binderOk) {
             context.psk_accepted = true;
@@ -268,9 +435,12 @@ function TLSSession(options){
       // Client: detect if server accepted PSK from ServerHello (BEFORE set_context)
       if (!context.isServer && message.pre_shared_key && typeof message.pre_shared_key.selected === 'number') {
         if (context.psk_offered) {
+          dbg('CLI-PSK', '✓ server accepted PSK, selected_identity:', message.pre_shared_key.selected);
           context.psk_accepted = true;
           context.isResumed = true;
         }
+      } else if (!context.isServer && context.psk_offered && message.type === 'server_hello') {
+        dbg('CLI-PSK', '✗ server did NOT include pre_shared_key in SH — full handshake');
       }
 
       // Client: detect HelloRetryRequest (ServerHello with magic random)
@@ -291,6 +461,11 @@ function TLSSession(options){
         let ch1_hash = getHashFn(hashName)(concatUint8Arrays(context.transcript));
         let message_hash = wire.build_message(wire.TLS_MESSAGE_TYPE.MESSAGE_HASH, ch1_hash);
         context.transcript = [message_hash, hrrData]; // message_hash + HRR
+
+        // After HRR, the running hash must be restarted to match the reshaped
+        // transcript. If any existing running hash was tracking the old (CH1 + HRR)
+        // sequence, it's now stale — we rebuild from the new 2-entry transcript.
+        reset_transcript_hash(hashName);
 
         // Find the requested group from HRR key_share extension
         // After wire.js fix, key_groups contains [{group: N, key_exchange: empty}] for HRR
@@ -341,7 +516,7 @@ function TLSSession(options){
                   0x0401, 0x0501, 0x0601
               ] },
               { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) },
-              { type: 23, data: new Uint8Array(0) }, // extended_master_secret
+              { type: 'EXTENDED_MASTER_SECRET', value: null },
             ];
 
             // SNI (must be first)
@@ -396,6 +571,122 @@ function TLSSession(options){
         remote_extensions: message.extensions || [],
         add_remote_key_groups: message.key_groups || []
       });
+
+      // Server: TLS 1.2 resumption detection (only makes sense from ClientHello).
+      // This runs BEFORE set_context's reactive loop picks a version, so we mark state
+      // but defer the decision. The reactive loop will check tls12_abbreviated once
+      // TLS 1.2 is actually selected.
+      if (context.isServer && message.type === 'client_hello') {
+
+        // Was SessionTicket extension present? (empty or with data)
+        if (message.session_ticket_supported) {
+          context.tls12_session_ticket_requested = true;
+        }
+
+        // 1) Try ticket-based resumption (RFC 5077) — stateless, preferred over session_id
+        if (message.session_ticket && message.session_ticket.length > 0 && context.ticketKeys && context.sessionTickets) {
+          let state = decrypt_session_blob(message.session_ticket, context.ticketKeys);
+          if (state && state.v === 12 && state.master_secret) {
+            // Honor ticket-based resumption: we'll proceed as abbreviated handshake once TLS 1.2 is selected.
+            context.tls12_resume_state = state;
+            context.tls12_session_ticket_offered = message.session_ticket;
+          }
+        }
+
+        // 2) Try Session ID resumption — emit 'resumeSession' event (async-supported).
+        //    Only if ticket-based didn't already succeed. Works regardless of sessionTickets
+        //    setting: if the user registered a 'resumeSession' listener, they opted into
+        //    Session ID-based resumption.
+        if (!context.tls12_resume_state && message.session_id && message.session_id.length > 0) {
+          // Fire synchronously-first; listener may resolve immediately OR asynchronously.
+          // If async, the listener's callback ends up calling set_context via a helper below.
+          let offeredId = message.session_id;
+          let resolved = false;
+
+          let resumeCb = function(err, sessionData) {
+            if (resolved) return;
+            resolved = true;
+            context.tls12_resume_pending = false;
+
+            if (!err && sessionData) {
+              // sessionData may be a structured state (user returned a decoded state)
+              // or an encrypted Buffer (user returned what we gave them in 'newSession').
+              let state = null;
+              if (sessionData instanceof Uint8Array || Buffer.isBuffer(sessionData)) {
+                state = decrypt_session_blob(sessionData, context.ticketKeys);
+              } else if (typeof sessionData === 'object' && sessionData.master_secret) {
+                state = sessionData;
+              }
+              if (state && state.v === 12 && state.master_secret) {
+                set_context({
+                  tls12_resume_state: state,
+                });
+              }
+            }
+            // If no state resolved → full handshake. Reactive loop continues once pending clears.
+          };
+
+          context.tls12_resume_pending = true;
+          ev.emit('resumeSession', offeredId, resumeCb);
+
+          // If nobody listened (listenerCount === 0), immediately un-pend.
+          if (ev.listenerCount('resumeSession') === 0) {
+            resumeCb(null, null);
+          }
+        }
+      }
+
+      // Client: TLS 1.2 resumption detection.
+      // Two cases trigger abbreviated handshake:
+      //   (a) Session ID-based: server echoes the saved session_id
+      //   (b) Ticket-based: per RFC 5077 §3.4, if server accepts the ticket AND the CH
+      //       session_id is non-empty, it MUST echo the same session_id. So if our CH
+      //       session_id appears back in SH and we offered a ticket, ticket was accepted.
+      if (!context.isServer && context.tls12_client_session && message.type === 'server_hello' &&
+          message.session_id && message.session_id.length > 0) {
+
+        let abbreviatedDetected = false;
+        let savedSid = context.tls12_client_session.session_id;
+        let sentSid  = context.local_session_id;
+        let hasTicket = context.tls12_client_session.ticket && context.tls12_client_session.ticket.length > 0;
+
+        dbg('CLI-12RESUME', 'saved sid:', hexPreview(savedSid, 16),
+            'sent sid:', hexPreview(sentSid, 16),
+            'received sid:', hexPreview(message.session_id, 16),
+            'hasTicket:', hasTicket);
+
+        // Case (a): server's session_id equals the one we had stored from a prior connection
+        if (savedSid && savedSid.length > 0 && uint8Equal(message.session_id, savedSid)) {
+          abbreviatedDetected = true;
+          dbg('CLI-12RESUME', '✓ case (a) matched: SH echoes saved sid');
+        }
+
+        // Case (b): we offered a ticket and server echoed our CH session_id
+        if (!abbreviatedDetected && hasTicket && sentSid && sentSid.length > 0 &&
+            uint8Equal(message.session_id, sentSid)) {
+          abbreviatedDetected = true;
+          dbg('CLI-12RESUME', '✓ case (b) matched: SH echoes CH sid after ticket offer');
+        }
+
+        if (!abbreviatedDetected) {
+          dbg('CLI-12RESUME', '✗ no match — full handshake expected');
+        }
+
+        if (abbreviatedDetected) {
+          context.tls12_abbreviated = true;
+          context.isResumed = true;
+          // Load master_secret and EMS flag from saved session
+          set_context({
+            base_secret: context.tls12_client_session.master_secret,
+            use_extended_master_secret: !!context.tls12_client_session.extended_master_secret,
+            // Mark as if remote_hello_done arrived — we won't actually receive it in abbreviated flow,
+            // but the reactive loop uses this to gate CKE; we're skipping CKE anyway.
+            remote_hello_done: true,
+            // Pretend key_exchange_sent so Finished logic proceeds without real CKE
+            key_exchange_sent: true,
+          });
+        }
+      }
 
       ev.emit('hello');
 
@@ -494,20 +785,63 @@ function TLSSession(options){
 
     }else if(message.type=='new_session_ticket'){
 
-      // Client receives NewSessionTicket from server (post-handshake)
-      if(!context.isServer && context.resumption_master_secret){
-        let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-        let psk = derive_psk(hashName, context.resumption_master_secret, message.ticket_nonce);
+      // Client receives NewSessionTicket from server (post-handshake in TLS 1.3, pre-CCS in TLS 1.2)
+      if(!context.isServer){
+        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.resumption_master_secret) {
+          // TLS 1.3: derive PSK from resumption_master_secret + ticket_nonce
+          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let psk = derive_psk(hashName, context.resumption_master_secret, message.ticket_nonce);
 
-        ev.emit('session', {
-          ticket: message.ticket,
-          ticket_nonce: message.ticket_nonce,
-          psk: psk,
-          cipher: context.selected_cipher_suite,
-          lifetime: message.ticket_lifetime,
-          age_add: message.ticket_age_add,
-          maxEarlyDataSize: 0,
-        });
+          dbg('CLI-NST', 'received TLS 1.3 NST — cipher:', '0x' + context.selected_cipher_suite.toString(16),
+              'hash:', hashName,
+              'transcript len:', concatUint8Arrays(context.transcript).length);
+          dbg('CLI-NST', 'ticket_nonce:', hexPreview(message.ticket_nonce, 4),
+              'age_add:', message.ticket_age_add,
+              'lifetime:', message.ticket_lifetime);
+          dbg('CLI-NST', 'resumption_master_secret:', hexPreview(context.resumption_master_secret, 8),
+              'derived psk:', hexPreview(psk, 8));
+
+          // Encode opaque client-side session Buffer (JSON — user is responsible for secure storage)
+          let session_blob = encode_client_session({
+            v: 13,                                    // blob kind: TLS 1.3
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            ticket: message.ticket,
+            psk: psk,
+            age_add: message.ticket_age_add,
+            lifetime: message.ticket_lifetime,
+            sni: context.local_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          });
+
+          ev.emit('session', session_blob);
+        } else if (context.selected_version === wire.TLS_VERSION.TLS1_2 && context.base_secret) {
+          // TLS 1.2: NewSessionTicket is sent BEFORE server's CCS+Finished and is part of the
+          // handshake transcript (RFC 5077 §3.3). Server's Finished hash covers this message,
+          // so the client MUST include it in its transcript for verification to succeed.
+          pushTranscript(data);
+
+          // Save the raw ticket so getTLSTicket() can return it (Node compat).
+          context.tls12_received_ticket = message.ticket;
+
+          let session_blob = encode_client_session({
+            v: 12,                                    // blob kind: TLS 1.2
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            master_secret: context.base_secret,
+            extended_master_secret: !!context.use_extended_master_secret,
+            ticket: message.ticket,
+            session_id: context.remote_session_id || null,  // store for Session ID fallback
+            lifetime: message.ticket_lifetime_hint || context.ticketLifetime,
+            sni: context.local_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          });
+
+          ev.emit('session', session_blob);
+          context.tls12_client_session_emitted = true;
+        }
       }
 
     }else if(message.type=='key_update'){
@@ -797,6 +1131,33 @@ function TLSSession(options){
         }
       }
 
+      if('tls12_resume_state' in options){
+        if(context.tls12_resume_state !== options.tls12_resume_state){
+          context.tls12_resume_state = options.tls12_resume_state;
+          has_changed=true;
+        }
+      }
+
+      if('tls12_abbreviated' in options){
+        if(context.tls12_abbreviated !== options.tls12_abbreviated){
+          context.tls12_abbreviated = options.tls12_abbreviated;
+          has_changed=true;
+        }
+      }
+
+      if('isResumed' in options){
+        if(context.isResumed !== options.isResumed){
+          context.isResumed = options.isResumed;
+          has_changed=true;
+        }
+      }
+
+      if('use_extended_master_secret' in options){
+        if(context.use_extended_master_secret !== options.use_extended_master_secret){
+          context.use_extended_master_secret = options.use_extended_master_secret;
+          has_changed=true;
+        }
+      }
       if('ecdhe_shared_secret' in options){
         if(context.ecdhe_shared_secret==null && options.ecdhe_shared_secret!==null){
           context.ecdhe_shared_secret=options.ecdhe_shared_secret;
@@ -809,6 +1170,11 @@ function TLSSession(options){
         if(options.base_secret !== context.base_secret){
           context.base_secret=options.base_secret;
           has_changed=true;
+          // TLS 1.2: base_secret IS the master_secret. Emit NSS SSLKEYLOGFILE line.
+          if (options.base_secret && (context.selected_version === wire.TLS_VERSION.TLS1_2 ||
+              context.selected_version === wire.DTLS_VERSION.DTLS1_2)) {
+            _emitKeylog('CLIENT_RANDOM', options.base_secret);
+          }
         }
       }
 
@@ -826,6 +1192,7 @@ function TLSSession(options){
           has_changed=true;
           if(context.local_handshake_traffic_secret!==null){
             ev.emit('handshakeSecrets', context.local_handshake_traffic_secret, context.remote_handshake_traffic_secret);
+            _emitHandshakeKeylog();
           }
         }
       }
@@ -836,6 +1203,7 @@ function TLSSession(options){
           has_changed=true;
           if(context.remote_handshake_traffic_secret!==null){
             ev.emit('handshakeSecrets', context.local_handshake_traffic_secret, context.remote_handshake_traffic_secret);
+            _emitHandshakeKeylog();
           }
         }
       }
@@ -846,6 +1214,7 @@ function TLSSession(options){
           has_changed=true;
           if(context.local_app_traffic_secret!==null){
             ev.emit('appSecrets', context.local_app_traffic_secret, context.remote_app_traffic_secret);
+            _emitAppKeylog();
           }
         }
       }
@@ -856,6 +1225,7 @@ function TLSSession(options){
           has_changed=true;
           if(context.remote_app_traffic_secret!==null){
             ev.emit('appSecrets', context.local_app_traffic_secret, context.remote_app_traffic_secret);
+            _emitAppKeylog();
           }
         }
       }
@@ -945,19 +1315,74 @@ function TLSSession(options){
       //select selected_cipher...
       if (context.selected_cipher_suite == null && context.local_supported_cipher_suites.length > 0 && context.remote_supported_cipher_suites.length > 0) {
         
-        for (let i2 = 0; i2 < context.local_supported_cipher_suites.length; i2++) {
-          let cs = context.local_supported_cipher_suites[i2] | 0;
-          for (let j2 = 0; j2 < context.remote_supported_cipher_suites.length; j2++) {
-            
-            if ((context.remote_supported_cipher_suites[j2] | 0) == cs) {
-              params_to_set['selected_cipher_suite'] = cs;
-              break;
-            }
+        // If resuming TLS 1.2, force cipher to match stored state (if client still offers it)
+        if (context.isServer && context.tls12_resume_state &&
+            context.selected_version !== wire.TLS_VERSION.TLS1_3 &&
+            context.selected_version !== wire.DTLS_VERSION.DTLS1_3) {
+          let storedCipher = context.tls12_resume_state.cipher | 0;
+          if (context.remote_supported_cipher_suites.indexOf(storedCipher) >= 0 &&
+              context.local_supported_cipher_suites.indexOf(storedCipher) >= 0) {
+            params_to_set['selected_cipher_suite'] = storedCipher;
+          } else {
+            // Client no longer offers this cipher → can't resume, drop state
+            context.tls12_resume_state = null;
           }
-          if ('selected_cipher_suite' in params_to_set==true && params_to_set.selected_cipher_suite !== null) break;
         }
 
-        if('selected_cipher_suite' in params_to_set==false || params_to_set.selected_cipher_suite==null){
+        // TLS 1.3 PSK resumption: per RFC 8446 §4.2.11, server MUST select a cipher compatible
+        // with the selected PSK (same hash algorithm). Since we accepted the PSK based on its
+        // stored cipher's hash (for binder verification), we force the same cipher here.
+        if (context.isServer && context.psk_accepted && context.psk_offered && context.psk_offered.cipher &&
+            (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)) {
+          let pskCipher = context.psk_offered.cipher | 0;
+          if (context.remote_supported_cipher_suites.indexOf(pskCipher) >= 0 &&
+              context.local_supported_cipher_suites.indexOf(pskCipher) >= 0) {
+            params_to_set['selected_cipher_suite'] = pskCipher;
+          }
+          // If client no longer offers this cipher, PSK can't be used — but we already accepted it.
+          // This is an edge case; fall through to normal selection and hope for the best.
+        }
+
+        if (!('selected_cipher_suite' in params_to_set)) {
+          for (let i2 = 0; i2 < context.local_supported_cipher_suites.length; i2++) {
+            let cs = context.local_supported_cipher_suites[i2] | 0;
+            for (let j2 = 0; j2 < context.remote_supported_cipher_suites.length; j2++) {
+              
+              if ((context.remote_supported_cipher_suites[j2] | 0) == cs) {
+                params_to_set['selected_cipher_suite'] = cs;
+                break;
+              }
+            }
+            if ('selected_cipher_suite' in params_to_set==true && params_to_set.selected_cipher_suite !== null) break;
+          }
+
+          if('selected_cipher_suite' in params_to_set==false || params_to_set.selected_cipher_suite==null){
+          }
+        }
+      }
+
+      // TLS 1.2 abbreviated handshake setup: validate EMS match, seed base_secret, set flags.
+      // Runs once when all prerequisites are met (version + cipher selected, resume state present).
+      if (context.isServer && context.tls12_resume_state && !context.tls12_abbreviated &&
+          params_to_set.selected_cipher_suite != null &&
+          (context.selected_version === wire.TLS_VERSION.TLS1_2 || params_to_set.selected_version === wire.TLS_VERSION.TLS1_2)) {
+
+        let storedEMS = !!context.tls12_resume_state.extended_master_secret;
+        let clientEMS = !!context.use_extended_master_secret;
+
+        if (storedEMS !== clientEMS) {
+          // EMS mismatch: per RFC 7627 can't resume. Fall through to full handshake.
+          context.tls12_resume_state = null;
+        } else {
+          // OK, we can do abbreviated. Use params_to_set for all state flags
+          // (triggers has_changed → reactive loop re-runs with new state).
+          params_to_set['tls12_abbreviated'] = true;
+          params_to_set['isResumed'] = true;
+          params_to_set['base_secret'] = context.tls12_resume_state.master_secret;
+          // Echo stored session_id if we had one from the client. Otherwise fresh.
+          // For ticket-based resume: client's CH session_id is usually non-empty "random" bytes —
+          // we echo it back (RFC 5077 §3.4). For ID-based: we already have context.remote_session_id.
+          params_to_set['selected_session_id'] = context.remote_session_id || new Uint8Array(0);
         }
       }
 
@@ -1101,6 +1526,9 @@ function TLSSession(options){
           let message_hash = wire.build_message(wire.TLS_MESSAGE_TYPE.MESSAGE_HASH, ch1_hash);
           context.transcript = [message_hash];
 
+          // Rebuild the running hash to match the reshaped transcript.
+          reset_transcript_hash(hashName);
+
           // Build and send HRR (it's a ServerHello with magic random)
           let hrr_body = wire.build_hello_retry_request({
             cipher_suite: context.selected_cipher_suite,
@@ -1137,7 +1565,10 @@ function TLSSession(options){
                 }
               }
             }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
-              can_send_hello=true;
+              // Block ServerHello while waiting for async resumeSession decision
+              if (!context.tls12_resume_pending) {
+                can_send_hello=true;
+              }
             }
           }
         }
@@ -1194,26 +1625,50 @@ function TLSSession(options){
 
             // Only echo extended_master_secret if client sent it
             if (context.use_extended_master_secret) {
-              ext_list.push({ type: 23, data: new Uint8Array(0) });
+              ext_list.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
             }
 
-            if (context.alpn_selected) {
+            if (context.selected_alpn) {
               // RFC 7301: ServerHello echoes a single selected protocol
-              ext_list.push({ type: 'ALPN', value: [ String(context.alpn_selected) ] });
+              ext_list.push({ type: 'ALPN', value: [ String(context.selected_alpn) ] });
+            }
+
+            // SESSION_TICKET: RFC 5077 §3.2 — server echoes empty extension to signal it will
+            // send a NewSessionTicket later. Skip for abbreviated handshake (per §3.3).
+            // Skip for DTLS — we don't emit NST in DTLS, so MUST NOT echo the ext either (§3.2).
+            let isDtls12Here = (context.selected_version === wire.DTLS_VERSION.DTLS1_2);
+            if (context.tls12_session_ticket_requested && !context.tls12_abbreviated && context.sessionTickets && !isDtls12Here) {
+              ext_list.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
+            }
+
+            // Session ID: for abbreviated (resumed) handshake, MUST echo client's session_id
+            // (RFC 5077 §3.4). For TLS 1.2 full handshake, generate a fresh 32-byte session_id
+            // (matches OpenSSL/Node.js behavior for middlebox compatibility).
+            // For DTLS 1.2 full handshake: just echo client's session_id (no middlebox concern,
+            // and matches original lemon-tls behavior before my TLS 1.2 resumption changes).
+            let sid_to_send;
+            if (context.tls12_abbreviated) {
+              sid_to_send = context.remote_session_id || new Uint8Array(0);
+            } else if (context.selected_version === wire.DTLS_VERSION.DTLS1_2) {
+              sid_to_send = context.remote_session_id || new Uint8Array(0);
+            } else {
+              if (!context.tls12_session_id_for_store) {
+                context.tls12_session_id_for_store = new Uint8Array(crypto.randomBytes(32));
+              }
+              sid_to_send = context.tls12_session_id_for_store;
             }
 
             build_message_params = {
               type: 'server_hello',
               version: context.selected_version,
               random: context.local_random,
-              session_id: context.remote_session_id || new Uint8Array(0), // echo client session_id
+              session_id: sid_to_send,
               cipher_suite: context.selected_cipher_suite,  // e.g. 0xC02F
               // compression_method always 0
               extensions: ext_list
             };
 
             
-
 
 
           }
@@ -1247,12 +1702,14 @@ function TLSSession(options){
 
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
           let result;
+          // Use incremental transcript hash — avoids concat+hash of full transcript
+          let tx_hash = get_transcript_hash(hashName);
           if (context.psk_accepted && context.psk_offered && context.psk_offered.psk) {
             // PSK + ECDHE key schedule
-            result = derive_handshake_traffic_secrets_psk(hashName, context.psk_offered.psk, context.ecdhe_shared_secret, concatUint8Arrays(context.transcript));
+            result = derive_handshake_traffic_secrets_psk_with_hash(hashName, context.psk_offered.psk, context.ecdhe_shared_secret, tx_hash);
           } else {
             // Standard key schedule (no PSK)
-            result = derive_handshake_traffic_secrets(hashName, context.ecdhe_shared_secret, concatUint8Arrays(context.transcript));
+            result = derive_handshake_traffic_secrets_with_hash(hashName, context.ecdhe_shared_secret, tx_hash);
           }
 
           params_to_set['base_secret']=result.handshake_secret;
@@ -1357,7 +1814,7 @@ function TLSSession(options){
         context.message_sent_seq++;
       }
 
-      if(context.isServer==true && context.cert_sent==false && context.local_cert_chain!==null && !context.psk_accepted){
+      if(context.isServer==true && context.cert_sent==false && context.local_cert_chain!==null && !context.psk_accepted && !context.tls12_abbreviated){
         if(((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null) || ((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.hello_sent==true)){
 
           let message_data = build_tls_message({
@@ -1390,7 +1847,8 @@ function TLSSession(options){
       if (context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
         if(context.cert_sent==true && context.cert_verify_sent==false && context.local_cert_chain!==null && context.local_handshake_traffic_secret!==null && context.selected_cipher_suite!==null){
 
-          let tbs_data = build_cert_verify_tbs(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash,true,concatUint8Arrays(context.transcript));
+          let tbsHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let tbs_data = build_cert_verify_tbs_with_hash(tbsHashName, true, get_transcript_hash(tbsHashName));
 
           let cert_private_key_obj = crypto.createPrivateKey({
             key: Buffer.from(context.cert_private_key),
@@ -1666,6 +2124,73 @@ function TLSSession(options){
       
       
 
+      // TLS 1.2 server: send NewSessionTicket (RFC 5077) BEFORE our Finished.
+      // Per RFC 5077 §3.3: "sent during the TLS handshake before the ChangeCipherSpec
+      // message, after the server has successfully verified the client's Finished message."
+      // Must run BEFORE the Finished send block below (which sets finished_sent=true).
+      // NOTE: Only for FULL handshake. In abbreviated handshake, we'd need to signal renewal
+      // via SESSION_TICKET ext in SH (which we don't add for abbreviated per RFC 5077 §3.2),
+      // so sending NST would cause "unexpected message" errors on strict clients (e.g. openssl).
+      // Renewal is optional per RFC 5077 §3.3 — safer to skip it in abbreviated.
+      // Excluded for DTLS 1.2 — implementations (e.g. openssl s_server -dtls1_2) don't always
+      // support it well. Revisit if needed.
+      if (context.selected_version === wire.TLS_VERSION.TLS1_2 &&
+          context.isServer && !context.tls12_newsession_sent && context.sessionTickets &&
+          context.tls12_session_ticket_requested && !context.tls12_abbreviated &&
+          context.base_secret) {
+
+        // Full handshake only: send NST after client's Finished verified, before server's Finished.
+        let can_send_nst = context.remote_finished_ok && !context.finished_sent;
+
+        if (can_send_nst) {
+          context.tls12_newsession_sent = true;
+
+          // Ensure ticketKeys is 48 bytes
+          if (!context.ticketKeys || context.ticketKeys.length !== 48) {
+            context.ticketKeys = crypto.randomBytes(48);
+          }
+
+          // Build session state to encrypt into ticket
+          let ticket = encrypt_session_blob({
+            v: 12,                                      // blob kind: TLS 1.2
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            master_secret: context.base_secret,
+            extended_master_secret: !!context.use_extended_master_secret,
+            sni: context.selected_sni || context.remote_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          }, context.ticketKeys);
+
+          let nst_data = build_tls_message({
+            type: 'new_session_ticket_tls12',
+            ticket_lifetime_hint: context.ticketLifetime,
+            ticket: ticket,
+          });
+
+          pushTranscript(nst_data);
+          // epoch 0 = cleartext (server hasn't sent its CCS yet)
+          ev.emit('message', 0, context.message_sent_seq, 'new_session_ticket', nst_data);
+          context.message_sent_seq++;
+
+          // Server-side 'session' event for monitoring / backward compat with lemon-tls
+          let server_session_blob = encode_client_session({
+            v: 12,
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            master_secret: context.base_secret,
+            extended_master_secret: !!context.use_extended_master_secret,
+            ticket: ticket,
+            session_id: context.remote_session_id || null,
+            lifetime: context.ticketLifetime,
+            sni: context.selected_sni || context.remote_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          });
+          ev.emit('session', server_session_blob);
+        }
+      }
+
       //send finished...
       // Client: send Certificate + CertificateVerify before Finished (if server requested)
       if(context.isServer==false && context.certificateRequested && !context.clientCertSent &&
@@ -1687,7 +2212,7 @@ function TLSSession(options){
 
           // Send CertificateVerify
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-          let transcript_hash = getHashFn(hashName)(concatUint8Arrays(context.transcript));
+          let transcript_hash = get_transcript_hash(hashName);
           let scheme = pick_scheme(context.certificateRequestSigAlgs.length > 0 ? context.certificateRequestSigAlgs : context.local_supported_signature_algorithms, certCtx.privateKey);
           let signature = sign_with_scheme(scheme, certCtx.privateKey, transcript_hash, false);
           let cv_data = build_tls_message({
@@ -1720,7 +2245,8 @@ function TLSSession(options){
 
           if((context.isServer==false && context.remote_finished_ok==true && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (context.isServer==true && context.cert_verify_sent==true && context.local_cert_chain!==null) || (context.isServer==true && context.psk_accepted==true && context.encrypted_exts_sent==true)){
 
-            let finished_data=get_handshake_finished(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash,context.local_handshake_traffic_secret,concatUint8Arrays(context.transcript));
+            let finHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let finished_data=get_handshake_finished_with_hash(finHashName,context.local_handshake_traffic_secret,get_transcript_hash(finHashName));
             context.local_finished_data = finished_data;
 
             let message_data = build_tls_message({
@@ -1740,16 +2266,34 @@ function TLSSession(options){
 
         }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
 
-          if((context.isServer==true && context.remote_finished_ok==true) || (context.isServer==false && context.key_exchange_sent==true)){
+          // Finished ordering differs between full and abbreviated handshake:
+          //   Full:        client sends first (after CKE), then server (after client's Finished).
+          //   Abbreviated: server sends first (after ServerHello), then client (after server's Finished).
+          let can_send_finished;
+          if (context.tls12_abbreviated) {
+            if (context.isServer) {
+              can_send_finished = context.hello_sent == true;                // after ServerHello
+            } else {
+              can_send_finished = context.remote_finished_ok == true;        // after server's Finished
+            }
+          } else {
+            if (context.isServer) {
+              can_send_finished = context.remote_finished_ok == true;
+            } else {
+              can_send_finished = context.key_exchange_sent == true;
+            }
+          }
 
-            let hashFn  = getHashFn(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
-            let transcript_hash = hashFn(concatUint8Arrays(context.transcript));
+          if (can_send_finished) {
+
+            let finishedHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let transcript_hash = get_transcript_hash(finishedHashName);
 
             let finished_data;
             if(context.isServer==true){
-              finished_data=tls12_prf(context.base_secret, "server finished", transcript_hash, 12, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+              finished_data=tls12_prf(context.base_secret, "server finished", transcript_hash, 12, finishedHashName);
             }else{
-              finished_data=tls12_prf(context.base_secret, "client finished", transcript_hash, 12, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+              finished_data=tls12_prf(context.base_secret, "client finished", transcript_hash, 12, finishedHashName);
             }
             context.local_finished_data = finished_data;
 
@@ -1778,7 +2322,8 @@ function TLSSession(options){
 
           if((context.isServer==true && context.finished_sent==true && context.remote_finished_ok==false) || (context.isServer==false && context.finished_sent==false && context.remote_finished_ok==true)){
 
-            let result2 = derive_app_traffic_secrets(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash, context.base_secret, concatUint8Arrays(context.transcript));
+            let appHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let result2 = derive_app_traffic_secrets_with_hash(appHashName, context.base_secret, get_transcript_hash(appHashName));
 
             // Save master_secret for resumption before clearing
             params_to_set['tls13_master_secret'] = result2.master_secret;
@@ -1803,7 +2348,8 @@ function TLSSession(options){
 
           if((context.isServer==true && context.finished_sent==true) || (context.isServer==false && context.remote_finished !== null)){
 
-            params_to_set['expected_remote_finished']=get_handshake_finished(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash,context.remote_handshake_traffic_secret,concatUint8Arrays(context.transcript));
+            let remoteFinHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            params_to_set['expected_remote_finished']=get_handshake_finished_with_hash(remoteFinHashName,context.remote_handshake_traffic_secret,get_transcript_hash(remoteFinHashName));
 
           }
 
@@ -1812,13 +2358,13 @@ function TLSSession(options){
           if(context.remote_finished!==null){
 
 
-            let hashFn  = getHashFn(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
-            let transcript_hash = hashFn(concatUint8Arrays(context.transcript));
+            let tls12FinHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let transcript_hash = get_transcript_hash(tls12FinHashName);
 
             if(context.isServer==true){
-              params_to_set['expected_remote_finished']=tls12_prf(context.base_secret, "client finished", transcript_hash, 12, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+              params_to_set['expected_remote_finished']=tls12_prf(context.base_secret, "client finished", transcript_hash, 12, tls12FinHashName);
             }else{
-              params_to_set['expected_remote_finished']=tls12_prf(context.base_secret, "server finished", transcript_hash, 12, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+              params_to_set['expected_remote_finished']=tls12_prf(context.base_secret, "server finished", transcript_hash, 12, tls12FinHashName);
             }
 
             
@@ -1870,46 +2416,53 @@ function TLSSession(options){
         // TLS 1.3: compute resumption_master_secret (both client and server need it)
         if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.tls13_master_secret && !context.resumption_master_secret) {
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-          context.resumption_master_secret = derive_resumption_master_secret(
-            hashName, context.tls13_master_secret, concatUint8Arrays(context.transcript)
+          context.resumption_master_secret = derive_resumption_master_secret_with_hash(
+            hashName, context.tls13_master_secret, get_transcript_hash(hashName)
           );
         }
 
         // TLS 1.3 server: send NewSessionTicket
-        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.isServer && !context.session_ticket_sent && !context.noTickets && context.resumption_master_secret) {
+        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.isServer && !context.session_ticket_sent && context.sessionTickets && context.resumption_master_secret) {
           context.session_ticket_sent = true;
 
           let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
           let ticket_nonce = new Uint8Array([context.ticket_nonce_counter++]);
           let psk = derive_psk(hashName, context.resumption_master_secret, ticket_nonce);
           let ticket_age_add = crypto.randomBytes(4).readUInt32BE(0);
-          let ticket_lifetime = 7200; // 2 hours
+          let ticket_lifetime = context.ticketLifetime;
 
-          // Ticket = encrypted PSK + metadata using ticketKeys (or random fallback)
-          // Format: iv(12) || encrypted_json || tag(16)
-          // ticketKeys: 48 bytes = name(16) + aes_key(16) + hmac_key(16)
-          // We use first 32 bytes as AES-256-GCM key for simplicity
-          let tk = context.ticketKeys || crypto.randomBytes(48);
-          let ticket_enc_key = tk.length >= 32 ? tk.slice(0, 32) : Buffer.concat([tk, crypto.randomBytes(32 - tk.length)]);
-          let ticket_iv = crypto.randomBytes(12);
-          let ticket_plaintext = Buffer.from(JSON.stringify({
-            psk: Buffer.from(psk).toString('base64'),
+          dbg('SRV-NST', 'issuing TLS 1.3 NST — cipher:', '0x' + context.selected_cipher_suite.toString(16),
+              'hash:', hashName,
+              'transcript len:', concatUint8Arrays(context.transcript).length);
+          dbg('SRV-NST', 'ticket_nonce:', hexPreview(ticket_nonce, 4),
+              'age_add:', ticket_age_add,
+              'lifetime:', ticket_lifetime);
+          dbg('SRV-NST', 'resumption_master_secret:', hexPreview(context.resumption_master_secret, 8),
+              'derived psk:', hexPreview(psk, 8));
+
+          // Ensure ticketKeys is 48 bytes (key_name + aes_key)
+          if (!context.ticketKeys || context.ticketKeys.length !== 48) {
+            context.ticketKeys = crypto.randomBytes(48);
+          }
+
+          // Encrypt session state into opaque ticket (unified format: key_name(16) | IV(12) | CT | Tag(16))
+          let ticket = encrypt_session_blob({
+            v: 13,                                      // blob kind: TLS 1.3 PSK
+            version: context.selected_version,
             cipher: context.selected_cipher_suite,
+            psk: psk,
             age_add: ticket_age_add,
-            created: Date.now()
-          }));
-          let ticket_cipher = crypto.createCipheriv('aes-256-gcm', ticket_enc_key, ticket_iv);
-          let ticket_ct = ticket_cipher.update(ticket_plaintext);
-          ticket_cipher.final();
-          let ticket_tag = ticket_cipher.getAuthTag();
-          let ticket = Buffer.concat([ticket_iv, ticket_ct, ticket_tag]);
+            sni: context.selected_sni || context.remote_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          }, context.ticketKeys);
 
           let nst_data = wire.build_message(wire.TLS_MESSAGE_TYPE.NEW_SESSION_TICKET,
             wire.build_new_session_ticket({
               ticket_lifetime: ticket_lifetime,
               ticket_age_add: ticket_age_add,
               ticket_nonce: ticket_nonce,
-              ticket: new Uint8Array(ticket),
+              ticket: ticket,
               extensions: []
             })
           );
@@ -1917,15 +2470,85 @@ function TLSSession(options){
           ev.emit('message', 2, context.message_sent_seq, 'new_session_ticket', nst_data);
           context.message_sent_seq++;
 
-          ev.emit('session', {
-            ticket: new Uint8Array(ticket),
-            ticket_nonce: ticket_nonce,
-            psk: psk,
+          // Emit 'session' event on server side too — lets users track when tickets are
+          // issued (e.g. for monitoring or metrics). Not part of Node.js API but useful.
+          // Emits the same Buffer the client would receive via their 'session' event,
+          // so server-side apps could also persist it if they want.
+          let server_session_blob = encode_client_session({
+            v: 13,
+            version: context.selected_version,
             cipher: context.selected_cipher_suite,
-            lifetime: ticket_lifetime,
+            ticket: ticket,
+            psk: psk,
             age_add: ticket_age_add,
-            maxEarlyDataSize: 0,
+            lifetime: ticket_lifetime,
+            sni: context.selected_sni || context.remote_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
           });
+          ev.emit('session', server_session_blob);
+        }
+
+        // TLS 1.2 server: emit 'newSession' for Session ID-based resumption.
+        // Fires whenever we generated a session_id for this connection AND didn't issue
+        // a NewSessionTicket (so the client can only resume via Session ID — we need the
+        // user to store the session state). TLS 1.2 only (DTLS 1.2 excluded for now).
+        if (context.selected_version === wire.TLS_VERSION.TLS1_2 &&
+            context.isServer && !context.tls12_abbreviated && !context.tls12_newsession_sent &&
+            context.tls12_session_id_for_store && !context.tls12_session_id_emitted && context.base_secret &&
+            context.remote_finished_ok) {
+
+          context.tls12_session_id_emitted = true;
+
+          // Ensure ticketKeys is 48 bytes (used to encrypt stored session data)
+          if (!context.ticketKeys || context.ticketKeys.length !== 48) {
+            context.ticketKeys = crypto.randomBytes(48);
+          }
+
+          let stored_blob = encrypt_session_blob({
+            v: 12,
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            master_secret: context.base_secret,
+            extended_master_secret: !!context.use_extended_master_secret,
+            sni: context.selected_sni || context.remote_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          }, context.ticketKeys);
+
+          // User stores this; returns it on next handshake via 'resumeSession' callback.
+          ev.emit('newSession', context.tls12_session_id_for_store, stored_blob, function() {
+            // Callback is advisory — we don't block on it in lemon-tls.
+            // (Node.js blocks the handshake until callback is invoked, but our reactive
+            // model decouples this: the session is marked for storage and we continue.)
+          });
+        }
+
+        // TLS 1.2 client: emit 'session' for Session ID-only resumption (no ticket received).
+        // Fires at secureConnect when the server gave us a non-empty session_id but no
+        // NewSessionTicket — the client's only way to resume is via Session ID, so we must
+        // give the user a blob containing session_id + master_secret to pass back later.
+        // TLS 1.2 only (DTLS 1.2 excluded for now).
+        if (context.selected_version === wire.TLS_VERSION.TLS1_2 &&
+            !context.isServer && !context.tls12_abbreviated && !context.tls12_client_session_emitted &&
+            context.remote_session_id && context.remote_session_id.length > 0 &&
+            context.base_secret && context.remote_finished_ok) {
+
+          context.tls12_client_session_emitted = true;
+
+          let session_blob = encode_client_session({
+            v: 12,                                    // blob kind: TLS 1.2
+            version: context.selected_version,
+            cipher: context.selected_cipher_suite,
+            master_secret: context.base_secret,
+            extended_master_secret: !!context.use_extended_master_secret,
+            ticket: null,                             // no ticket — Session ID only
+            session_id: context.remote_session_id,
+            sni: context.local_sni || null,
+            alpn: context.selected_alpn || null,
+            created: Date.now(),
+          });
+          ev.emit('session', session_blob);
         }
       }
 
@@ -2093,7 +2716,7 @@ function TLSSession(options){
         },
         // TLS 1.2 compatibility
         { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) },
-        { type: 23, data: new Uint8Array(0) } // extended_master_secret
+        { type: 'EXTENDED_MASTER_SECRET', value: null }
       ];
 
       // Add SNI if servername was provided
@@ -2111,35 +2734,47 @@ function TLSSession(options){
         extensions.push(context.local_extensions[i]);
       }
 
-      // PSK resumption: check if session/psk was provided
-      let pskData = options.session || options.psk || null;
+      // Resumption: check if session was provided (opaque Buffer) — decode to structured data
+      let sessionData = null;
+      if (options.session) {
+        // options.session may be a Buffer/Uint8Array (Node.js style) or a plain object (legacy)
+        if (options.session instanceof Uint8Array || Buffer.isBuffer(options.session)) {
+          sessionData = decode_client_session(options.session);
+        } else if (typeof options.session === 'object') {
+          sessionData = options.session; // legacy: already-structured object
+        }
+      } else if (options.psk) {
+        sessionData = options.psk; // legacy path
+      }
+
       let message_data;
 
-      if (pskData && pskData.psk && pskData.ticket && pskData.cipher) {
+      // TLS 1.3 PSK resumption (sessionData contains psk)
+      if (sessionData && sessionData.psk && sessionData.ticket && sessionData.cipher) {
         // Add PSK key exchange modes (psk_dhe_ke = 1)
         extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
 
         // Save PSK for later verification
         context.psk_offered = {
-          identity: pskData.ticket,
-          psk: pskData.psk instanceof Uint8Array ? pskData.psk : new Uint8Array(pskData.psk),
-          cipher: pskData.cipher,
-          age_add: pskData.age_add || 0,
+          identity: sessionData.ticket,
+          psk: sessionData.psk instanceof Uint8Array ? sessionData.psk : new Uint8Array(sessionData.psk),
+          cipher: sessionData.cipher,
+          age_add: sessionData.age_add || 0,
         };
 
         // Compute obfuscated ticket age
-        let ticketAge = pskData.lifetime ? Math.min((Date.now() - (pskData.created || Date.now())) / 1000, pskData.lifetime) * 1000 : 0;
-        let obfuscatedAge = ((ticketAge + (pskData.age_add || 0)) & 0xFFFFFFFF) >>> 0;
+        let ticketAge = sessionData.lifetime ? Math.min((Date.now() - (sessionData.created || Date.now())) / 1000, sessionData.lifetime) * 1000 : 0;
+        let obfuscatedAge = ((ticketAge + (sessionData.age_add || 0)) & 0xFFFFFFFF) >>> 0;
 
         // Build ClientHello with placeholder binder to compute truncated hash
-        let hashName = TLS_CIPHER_SUITES[pskData.cipher] ? TLS_CIPHER_SUITES[pskData.cipher].hash : 'sha256';
+        let hashName = TLS_CIPHER_SUITES[sessionData.cipher] ? TLS_CIPHER_SUITES[sessionData.cipher].hash : 'sha256';
         let hashLen = getHashFn(hashName).outputLen;
         let placeholderBinder = new Uint8Array(hashLen);
 
         let pskExt = {
           type: 'PRE_SHARED_KEY',
           value: {
-            identities: [{ identity: pskData.ticket, age: obfuscatedAge }],
+            identities: [{ identity: sessionData.ticket, age: obfuscatedAge }],
             binders: [placeholderBinder]
           }
         };
@@ -2165,12 +2800,63 @@ function TLSSession(options){
         let binder_key = derive_binder_key(hashName, context.psk_offered.psk, false);
         let binder = compute_psk_binder(hashName, binder_key, truncatedMessage);
 
+        dbg('CLI-PSK', 'ticket:', hexPreview(sessionData.ticket, 24),
+            'cipher:', '0x' + sessionData.cipher.toString(16),
+            'hash:', hashName);
+        dbg('CLI-PSK', 'psk:', hexPreview(sessionData.psk, 8),
+            'age_add:', sessionData.age_add,
+            'lifetime:', sessionData.lifetime,
+            'ticketAge (ms):', ticketAge,
+            'obfuscatedAge:', obfuscatedAge);
+        dbg('CLI-PSK', 'truncatedMessage len:', truncatedMessage.length,
+            'full CH len (after real binder):', 'see next');
+        dbg('CLI-PSK', 'sent binder:', hexPreview(binder, 16));
+
         // Rebuild with real binder
         pskExt.value.binders = [binder];
         message_data = build_tls_message(build_message_params);
 
+      } else if (sessionData && sessionData.v === 12 && sessionData.master_secret) {
+        // TLS 1.2 resumption: session ID and/or SessionTicket
+        // Save for later verification when ServerHello arrives
+        context.tls12_client_session = sessionData;
+
+        // Only advertise SESSION_TICKET ext if we actually have a ticket to present.
+        // If we only have a session_id (no ticket), don't include empty SESSION_TICKET ext:
+        // servers with SSL_OP_NO_TICKET can behave inconsistently when the extension appears
+        // alongside a session_id resumption attempt — they may skip the session_id lookup.
+        if (sessionData.ticket && sessionData.ticket.length > 0) {
+          extensions.push({ type: 'SESSION_TICKET', value: sessionData.ticket });
+        }
+
+        // If we have a session_id → put it in ClientHello.session_id (overrides the random one)
+        let sid = context.local_session_id;
+        if (sessionData.session_id && sessionData.session_id.length > 0) {
+          sid = sessionData.session_id;
+          context.local_session_id = sid;
+        }
+
+        let build_message_params = {
+          type: 'client_hello',
+          version: 0x0303,
+          random: context.local_random,
+          session_id: sid,
+          cookie: context.dtls_cookie,
+          cipher_suite: context.local_supported_cipher_suites,
+          extensions: extensions
+        };
+        message_data = build_tls_message(build_message_params);
+
       } else {
-        // No PSK — standard ClientHello
+        // No resumption — advertise empty SessionTicket extension to offer support.
+        // Skip for DTLS (DTLS clients/servers often don't implement RFC 5077 fully,
+        // and adding it caused interop issues with openssl s_server -dtls1_2).
+        let isDtls = context.local_supported_versions && context.local_supported_versions.some(v => (v & 0xFF00) === 0xFE00);
+        if (!isDtls && context.sessionTickets) {
+          extensions.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
+        }
+
+        // Standard ClientHello
         let build_message_params = {
           type: 'client_hello',
           version: 0x0303,
@@ -2249,7 +2935,7 @@ function TLSSession(options){
 
     /** Returns the negotiated ALPN protocol string (e.g. 'h2'), or null. */
     getALPN: function(){
-      return context.alpn_selected || null;
+      return context.selected_alpn || null;
     },
 
     /** Returns the remote certificate chain, or null. */

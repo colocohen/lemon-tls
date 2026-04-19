@@ -90,6 +90,8 @@ const TLS_EXT = {
   CLIENT_CERT_TYPE: 19,
   SERVER_CERT_TYPE: 20,
   PADDING: 21,
+  EXTENDED_MASTER_SECRET: 23,
+  SESSION_TICKET: 35,
   PRE_SHARED_KEY: 41,
   EARLY_DATA: 42,
   SUPPORTED_VERSIONS: 43,
@@ -240,6 +242,8 @@ exts.KEY_SHARE = { encode: null, decode: null };
 exts.ALPN = { encode: null, decode: null };
 exts.COOKIE = { encode: null, decode: null };
 exts.RENEGOTIATION_INFO = { encode: null, decode: null };
+exts.SESSION_TICKET = { encode: null, decode: null };
+exts.EXTENDED_MASTER_SECRET = { encode: null, decode: null };
 
 /* ------------------------------ SERVER_NAME (0) ------------------------------ */
 exts.SERVER_NAME.encode = function (value) {
@@ -666,6 +670,27 @@ exts.COOKIE.decode = function (data) {
   return v; // Uint8Array — opaque cookie
 };
 
+/* ---------------------------- SESSION_TICKET (35) ---------------------------- */
+// RFC 5077. Both directions carry opaque bytes (not a length-prefixed vector).
+//   ClientHello: empty = "I support tickets" / non-empty = "resume using this ticket"
+//   ServerHello: empty = "I will send a NewSessionTicket" (never non-empty in ServerHello)
+exts.SESSION_TICKET.encode = function (value) {
+  return toU8(value || new Uint8Array(0));
+};
+
+exts.SESSION_TICKET.decode = function (data) {
+  return data; // opaque bytes — caller interprets
+};
+
+/* -------------------------- EXTENDED_MASTER_SECRET (23) -------------------------- */
+// RFC 7627. Both directions: empty body. Signals support for Extended Master Secret.
+exts.EXTENDED_MASTER_SECRET.encode = function (value) {
+  return new Uint8Array(0);
+};
+
+exts.EXTENDED_MASTER_SECRET.decode = function (data) {
+  return true; // presence is the signal
+};
 /* ============================= Extensions helpers ============================= */
 function ext_name_by_code(code) {
   // best-effort pretty name

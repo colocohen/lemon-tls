@@ -533,7 +533,7 @@ function TLSSession(options){
             }
 
             // Custom extensions (e.g. QUIC transport params 0x39)
-            for (let ci in context.local_extensions) {
+            for (let ci = 0; ci < context.local_extensions.length; ci++) {
               extensions.push(context.local_extensions[ci]);
             }
 
@@ -999,7 +999,7 @@ function TLSSession(options){
 
 
       if('add_local_key_groups' in options){
-        for(let i in options['add_local_key_groups']){
+        for(let i = 0; i < options['add_local_key_groups'].length; i++){
 
           let group=options['add_local_key_groups'][i].group;
           if(group in context.local_key_groups==false){
@@ -1029,7 +1029,7 @@ function TLSSession(options){
 
 
       if('add_remote_key_groups' in options){
-        for(let i in options['add_remote_key_groups']){
+        for(let i = 0; i < options['add_remote_key_groups'].length; i++){
 
           let group=options['add_remote_key_groups'][i].group;
           if(group in context.remote_key_groups==false){
@@ -1779,7 +1779,7 @@ function TLSSession(options){
           }
 
 
-          for(let i in context.local_extensions){
+          for(let i = 0; i < context.local_extensions.length; i++){
             extensions.push(context.local_extensions[i]);
           }
 
@@ -2730,7 +2730,7 @@ function TLSSession(options){
       }
 
       // Add custom extensions (e.g. QUIC transport params 0x39)
-      for (let i in context.local_extensions) {
+      for (let i = 0; i < context.local_extensions.length; i++) {
         extensions.push(context.local_extensions[i]);
       }
 

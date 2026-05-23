@@ -29,7 +29,7 @@ function normalize_hello(hello) {
       } else if (name === 'KEY_SHARE') {
         if (!('key_groups' in out)) out.key_groups = [];
         if (!('supported_groups' in out)) out.supported_groups = [];
-        for (let i2 in value) {
+        for (let i2 = 0; i2 < value.length; i2++) {
           if (out.supported_groups.indexOf(value[i2].group) < 0) {
             out.supported_groups.push(value[i2].group);
           }

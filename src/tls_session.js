@@ -2105,6 +2105,41 @@ function TLSSession(options){
         }
       }
 
+      // TLS 1.2 / DTLS 1.2 server: send CertificateRequest if mutual auth was
+      // requested via { requestCert: true }. Per RFC 5246 §7.4.4 this message
+      // goes between ServerKeyExchange and ServerHelloDone. The TLS 1.3 path
+      // (line ~1805) sends CertificateRequest between EncryptedExtensions and
+      // Certificate and is handled separately — version branching matters
+      // because the wire formats differ (RFC 5246 §7.4.4 vs RFC 8446 §4.3.2).
+      //
+      // Without this block, a 1.2 server that sets requestCert never actually
+      // requests the client's certificate, the client never sends one (TLS
+      // clients only send a cert in response to CertificateRequest), and any
+      // application-layer fingerprint check on the server fails with "peer
+      // presented no certificate" — most notably breaking WebRTC, which
+      // mandates mutual authentication (RFC 8827 §6.5) and pins to DTLS 1.2.
+      if (context.isServer == true && context.requestCert == true &&
+          !context.certificateRequestSent &&
+          context.key_exchange_sent == true && !context.hello_done_sent &&
+          (context.selected_version === wire.TLS_VERSION.TLS1_2 ||
+           context.selected_version === wire.DTLS_VERSION.DTLS1_2)) {
+
+        let cr_body = wire.build_certificate_request({
+          version: wire.TLS_VERSION.TLS1_2,
+          // rsa_sign(1), ecdsa_sign(64) — accept both. WebRTC uses ECDSA,
+          // most other 1.2 deployments use RSA. The client picks whichever
+          // matches its certificate.
+          certificate_types: [1, 64],
+          signature_algorithms: context.local_supported_signature_algorithms || [],
+          certificate_authorities: [],  // empty: accept any CA
+        });
+        let cr_data = wire.build_message(wire.TLS_MESSAGE_TYPE.CERTIFICATE_REQUEST, cr_body);
+        pushTranscript(cr_data);
+        context.certificateRequestSent = true;
+        ev.emit('message', 0, context.message_sent_seq, 'certificate_request', cr_data);
+        context.message_sent_seq++;
+      }
+
       //server hello done - 1.2 only...
       if(context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
         if(context.hello_done_sent==false && context.key_exchange_sent==true){

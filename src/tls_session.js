@@ -504,20 +504,24 @@ function TLSSession(options){
             // - ALPN (same as CH1)
             // - custom extensions (QUIC transport params etc.)
             // - same cipher_suites, session_id, random as CH1
+            // CH2 MUST match CH1 exactly except key_share/cookie (RFC 8446
+            // §4.1.2) — so mirror CH1's conditional composition: same sigalg
+            // source (CH1 wrote its final list back to the context), and the
+            // same tls13Only rules for the legacy extensions and psk modes.
+            let tls13Only2 = context.local_supported_versions.length > 0 &&
+                             context.local_supported_versions.every(v => v === 0x0304);
             let extensions = [
               { type: 'SUPPORTED_VERSIONS', value: context.local_supported_versions },
               { type: 'SUPPORTED_GROUPS', value: context.local_supported_groups },
               { type: 'KEY_SHARE', value: [{ group: requestedGroup, key_exchange: newKeyGroup.public_key }] },
-              { type: 'SIGNATURE_ALGORITHMS', value: [
-                  // Must match CH1 exactly (RFC 8446 §4.1.2)
-                  0x0804, 0x0805, 0x0806,
-                  0x0403, 0x0503, 0x0603,
-                  0x0807, 0x0808,
-                  0x0401, 0x0501, 0x0601
-              ] },
-              { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) },
-              { type: 'EXTENDED_MASTER_SECRET', value: null },
+              { type: 'SIGNATURE_ALGORITHMS', value: context.local_supported_signature_algorithms },
             ];
+            if (!tls13Only2) {
+              extensions.push({ type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) });
+              extensions.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
+            } else {
+              extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
+            }
 
             // SNI (must be first)
             if (context.local_sni) extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
@@ -543,6 +547,11 @@ function TLSSession(options){
               random: context.local_random,
               session_id: context.local_session_id,
               cookie: context.dtls_cookie,
+          // BUGFIX: `cipher_suites` (plural) is what wire.js's client_hello
+              // builder actually reads; the singular key was silently ignored and
+              // wire.js substituted its own hardcoded fallback list — the
+              // configured cipher suites never reached the wire. Both names passed.
+              cipher_suites: context.local_supported_cipher_suites,
               cipher_suite: context.local_supported_cipher_suites,
               extensions: extensions,
             });
@@ -2690,9 +2699,22 @@ function TLSSession(options){
         context.local_session_id=new Uint8Array(crypto.randomBytes(32));
       }
 
+      // TLS 1.3-only mode (QUIC and any client that offers no other version):
+      // the ClientHello must not carry TLS 1.2 baggage. QUIC mandates TLS 1.3
+      // (RFC 9001), and strict 1.3-only stacks reject hellos with legacy
+      // artifacts. Detected from the configured versions, so plain TLS over
+      // TCP (which offers 1.3+1.2) keeps the full compatibility behavior.
+      let tls13Only = context.local_supported_versions.length > 0 &&
+                      context.local_supported_versions.every(v => v === 0x0304);
+
       // Support both TLS 1.3 and 1.2 (server picks the best)
       if(context.local_supported_cipher_suites.length<=0){
-        context.local_supported_cipher_suites=[
+        context.local_supported_cipher_suites = tls13Only ? [
+          // TLS 1.3 only — no ECDHE 1.2 suites in a QUIC hello
+          0x1301, // TLS_AES_128_GCM_SHA256
+          0x1302, // TLS_AES_256_GCM_SHA384
+          0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        ] : [
           // TLS 1.3
           0x1301, // TLS_AES_128_GCM_SHA256
           0x1302, // TLS_AES_256_GCM_SHA384
@@ -2722,6 +2744,23 @@ function TLSSession(options){
         private_key: private_key
       };
 
+      // Honor the configured signature algorithms; the hardcoded list is only
+      // the default when none were set (previously the configured list was
+      // ignored here — while the HRR CH2 hardcoded its own, so CH1 and CH2
+      // could differ, violating RFC 8446 §4.1.2's exact-match requirement).
+      let ch_sigalgs = (context.local_supported_signature_algorithms &&
+                        context.local_supported_signature_algorithms.length > 0)
+        ? context.local_supported_signature_algorithms
+        : [
+            // TLS 1.3 (PSS + ECDSA + EdDSA)
+            0x0804, 0x0805, 0x0806,
+            0x0403, 0x0503, 0x0603,
+            0x0807, 0x0808,
+            // TLS 1.2 (PKCS1)
+            0x0401, 0x0501, 0x0601
+          ];
+      context.local_supported_signature_algorithms = ch_sigalgs; // for CH2 reuse
+
       let extensions = [
         { 
           type: 'SUPPORTED_VERSIONS', 
@@ -2740,19 +2779,20 @@ function TLSSession(options){
         },
         {
           type: 'SIGNATURE_ALGORITHMS', 
-          value: [
-            // TLS 1.3 (PSS + ECDSA)
-            0x0804, 0x0805, 0x0806,
-            0x0403, 0x0503, 0x0603,
-            0x0807, 0x0808,
-            // TLS 1.2 (PKCS1)
-            0x0401, 0x0501, 0x0601
-          ]
-        },
-        // TLS 1.2 compatibility
-        { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) },
-        { type: 'EXTENDED_MASTER_SECRET', value: null }
+          value: ch_sigalgs
+        }
       ];
+      if (!tls13Only) {
+        // TLS 1.2 compatibility — meaningless (and suspicious to strict
+        // stacks) in a 1.3-only/QUIC hello
+        extensions.push({ type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) });
+        extensions.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
+      } else {
+        // psk_key_exchange_modes: every mainstream 1.3 client sends it, and a
+        // server MUST NOT send NewSessionTicket to a client that omitted it
+        // (RFC 8446 §4.2.9) — required for future 0-RTT/resumption anyway.
+        extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
+      }
 
       // Add SNI if servername was provided
       if (context.local_sni) {
@@ -2822,6 +2862,11 @@ function TLSSession(options){
           random: context.local_random,
           session_id: context.local_session_id,
           cookie: context.dtls_cookie,
+          // BUGFIX: `cipher_suites` (plural) is what wire.js's client_hello
+          // builder actually reads; the singular key was silently ignored and
+          // wire.js substituted its own hardcoded fallback list — the
+          // configured cipher suites never reached the wire. Both names passed.
+          cipher_suites: context.local_supported_cipher_suites,
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -2877,6 +2922,11 @@ function TLSSession(options){
           random: context.local_random,
           session_id: sid,
           cookie: context.dtls_cookie,
+          // BUGFIX: `cipher_suites` (plural) is what wire.js's client_hello
+          // builder actually reads; the singular key was silently ignored and
+          // wire.js substituted its own hardcoded fallback list — the
+          // configured cipher suites never reached the wire. Both names passed.
+          cipher_suites: context.local_supported_cipher_suites,
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -2887,7 +2937,9 @@ function TLSSession(options){
         // Skip for DTLS (DTLS clients/servers often don't implement RFC 5077 fully,
         // and adding it caused interop issues with openssl s_server -dtls1_2).
         let isDtls = context.local_supported_versions && context.local_supported_versions.some(v => (v & 0xFF00) === 0xFE00);
-        if (!isDtls && context.sessionTickets) {
+        if (!isDtls && !tls13Only && context.sessionTickets) {
+          // RFC 5077 SessionTicket is a TLS 1.2 mechanism; 1.3 resumption uses
+          // NewSessionTicket/PSK. Never advertise it in a 1.3-only/QUIC hello.
           extensions.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
         }
 
@@ -2898,6 +2950,11 @@ function TLSSession(options){
           random: context.local_random,
           session_id: context.local_session_id,
           cookie: context.dtls_cookie,
+          // BUGFIX: `cipher_suites` (plural) is what wire.js's client_hello
+          // builder actually reads; the singular key was silently ignored and
+          // wire.js substituted its own hardcoded fallback list — the
+          // configured cipher suites never reached the wire. Both names passed.
+          cipher_suites: context.local_supported_cipher_suites,
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -3109,4 +3166,3 @@ function TLSSession(options){
 }
 
 export default TLSSession;
-

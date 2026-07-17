@@ -136,8 +136,8 @@ const TLS_CIPHER_SUITES = {
     cipher:       'CHACHA20_POLY1305',
     aead:         true,
     keylen:       32,
-    fixed_ivlen:  4,
-    record_ivlen: 8,
+    fixed_ivlen:  12,  // RFC 7905: ChaCha20 uses a full 12-byte IV, no explicit nonce
+    record_ivlen: 0,
     ivlen:        12,
     hash:         'sha256'
   },

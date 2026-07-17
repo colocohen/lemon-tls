@@ -298,6 +298,37 @@ function getNonce12(salt4, explicit8) {
 }
 
 /**
+ * TLS/DTLS 1.2 ChaCha20-Poly1305 nonce (RFC 7905 §2).
+ *
+ * Unlike AES-GCM, ChaCha20-Poly1305 in TLS 1.2 has NO explicit per-record nonce
+ * on the wire. The 12-byte nonce is the record's 64-bit sequence number, left-
+ * padded to 12 bytes, XORed with the 12-byte client/server write IV derived from
+ * the key block. This is the same construction TLS 1.3 uses — the difference from
+ * GCM (salt(4) || explicit(8)) is why the two must be handled separately.
+ *
+ * For DTLS the "sequence number" input is the 16-bit epoch concatenated with the
+ * 48-bit record sequence number, i.e. the same 64-bit value used in the AAD, so
+ * callers pass the full record seq and (for DTLS) fold the epoch into it.
+ */
+function getChachaNonce12(iv12, seq) {
+  const nonce = new Uint8Array(12);
+  nonce.set(iv12, 0);
+  // XOR the 64-bit seq into the LAST 8 bytes (big-endian), leaving the first 4
+  // bytes of the IV untouched — identical layout to TLS 1.3's getNonce.
+  const hi = (seq / 0x100000000) | 0;
+  const lo = seq >>> 0;
+  nonce[4]  ^= (hi >>> 24) & 0xff;
+  nonce[5]  ^= (hi >>> 16) & 0xff;
+  nonce[6]  ^= (hi >>> 8)  & 0xff;
+  nonce[7]  ^=  hi         & 0xff;
+  nonce[8]  ^= (lo >>> 24) & 0xff;
+  nonce[9]  ^= (lo >>> 16) & 0xff;
+  nonce[10] ^= (lo >>> 8)  & 0xff;
+  nonce[11] ^=  lo         & 0xff;
+  return nonce;
+}
+
+/**
  * Encode sequence number as 8-byte big-endian.
  * Perf: uses Number arithmetic (seq < 2^53 is always safe for TLS).
  */
@@ -634,11 +665,36 @@ function buildDtlsAad12(epoch, seq, type, plaintextLen) {
   return aad;
 }
 
-/** Encrypt DTLS 1.2 record payload. Returns: explicit_nonce(8) || ciphertext || tag(16). */
+/** Encrypt DTLS 1.2 record payload. Returns: [explicit_nonce(8) ||] ciphertext || tag(16).
+ *
+ * AES-GCM: prepends an 8-byte explicit nonce (the record seq); nonce = salt(4) || seq(8).
+ * ChaCha20-Poly1305 (RFC 7905): NO explicit nonce on the wire; nonce = iv(12) XOR
+ *   (epoch(16) || seq(48)). Detected by ivSalt length (12 = ChaCha, 4 = GCM).
+ */
 function encryptDtls12(pt, key, ivSalt, epoch, seq, type) {
+  let aad = buildDtlsAad12(epoch, seq, type, pt.length);
+
+  // ChaCha20-Poly1305: full 12-byte IV, no explicit nonce (RFC 7905).
+  if (ivSalt.length === 12) {
+    // DTLS folds the 16-bit epoch above the 48-bit seq to form the 64-bit
+    // sequence input, matching the AAD's epoch||seq (RFC 6347 / RFC 9147).
+    let seq64 = epoch * 0x1000000000000 + seq;
+    let nonce = getChachaNonce12(ivSalt, seq64);
+    let cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
+    cipher.setAAD(aad, { plaintextLength: pt.length });
+    let ct = cipher.update(pt);
+    cipher.final();
+    let tag = cipher.getAuthTag();
+    // No explicit nonce prefix for ChaCha.
+    let out = new Uint8Array(ct.length + tag.length);
+    out.set(new Uint8Array(ct), 0);
+    out.set(new Uint8Array(tag), ct.length);
+    return out;
+  }
+
+  // AES-GCM: explicit nonce (= record seq) prepended.
   let explicit = seqToBytes(seq);
   let nonce = getNonce12(ivSalt, explicit);
-  let aad = buildDtlsAad12(epoch, seq, type, pt.length);
   let algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
   let cipher = crypto.createCipheriv(algo, key, nonce);
   cipher.setAAD(aad);
@@ -652,8 +708,28 @@ function encryptDtls12(pt, key, ivSalt, epoch, seq, type) {
   return out;
 }
 
-/** Decrypt DTLS 1.2 record fragment. Input: explicit_nonce(8) || ciphertext || tag(16). */
+/** Decrypt DTLS 1.2 record fragment.
+ *  AES-GCM input: explicit_nonce(8) || ciphertext || tag(16).
+ *  ChaCha20 input: ciphertext || tag(16)  (no explicit nonce — RFC 7905).
+ */
 function decryptDtls12(fragment, key, ivSalt, epoch, seq, type) {
+  // ChaCha20-Poly1305: no explicit nonce; nonce = iv(12) XOR (epoch||seq).
+  if (ivSalt.length === 12) {
+    if (fragment.length < 16) throw new Error('DTLS 1.2 ChaCha fragment too short');
+    let ct  = fragment.slice(0, fragment.length - 16);
+    let tag = fragment.slice(fragment.length - 16);
+    let seq64 = epoch * 0x1000000000000 + seq;
+    let nonce = getChachaNonce12(ivSalt, seq64);
+    let aad = buildDtlsAad12(epoch, seq, type, ct.length);
+    let decipher = crypto.createDecipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
+    decipher.setAAD(aad, { plaintextLength: ct.length });
+    decipher.setAuthTag(tag);
+    let pt = decipher.update(ct);
+    decipher.final();
+    return new Uint8Array(pt);
+  }
+
+  // AES-GCM: strip the 8-byte explicit nonce.
   if (fragment.length < 24) throw new Error('DTLS 1.2 fragment too short');
   let explicit = fragment.slice(0, 8);
   let tag = fragment.slice(fragment.length - 16);
@@ -802,9 +878,41 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
 }
 
 /**
+ * Reconstruct a full DTLS 1.3 record sequence number from its truncated wire
+ * encoding (RFC 9147 §4.2.2).
+ *
+ * @param truncated  the low `bits` bits of the seq as sent on the wire
+ * @param bits       8 or 16 (how many low bits were transmitted)
+ * @param maxSeq     highest full seq already accepted in this epoch (-1 if none)
+ *
+ * Returns the full seq: the value congruent to `truncated` (mod 2^bits) that is
+ * closest to maxSeq+1. This tolerates reordering within half a window in each
+ * direction, which is what the sliding receive window expects.
+ */
+function reconstructDtlsSeq(truncated, bits, maxSeq) {
+  let window = Math.pow(2, bits);          // 256 or 65536
+  let expected = maxSeq + 1;               // where we expect the next record
+  let high = Math.floor(expected / window) * window;
+  let candidate = high + truncated;
+
+  // Pick whichever of {candidate-window, candidate, candidate+window} is nearest
+  // to `expected`, without going negative.
+  let best = candidate;
+  let bestDist = Math.abs(candidate - expected);
+  for (let delta of [-window, window]) {
+    let alt = candidate + delta;
+    if (alt < 0) continue;
+    let dist = Math.abs(alt - expected);
+    if (dist < bestDist) { best = alt; bestDist = dist; }
+  }
+  return best;
+}
+
+
+/**
  * Decrypt a DTLS 1.3 encrypted record.
  * data: full record bytes (starting with unified header byte)
- * keys: { key, iv, snKey, algo? }
+ * keys: { key, iv, snKey, algo?, maxReadSeq? }
  * Returns { epoch, seq, type, content } or null on failure.
  */
 function decryptEncryptedDtls13(data, keys) {
@@ -834,7 +942,19 @@ function decryptEncryptedDtls13(data, keys) {
 
   // Decrypt record number
   let rn = maskRecordNumber(keys.snKey, encRn, ciphertext);
-  let seq = hdr.seqLen2 ? ((rn[0] << 8) | rn[1]) : rn[0];
+  let truncated = hdr.seqLen2 ? ((rn[0] << 8) | rn[1]) : rn[0];
+
+  // RFC 9147 §4.2.2: the wire carries only the low 8 or 16 bits of the record
+  // sequence number. Reconstruct the full value by choosing the candidate
+  // congruent to `truncated` (mod window) that is closest to the highest seq
+  // we've already accepted in this epoch. Without this, seq silently wraps to 0
+  // after 2^16 records and every nonce/AAD past that point is wrong.
+  //
+  // keys.maxReadSeq holds the highest full seq accepted so far (per-epoch key
+  // object). It starts undefined → treated as -1 so the first record maps to
+  // its own truncated value.
+  let seq = reconstructDtlsSeq(truncated, hdr.seqLen2 ? 16 : 8,
+                               (keys.maxReadSeq === undefined ? -1 : keys.maxReadSeq));
 
   // Rebuild AAD with plaintext RN
   let hdrLen = 1 + rnLen + (hdr.hasLength ? 2 : 0);
@@ -863,6 +983,13 @@ function decryptEncryptedDtls13(data, keys) {
     decipher.final();
 
     let inner = parseInnerPlaintext(new Uint8Array(pt));
+
+    // Advance the per-epoch high-water mark only after the tag verified, so a
+    // forged/replayed record number can't poison future reconstruction.
+    if (keys.maxReadSeq === undefined || seq > keys.maxReadSeq) {
+      keys.maxReadSeq = seq;
+    }
+
     return {
       epoch: hdr.epoch,
       seq: seq,
@@ -1018,6 +1145,7 @@ export {
 
   // TLS 1.2
   getNonce12,
+  getChachaNonce12,
   seqToBytes,
   buildAad12,
   encrypt12,

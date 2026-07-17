@@ -331,6 +331,18 @@ function TLSSocket(duplex, options){
             ? context.isTls13
             : session.getVersion() === 0x0304; // early records (pre-secureConnect)
 
+        // AEAD decryption can throw on any forged/corrupted record (GCM/ChaCha
+        // tag mismatch surfaces as an exception from decipher.final()). Left
+        // unhandled, a single injected bad segment would throw out of the
+        // transport 'data' handler — an unhandled exception that tears down the
+        // connection or the process: a trivial remote DoS.
+        //
+        // RFC 8446 §5.2: in TLS (unlike DTLS, which silently drops), a record
+        // that fails to decrypt MUST be treated as a fatal error. So we catch,
+        // send a fatal bad_record_mac alert, destroy the connection, and stop.
+        // The read sequence number is intentionally NOT advanced on failure —
+        // the rejected record never counts.
+        try {
         if (!isTls13 && context.remote_ccs_seen === true) {
             // TLS 1.2: decrypt with key_block derived keys
             if (context.app_read_key === null) {
@@ -394,7 +406,14 @@ function TLSSocket(duplex, options){
             }
             context.handshake_read_seq++;
         }
-        
+        } catch (e) {
+            // Record failed authentication → fatal bad_record_mac (RFC 8446 §5.2).
+            try { session.sendAlert ? session.sendAlert(2, TLS_ALERT.BAD_RECORD_MAC) : null; } catch (_) {}
+            self.emit('error', new Error('TLS record decryption failed (bad_record_mac)'));
+            self.destroy();
+            return;
+        }
+
 
         if (out !== null) {
             // Reuse cached isTls13 computed at the top of this function

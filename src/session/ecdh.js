@@ -28,7 +28,22 @@ function x25519_get_shared_secret(localPrivateRaw, remotePublicRaw) {
   let pubDer  = Buffer.concat([X25519_SPKI_PREFIX, Buffer.from(remotePublicRaw)]);
   let privObj = crypto.createPrivateKey({ key: privDer, format: 'der', type: 'pkcs8' });
   let pubObj  = crypto.createPublicKey({ key: pubDer, format: 'der', type: 'spki' });
-  return new Uint8Array(crypto.diffieHellman({ privateKey: privObj, publicKey: pubObj }));
+  let secret  = new Uint8Array(crypto.diffieHellman({ privateKey: privObj, publicKey: pubObj }));
+
+  // RFC 7748 §6.1: implementations MUST reject an all-zero shared secret. A peer
+  // that sends a low-order/small-order public key can force the X25519 result to
+  // be all zeros — a value it knows in advance — which would let it choose the
+  // key material. The `break` here is safe (does not leak a secret): the peer's
+  // public key is public, so an early exit reveals nothing exploitable.
+  let allZero = true;
+  for (let i = 0; i < secret.length; i++) {
+    if (secret[i] !== 0) { allZero = false; break; }
+  }
+  if (allZero) {
+    throw new Error('X25519: all-zero shared secret — invalid peer public key (RFC 7748 §6.1)');
+  }
+
+  return secret;
 }
 
 /**

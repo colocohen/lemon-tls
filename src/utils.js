@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 
 function concatUint8Arrays(arrays) {
     let totalLength = 0;
@@ -93,9 +94,35 @@ function uint8Equal(a, b) {
 }
 
 
+/**
+ * Constant-time equality for two byte arrays.
+ *
+ * Unlike uint8Equal (which short-circuits on the first differing byte and
+ * therefore leaks — via timing — how many leading bytes matched), this always
+ * compares the full length. Use it wherever a mismatch would otherwise be
+ * exploitable as an oracle: Finished verify_data, PSK binders, ticket key_name,
+ * and any MAC/tag comparison.
+ *
+ * Returns false immediately (and safely) on length mismatch — that's public
+ * information, not a secret, so short-circuiting there is fine.
+ *
+ * Note: crypto.timingSafeEqual requires two equal-length Buffers. We wrap the
+ * inputs as Buffer views over the same memory (no copy) via byteOffset/length.
+ */
+function timingSafeEqualU8(a, b) {
+  if (a == null || b == null) return false;
+  if (a.length !== b.length) return false;
+  if (a.length === 0) return true;
+  let ba = Buffer.isBuffer(a) ? a : Buffer.from(a.buffer, a.byteOffset, a.length);
+  let bb = Buffer.isBuffer(b) ? b : Buffer.from(b.buffer, b.byteOffset, b.length);
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+
 export {
   concatUint8Arrays,
   arraybufferEqual,
   arraysEqual,
-  uint8Equal
+  uint8Equal,
+  timingSafeEqualU8
 };

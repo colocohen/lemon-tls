@@ -26,7 +26,8 @@ import {
 import {
   concatUint8Arrays,
   arraysEqual,
-  uint8Equal
+  uint8Equal,
+  timingSafeEqualU8
 } from './utils.js';
 
 import * as wire from './wire.js';
@@ -37,6 +38,15 @@ import createSecureContext from './secure_context.js';
 import { x25519_get_public_key, x25519_get_shared_secret, p256_generate_keypair, p256_get_shared_secret, p384_generate_keypair, p384_get_shared_secret } from './session/ecdh.js';
 import { build_tls_message, parse_tls_message } from './session/message.js';
 import { encrypt_session_blob, decrypt_session_blob, encode_client_session, decode_client_session } from './session/ticket.js';
+
+// RFC 8446 §4.1.3 downgrade-protection sentinels. A TLS 1.3-capable server that
+// negotiates a lower version stamps one of these into the last 8 bytes of
+// ServerHello.random; a TLS 1.3-capable client that ends up on a lower version
+// MUST reject the handshake if it sees the sentinel. This defeats an active
+// attacker forcing a version downgrade (the sentinel is covered by the server's
+// signature / Finished, so it can't be stripped without breaking the handshake).
+const DOWNGRADE_SENTINEL_TLS12 = new Uint8Array([0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x01]); // "DOWNGRD\x01"
+const DOWNGRADE_SENTINEL_TLS11 = new Uint8Array([0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x00]); // "DOWNGRD\x00" (TLS 1.1 and below)
 
 // Debug logging — enabled via LEMON_DEBUG=1 env var
 const LEMON_DEBUG = typeof process !== 'undefined' && process.env && process.env.LEMON_DEBUG === '1';
@@ -412,12 +422,10 @@ function TLSSession(options){
           dbg('SRV-PSK', 'expected binder:', hexPreview(expectedBinder, 16));
           dbg('SRV-PSK', 'received binder:', hexPreview(pskBinder, 16));
 
-          let binderOk = pskBinder && expectedBinder.length === pskBinder.length;
-          if (binderOk) {
-            for (let bi = 0; bi < expectedBinder.length; bi++) {
-              if (expectedBinder[bi] !== pskBinder[bi]) { binderOk = false; break; }
-            }
-          }
+          // Constant-time binder comparison. A byte-by-byte early-exit compare
+          // would let an attacker recover a valid binder via timing, one byte at
+          // a time. timingSafeEqualU8 always compares the full length.
+          let binderOk = timingSafeEqualU8(expectedBinder, pskBinder);
 
           dbg('SRV-PSK', binderOk ? '✓ BINDER MATCH — psk_accepted' : '✗ BINDER MISMATCH — full handshake');
 
@@ -580,6 +588,28 @@ function TLSSession(options){
         remote_extensions: message.extensions || [],
         add_remote_key_groups: message.key_groups || []
       });
+
+      // RFC 8446 §4.1.3: downgrade-protection check (client side).
+      // If we offered TLS 1.3 but the server steered us to a lower version, the
+      // server's random must NOT carry the downgrade sentinel — if it does, an
+      // active attacker forced the downgrade. HRR was already handled and
+      // returned above, so `message` here is a genuine ServerHello.
+      if (!context.isServer && message.type === 'server_hello' &&
+          context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 &&
+          context.selected_version !== null &&
+          context.selected_version !== wire.TLS_VERSION.TLS1_3 &&
+          context.selected_version !== wire.DTLS_VERSION.DTLS1_3 &&
+          message.random && message.random.length === 32) {
+
+        let tail = message.random.subarray(24, 32);
+        if (timingSafeEqualU8(tail, DOWNGRADE_SENTINEL_TLS12) ||
+            timingSafeEqualU8(tail, DOWNGRADE_SENTINEL_TLS11)) {
+          dbg('DOWNGRADE', 'sentinel detected in ServerHello.random — aborting');
+          sendAlert(2, wire.TLS_ALERT.ILLEGAL_PARAMETER); // fatal, illegal_parameter (47)
+          ev.emit('error', new Error('TLS downgrade attack detected (RFC 8446 §4.1.3 sentinel present)'));
+          return;
+        }
+      }
 
       // Server: TLS 1.2 resumption detection (only makes sense from ClientHello).
       // This runs BEFORE set_context's reactive loop picks a version, so we mark state
@@ -1586,6 +1616,20 @@ function TLSSession(options){
 
           if(context.local_random==null){
             context.local_random=new Uint8Array(crypto.randomBytes(32));
+
+            // RFC 8446 §4.1.3: if we support TLS 1.3 but negotiated something
+            // lower, stamp the downgrade sentinel into the last 8 bytes of the
+            // ServerHello random so a 1.3-capable client can detect the downgrade.
+            // Only meaningful for a real ServerHello (not HRR, which reuses the
+            // magic HRR random), and only for the TLS transport (not DTLS here).
+            if (context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0) {
+              if (context.selected_version === wire.TLS_VERSION.TLS1_2) {
+                context.local_random.set(DOWNGRADE_SENTINEL_TLS12, 24);
+              } else if (context.selected_version === wire.TLS_VERSION.TLS1_1 ||
+                         context.selected_version === wire.TLS_VERSION.TLS1_0) {
+                context.local_random.set(DOWNGRADE_SENTINEL_TLS11, 24);
+              }
+            }
           }
 
           let build_message_params=null;
@@ -2426,7 +2470,9 @@ function TLSSession(options){
       //compare finished to expected...
       if(context.remote_finished_ok==false && context.remote_finished!==null && context.expected_remote_finished!==null){
 
-        if(uint8Equal(context.remote_finished, context.expected_remote_finished)==true){
+        // Constant-time Finished comparison — verify_data is a MAC; a timing
+        // oracle here would let a peer forge a valid Finished byte by byte.
+        if(timingSafeEqualU8(context.remote_finished, context.expected_remote_finished)==true){
 
           let message_data = build_tls_message({
             type: 'finished',

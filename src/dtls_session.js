@@ -27,6 +27,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import crypto from 'node:crypto';
 
 import TLSSession from './tls_session.js';
 import createSecureContext from './secure_context.js';
@@ -38,6 +39,7 @@ import {
   build_message,
   build_hello_verify_request,
   parse_hello_verify_request,
+  parse_hello,
 } from './wire.js';
 
 import {
@@ -58,6 +60,8 @@ import {
   buildDtlsAck,
   parseDtlsAck,
 } from './record.js';
+
+import { timingSafeEqualU8 } from './utils.js';
 
 
 // ============================================================
@@ -130,6 +134,15 @@ function DTLSSession(options) {
     isServer: isServer,
     mtu: options.mtu || 1200,
 
+    // Upper bound on a single reassembled handshake message. The DTLS handshake
+    // header carries a 24-bit length (up to 16MB), which is attacker-controlled
+    // on the very first fragment. Without a cap, a peer could send one fragment
+    // claiming length 0xFFFFFF for several msg_seqs and force large allocations
+    // before anything is authenticated. 256KB comfortably fits a real
+    // certificate-chain flight while bounding the damage. Configurable via
+    // options.maxHandshakeMessageSize.
+    maxHandshakeMessageSize: options.maxHandshakeMessageSize || (256 * 1024),
+
     // Version (determined after negotiation)
     selectedVersion: null,  // DTLS version (0xFEFC or 0xFEFD)
 
@@ -146,11 +159,16 @@ function DTLSSession(options) {
     cipherSuite: null,
     hashName: null,
 
-    // Fragment reassembly: msg_seq → { totalLength, parts: { offset: Uint8Array } }
+    // Fragment reassembly: msg_seq → { totalLength, type, chunks:[{off,end,body}], covered }
     fragments: {},
 
     // Incoming handshake msg_seq tracking
     nextReadMsgSeq: 0,
+
+    // Out-of-order handshake buffering (RFC 6347 §4.2.4 / RFC 9147 §5.2):
+    // complete messages that arrive ahead of nextReadMsgSeq are held here,
+    // keyed by msg_seq, and drained in order once the gap is filled.
+    pendingMessages: {},   // msg_seq → { type, body }
 
     // Flight tracking for retransmission
     currentFlight: [],     // array of { epoch, data: Uint8Array (complete datagram) }
@@ -425,9 +443,18 @@ function DTLSSession(options) {
    * Returns array of DTLS handshake message fragments (each with reconstruction header).
    */
   function fragmentMessage(dtlsMsg, tlsMsg, msgSeq) {
-    let overhead = 13 + 16; // record header + AEAD tag (approximate)
-    let maxFragment = ctx.mtu - overhead;
+    // Record-layer overhead we must leave room for inside one datagram/MTU:
+    //   DTLS 1.2: 13-byte classic record header + 16-byte AEAD tag (+8 explicit
+    //             nonce for GCM, but that lives inside the encrypted payload the
+    //             record layer builds, so we keep a small safety margin).
+    //   DTLS 1.3: 5-byte unified header (2-byte seq + length) + 16-byte AEAD tag.
+    // Using the correct, smaller 1.3 overhead avoids over-fragmenting.
+    let isDtls13 = ctx.selectedVersion === DTLS_VERSION.DTLS1_3;
+    let recordOverhead = isDtls13 ? (5 + 16) : (13 + 16 + 8);
+    let maxFragment = ctx.mtu - recordOverhead;
 
+    // The DTLS handshake message header is 12 bytes; the body is what we chunk.
+    const HS_HDR = 12;
     if (dtlsMsg.length <= maxFragment) return [dtlsMsg];
 
     // Need to fragment: split the TLS body into chunks
@@ -436,8 +463,11 @@ function DTLSSession(options) {
     let fragments = [];
     let offset = 0;
 
+    // Each fragment carries its own 12-byte handshake header, so the payload
+    // budget per fragment is maxFragment - HS_HDR.
+    let maxChunk = Math.max(1, maxFragment - HS_HDR);
     while (offset < totalLength) {
-      let chunkLen = Math.min(maxFragment - 12, totalLength - offset); // 12 = DTLS handshake header
+      let chunkLen = Math.min(maxChunk, totalLength - offset);
       let frag = build_dtls_handshake(tlsMsg, msgSeq, offset, chunkLen);
       fragments.push(frag);
       offset += chunkLen;
@@ -483,7 +513,18 @@ function DTLSSession(options) {
 
     let records = parseDtlsDatagram(data, keysByEpoch);
 
+    // RFC 9147 §7: collect the record numbers of handshake records we received
+    // in this datagram so we can ACK them once, after processing. Only for
+    // DTLS 1.3, and only while we're still handshaking (post-handshake ACKs of
+    // NewSessionTicket etc. are optional and skipped here for simplicity).
+    let ackable = [];
+
     for (let i = 0; i < records.length; i++) {
+      if (records[i].type === CT.HANDSHAKE &&
+          ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
+        ackable.push({ epoch: records[i].epoch, seq: records[i].seq });
+      }
+
       processRecord(records[i]);
 
       // After CCS, keys are newly available — re-decrypt remaining epoch>0 records
@@ -499,6 +540,14 @@ function DTLSSession(options) {
           }
         }
       }
+    }
+
+    // Send a single ACK covering all handshake records received in this datagram.
+    // We ACK from the highest epoch for which we already have write keys (so the
+    // ACK itself is protected once handshake keys exist; epoch 0 before that).
+    if (ackable.length > 0) {
+      let ackEpoch = ctx.keys[3] ? 3 : (ctx.keys[2] ? 2 : 0);
+      sendAck(ackEpoch, ackable);
     }
   }
 
@@ -569,33 +618,68 @@ function DTLSSession(options) {
   }
 
   /**
-   * Reassemble a fragmented handshake message.
+   * Reassemble a (possibly fragmented) handshake message.
+   *
+   * RFC 6347 §4.2.3 / RFC 9147 §5.5: fragments may overlap and arrive out of
+   * order, because a retransmission can re-fragment the same message with
+   * different boundaries (e.g. after a PMTU change). We therefore copy each
+   * fragment's bytes into a full-length buffer and track coverage as a set of
+   * merged byte-ranges, rather than requiring each fragment to start exactly
+   * where the previous one ended.
    */
   function reassembleFragment(parsed) {
     let key = parsed.msg_seq;
-    if (!(key in ctx.fragments)) {
-      ctx.fragments[key] = { totalLength: parsed.length, type: parsed.type, parts: {} };
+
+    // Ignore fragments for messages we've already delivered.
+    if (key < ctx.nextReadMsgSeq) return;
+
+    // DoS guard: the 24-bit `length` is attacker-controlled on the first
+    // fragment. Reject anything claiming more than our cap BEFORE allocating,
+    // so a peer can't force huge buffers with a single unauthenticated packet.
+    if (parsed.length > ctx.maxHandshakeMessageSize) {
+      ev.emit('error', new Error('DTLS handshake message exceeds maxHandshakeMessageSize (' +
+        parsed.length + ' > ' + ctx.maxHandshakeMessageSize + ')'));
+      return;
     }
+
     let frag = ctx.fragments[key];
-    frag.parts[parsed.frag_offset] = parsed.body;
-
-    // Check if complete
-    let assembled = new Uint8Array(frag.totalLength);
-    let filled = 0;
-    let offsets = Object.keys(frag.parts).map(Number).sort((a, b) => a - b);
-
-    for (let i = 0; i < offsets.length; i++) {
-      let part = frag.parts[offsets[i]];
-      if (offsets[i] !== filled) return; // gap — not complete yet
-      assembled.set(part, offsets[i]);
-      filled = offsets[i] + part.length;
+    if (!frag) {
+      frag = ctx.fragments[key] = {
+        totalLength: parsed.length,
+        type: parsed.type,
+        buf: new Uint8Array(parsed.length),
+        ranges: [],   // sorted, merged [start, end) covered ranges
+      };
     }
 
-    if (filled < frag.totalLength) return; // not complete
+    let start = parsed.frag_offset;
+    let end = parsed.frag_offset + parsed.frag_length;
 
-    // Complete — deliver
-    delete ctx.fragments[key];
-    deliverHandshakeMessage(frag.type, assembled, key);
+    // Bounds guard against a malformed fragment claiming to exceed totalLength.
+    if (end > frag.totalLength) return;
+
+    // Copy the fragment bytes in (overlaps simply overwrite with identical data).
+    frag.buf.set(parsed.body.subarray(0, parsed.frag_length), start);
+
+    // Merge [start, end) into the covered-range set.
+    frag.ranges.push([start, end]);
+    frag.ranges.sort((a, b) => a[0] - b[0]);
+    let merged = [];
+    for (let r of frag.ranges) {
+      if (merged.length && r[0] <= merged[merged.length - 1][1]) {
+        // Overlapping/adjacent → extend the previous range.
+        if (r[1] > merged[merged.length - 1][1]) merged[merged.length - 1][1] = r[1];
+      } else {
+        merged.push([r[0], r[1]]);
+      }
+    }
+    frag.ranges = merged;
+
+    // Complete when a single range covers [0, totalLength).
+    if (merged.length === 1 && merged[0][0] === 0 && merged[0][1] === frag.totalLength) {
+      delete ctx.fragments[key];
+      deliverHandshakeMessage(frag.type, frag.buf, key);
+    }
   }
 
   /**
@@ -603,18 +687,80 @@ function DTLSSession(options) {
    * Strips DTLS reconstruction → builds TLS format.
    */
   function deliverHandshakeMessage(type, body, msgSeq) {
-    // Skip if we've already processed this msg_seq
+    // Skip if we've already processed this msg_seq (duplicate / retransmit).
     if (msgSeq < ctx.nextReadMsgSeq) return;
-    ctx.nextReadMsgSeq = msgSeq + 1;
-
 
     // Check for HelloVerifyRequest (DTLS 1.2 server→client, type=3)
     if (type === 3 && !isServer) {
+      ctx.nextReadMsgSeq = msgSeq + 1;
       let hvr = parse_hello_verify_request(body);
       triggerClientHelloWithCookie(hvr.cookie);
       return;
     }
 
+    // ---- Server-side HelloVerifyRequest cookie exchange (RFC 6347 §4.2.1) ----
+    // For DTLS 1.2 with cookies enabled, the first ClientHello carries no cookie
+    // (or an empty one). We answer with a HelloVerifyRequest and do NOT process
+    // the ClientHello — that proves return-routability (the client must be at the
+    // address it claims before we allocate any handshake state). Only a second
+    // ClientHello echoing the correct cookie is processed.
+    //
+    // Note: msg_seq is NOT advanced for a rejected/HVR-triggering ClientHello, so
+    // the client's retried CH (which reuses msg_seq per RFC 6347) is still accepted.
+    if (type === 1 && isServer && options.useCookies === true &&
+        ctx.selectedVersion !== DTLS_VERSION.DTLS1_3) {
+
+      let ch = null;
+      try { ch = parse_hello({ kind: 'client', body: body }); } catch (e) { ch = null; }
+      let incomingCookie = (ch && ch.dtls_cookie) ? ch.dtls_cookie : new Uint8Array(0);
+
+      if (incomingCookie.length === 0) {
+        // First ClientHello → send HVR with a fresh cookie. Don't process the CH,
+        // don't advance msg_seq (the retry reuses the same msg_seq).
+        sendHelloVerifyRequest();
+        return;
+      }
+
+      // Second ClientHello: the cookie MUST match what we issued.
+      if (!ctx.hvrCookie || !timingSafeEqualU8(incomingCookie, ctx.hvrCookie)) {
+        // Cookie mismatch → silently drop (RFC 6347: server discards). Don't
+        // advance msg_seq; a correct retry can still arrive.
+        return;
+      }
+      // Cookie verified → fall through and process the ClientHello normally.
+    }
+
+    // ---- In-order delivery (RFC 6347 §4.2.4 / RFC 9147 §5.2) ----
+    // DTLS handshake messages must be handed to the TLS state machine strictly
+    // in msg_seq order. If this message is ahead of what we expect, buffer it
+    // and wait for the gap to fill. If it's the next expected one, feed it, then
+    // drain any consecutive messages that were buffered earlier.
+    if (msgSeq > ctx.nextReadMsgSeq) {
+      // Out of order — hold it (ignore a duplicate already buffered).
+      if (!(msgSeq in ctx.pendingMessages)) {
+        ctx.pendingMessages[msgSeq] = { type: type, body: body };
+      }
+      return;
+    }
+
+    // msgSeq === nextReadMsgSeq → feed it and advance.
+    feedHandshakeToTls(type, body, msgSeq);
+    ctx.nextReadMsgSeq = msgSeq + 1;
+
+    // Drain consecutively-numbered buffered messages.
+    while (ctx.nextReadMsgSeq in ctx.pendingMessages) {
+      let next = ctx.pendingMessages[ctx.nextReadMsgSeq];
+      delete ctx.pendingMessages[ctx.nextReadMsgSeq];
+      feedHandshakeToTls(next.type, next.body, ctx.nextReadMsgSeq);
+      ctx.nextReadMsgSeq++;
+    }
+  }
+
+  /**
+   * Feed one in-order handshake message to the TLSSession, converting from DTLS
+   * to TLS wire format and driving version detection.
+   */
+  function feedHandshakeToTls(type, body, msgSeq) {
     // Build TLS-format message: type(1) + length(3) + body
     let tlsMsg = build_message(type, body);
 
@@ -634,6 +780,23 @@ function DTLSSession(options) {
   }
 
   /**
+   * Server: build and send a HelloVerifyRequest with a fresh cookie (DTLS 1.2).
+   * The cookie is a CSPRNG value stored on the context; a matching cookie must
+   * come back in the client's second ClientHello (verified in
+   * deliverHandshakeMessage) before we process the handshake.
+   */
+  function sendHelloVerifyRequest() {
+    let cookie = new Uint8Array(crypto.randomBytes(32));
+    ctx.hvrCookie = cookie;
+    ctx.hvrDone = true;
+
+    // HVR always uses msg_seq 0 and is sent in the clear (epoch 0).
+    let hvrMsg = build_dtls_handshake(build_message(3, build_hello_verify_request({ cookie: cookie })), 0);
+    let record = buildDtlsPlaintext(CT.HANDSHAKE, 0, nextWriteSeq(0), hvrMsg);
+    ev.emit('packet', record);
+  }
+
+  /**
    * Trigger a new ClientHello with cookie (DTLS 1.2 HVR response).
    */
   function triggerClientHelloWithCookie(cookie) {
@@ -650,6 +813,8 @@ function DTLSSession(options) {
     tls.context.message_sent_seq = 0;
     ctx.nextReadMsgSeq = 0;
     ctx.currentFlight = [];
+    ctx.fragments = {};          // discard any partial reassembly from CH1 flight
+    ctx.pendingMessages = {};    // discard any out-of-order buffer from CH1 flight
     transcriptMsgSeqs = [];
 
     // Push CH2 to transcript (transcriptHook will store TLS format for now,
@@ -786,23 +951,12 @@ function DTLSSession(options) {
   // ============================================================
 
   tls.on('hello', function() {
-    // Version is detected lazily in handshakeSecrets and message handlers
-
-    // DTLS 1.2 server: optionally send HelloVerifyRequest
-    if (isServer && ctx.selectedVersion !== DTLS_VERSION.DTLS1_3 && !ctx.hvrDone && options.useCookies === true) {
-      ctx.hvrDone = true;
-      let cookie = new Uint8Array(32);
-      for (let i = 0; i < 32; i++) cookie[i] = Math.floor(Math.random() * 256);
-      ctx.hvrCookie = cookie;
-
-      let hvrBody = build_hello_verify_request({ cookie: cookie });
-      let hvrMsg = build_dtls_handshake(
-        build_message(3, hvrBody),
-        0
-      );
-      let record = buildDtlsPlaintext(CT.HANDSHAKE, 0, nextWriteSeq(0), hvrMsg);
-      ev.emit('packet', record);
-    }
+    // Version is detected lazily in handshakeSecrets and message handlers.
+    //
+    // Note: DTLS 1.2 HelloVerifyRequest is handled earlier, in
+    // deliverHandshakeMessage — the first (cookieless) ClientHello never reaches
+    // TLSSession, so by the time 'hello' fires here the cookie has already been
+    // verified. Nothing to do for HVR at this point.
   });
 
 

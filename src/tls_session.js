@@ -21,6 +21,9 @@ import {
   derive_handshake_traffic_secrets_psk_with_hash,
   hkdf_expand_label,
   getHashFn,
+  derive_exporter_master_secret_with_hash,
+  tls13_exporter,
+  tls12_exporter,
 } from './crypto.js';
 
 import {
@@ -209,6 +212,7 @@ function TLSSession(options){
 
     // TLS 1.3 resumption
     tls13_master_secret: null,
+    exporter_master_secret: null,     // RFC 8446 §7.1 "exp master" — for exportKeyingMaterial
     resumption_master_secret: null,
     ticket_nonce_counter: 0,
     session_ticket_sent: false,
@@ -373,6 +377,15 @@ function TLSSession(options){
       // Save raw ClientHello + emit event (server side)
       if (context.isServer && message.type === 'client_hello') {
         context.rawClientHello = data;
+        // Make the peer's extensions readable INSIDE the 'clienthello'
+        // handler (getRemoteExtension/getRemoteExtensions) — the main
+        // set_context that stores them runs after this emit, and the
+        // whole point of the event is to let callers inspect the offer
+        // and set answering local_extensions before the ServerHello is
+        // built (e.g. DTLS-SRTP use_srtp, RFC 5764 §4.1.2). The later
+        // set_context stores the identical array; its equality check
+        // makes that a no-op.
+        context.remote_extensions = message.extensions || [];
         ev.emit('clienthello', data, message);
       }
 
@@ -792,6 +805,26 @@ function TLSSession(options){
     }else if(message.type=='encrypted_extensions'){
 
       pushTranscript(data);
+
+      // TLS 1.3: most server extensions arrive HERE, not in the
+      // ServerHello (RFC 8446 §4.3.1) — including application-protocol
+      // ones like use_srtp (RFC 8842 requires it in EncryptedExtensions).
+      // Merge them into remote_extensions so getRemoteExtension() sees a
+      // version-agnostic union: ServerHello entries first (kept on type
+      // collision, which the RFC forbids anyway), then EE entries.
+      if (Array.isArray(message.extensions) && message.extensions.length > 0) {
+        var _mergedExts = (context.remote_extensions || []).slice();
+        for (var _eei = 0; _eei < message.extensions.length; _eei++) {
+          var _ee = message.extensions[_eei];
+          if (!_ee) continue;
+          var _dup = false;
+          for (var _mj = 0; _mj < _mergedExts.length; _mj++) {
+            if (_mergedExts[_mj] && _mergedExts[_mj].type === _ee.type) { _dup = true; break; }
+          }
+          if (!_dup) _mergedExts.push(_ee);
+        }
+        context.remote_extensions = _mergedExts;
+      }
 
       set_context({
         remote_supported_groups: message.supported_groups || [],
@@ -1214,6 +1247,12 @@ function TLSSession(options){
               context.selected_version === wire.DTLS_VERSION.DTLS1_2)) {
             _emitKeylog('CLIENT_RANDOM', options.base_secret);
           }
+        }
+      }
+
+      if('exporter_master_secret' in options){
+        if(context.exporter_master_secret==null && options.exporter_master_secret!==null){
+          context.exporter_master_secret=options.exporter_master_secret;
         }
       }
 
@@ -1692,6 +1731,19 @@ function TLSSession(options){
             let isDtls12Here = (context.selected_version === wire.DTLS_VERSION.DTLS1_2);
             if (context.tls12_session_ticket_requested && !context.tls12_abbreviated && context.sessionTickets && !isDtls12Here) {
               ext_list.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
+            }
+
+            // Custom local extensions (generic pass-through — same mechanism
+            // as the ClientHello and TLS 1.3 EncryptedExtensions paths).
+            // This is where server-side answers to client-offered extensions
+            // (e.g. use_srtp for DTLS-SRTP, RFC 5764 §4.1) go on the wire in
+            // (D)TLS 1.2. Previously local_extensions were silently dropped
+            // for the 1.2 ServerHello, so a server could never answer them.
+            // Responsibility for only answering extensions the client
+            // actually offered stays with the caller (it can inspect the
+            // ClientHello via the 'clienthello' event / getRemoteExtension).
+            for (let lei = 0; lei < context.local_extensions.length; lei++) {
+              ext_list.push(context.local_extensions[lei]);
             }
 
             // Session ID: for abbreviated (resumed) handshake, MUST echo client's session_id
@@ -2411,10 +2463,18 @@ function TLSSession(options){
           if((context.isServer==true && context.finished_sent==true && context.remote_finished_ok==false) || (context.isServer==false && context.finished_sent==false && context.remote_finished_ok==true)){
 
             let appHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-            let result2 = derive_app_traffic_secrets_with_hash(appHashName, context.base_secret, get_transcript_hash(appHashName));
+            let appTranscriptHash = get_transcript_hash(appHashName);
+            let result2 = derive_app_traffic_secrets_with_hash(appHashName, context.base_secret, appTranscriptHash);
 
             // Save master_secret for resumption before clearing
             params_to_set['tls13_master_secret'] = result2.master_secret;
+
+            // RFC 8446 §7.1: exporter_master_secret uses the SAME transcript
+            // hash (ClientHello..server Finished) as the app traffic secrets.
+            // Kept for the lifetime of the connection so exportKeyingMaterial
+            // (RFC 8446 §7.5) works after handshake completion.
+            params_to_set['exporter_master_secret'] =
+              derive_exporter_master_secret_with_hash(appHashName, result2.master_secret, appTranscriptHash);
             params_to_set['base_secret']=null;
 
             if (context.isServer === true) {
@@ -3116,12 +3176,80 @@ function TLSSession(options){
       };
     },
 
+    /**
+     * Export keying material (RFC 5705 for TLS 1.2, RFC 8446 §7.5 for
+     * TLS 1.3). Mirrors Node's tls.TLSSocket#exportKeyingMaterial.
+     *
+     * DTLS-SRTP (RFC 5764) usage:
+     *   session.exportKeyingMaterial(len, 'EXTRACTOR-dtls_srtp')
+     * with NO context argument. Note the TLS 1.2 subtlety: "no context"
+     * and "empty context" produce different output — omit the argument
+     * (or pass null) for the RFC 5764 form.
+     *
+     * Returns a Buffer of `length` bytes, or null before the secrets
+     * are available (handshake not far enough along).
+     *
+     * NOTE: the previous implementation was TLS 1.3-only AND derived from
+     * the app traffic secret in a single HKDF stage — which is not the
+     * RFC 8446 §7.5 construction and would not interoperate with
+     * OpenSSL/BoringSSL exporters. Both issues are fixed here; if anything
+     * consumed the old output, its derived values will change.
+     *
+     * @param {number} length
+     * @param {string} label
+     * @param {Uint8Array|Buffer|null} [context_value]
+     * @returns {Buffer|null}
+     */
     exportKeyingMaterial: function(length, label, context_value){
-      if (!context.local_app_traffic_secret || !context.selected_cipher_suite) return new Uint8Array(0);
-      let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-      let hashFn = getHashFn(hashName);
-      let ctx_hash = hashFn(context_value || new Uint8Array(0));
-      return hkdf_expand_label(hashName, context.local_app_traffic_secret, label || 'exporter', ctx_hash, length || 32);
+      if (!context.selected_cipher_suite || !length || !label) return null;
+      var suite = TLS_CIPHER_SUITES[context.selected_cipher_suite];
+      if (!suite) return null;
+      var is13 = (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+                  context.selected_version === wire.DTLS_VERSION.DTLS1_3);
+
+      if (is13) {
+        // RFC 8446 §7.5 — two-stage derivation from exporter_master_secret.
+        if (!context.exporter_master_secret) return null;
+        return Buffer.from(tls13_exporter(
+          suite.hash, context.exporter_master_secret, label,
+          (context_value != null) ? context_value : null, length
+        ));
+      }
+
+      // TLS 1.2 — RFC 5705 over the master secret + hello randoms.
+      // client_random comes first in the seed regardless of our role.
+      if (!context.base_secret || !context.local_random || !context.remote_random) return null;
+      var clientRandom = context.isServer ? context.remote_random : context.local_random;
+      var serverRandom = context.isServer ? context.local_random  : context.remote_random;
+      return Buffer.from(tls12_exporter(
+        suite.hash, context.base_secret, label,
+        clientRandom, serverRandom,
+        (context_value != null) ? context_value : null, length
+      ));
+    },
+
+    /**
+     * All extensions the peer sent in its hello (ClientHello when we're
+     * the server, ServerHello when we're the client), as parsed by
+     * wire.parse_extensions: [{ type, name, data, value }].
+     * `data` is the raw extension payload (Uint8Array); `value` is the
+     * decoded form for known extensions, null for unknown ones.
+     */
+    getRemoteExtensions: function(){
+      return context.remote_extensions ? context.remote_extensions.slice() : [];
+    },
+
+    /**
+     * Look up a single peer extension by its numeric type
+     * (e.g. 14 = use_srtp, 0x39 = QUIC transport parameters).
+     * Returns the { type, name, data, value } entry, or null.
+     */
+    getRemoteExtension: function(type){
+      var list = context.remote_extensions || [];
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].type === type) return list[i];
+      }
+      return null;
     },
 
     /** Returns the local Finished verify_data (Buffer), or null. */

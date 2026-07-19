@@ -899,6 +899,16 @@ function DTLSSession(options) {
   //  Handshake completion
   // ============================================================
 
+  // Forward 'clienthello' so server-side callers can inspect the peer's
+  // offered extensions (tls.getRemoteExtension / message.extensions) and
+  // set answering extensions via set_context({ local_extensions }) BEFORE
+  // the ServerHello is built — the emit is synchronous within ClientHello
+  // processing, ahead of hello construction. This is how DTLS-SRTP's
+  // use_srtp answer (RFC 5764 §4.1) gets negotiated generically.
+  tls.on('clienthello', function(data, message) {
+    ev.emit('clienthello', data, message);
+  });
+
   tls.on('secureConnect', function() {
     ctx.state = 'connected';
     cancelRetransmit();
@@ -983,6 +993,21 @@ function DTLSSession(options) {
 
     /** Access to internal TLSSession (for advanced use). */
     get tls() { return tls; },
+
+    /**
+     * Export keying material (RFC 5705 / RFC 8446 §7.5).
+     * DTLS-SRTP: exportKeyingMaterial(len, 'EXTRACTOR-dtls_srtp') — no context.
+     * Returns Buffer, or null before secrets are available.
+     */
+    exportKeyingMaterial: function(length, label, context_value) {
+      return tls.exportKeyingMaterial(length, label, context_value);
+    },
+
+    /** Peer's hello extensions: [{ type, name, data, value }]. */
+    getRemoteExtensions: function() { return tls.getRemoteExtensions(); },
+
+    /** One peer extension by numeric type (e.g. 14 = use_srtp), or null. */
+    getRemoteExtension: function(type) { return tls.getRemoteExtension(type); },
 
     /** Current DTLS state. */
     get state() { return ctx.state; },

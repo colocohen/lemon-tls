@@ -1446,6 +1446,30 @@ function TLSSocket(duplex, options){
     /** Full negotiation result — all selected parameters in one object. */
     self.getNegotiationResult = function(){ return session.getNegotiationResult ? session.getNegotiationResult() : null; };
 
+    /**
+     * Export keying material (RFC 5705 for TLS 1.2, RFC 8446 §7.5 for
+     * TLS 1.3). Mirrors Node's tls.TLSSocket#exportKeyingMaterial —
+     * same argument order (length, label, context). One deliberate
+     * difference: Node THROWS before the handshake completes; we return
+     * null (matching this library's null-until-ready convention used by
+     * getTrafficSecrets etc.).
+     */
+    self.exportKeyingMaterial = function(length, label, context_value){
+        return session.exportKeyingMaterial
+          ? session.exportKeyingMaterial(length, label, context_value)
+          : null;
+    };
+
+    /** Peer hello extensions: [{ type, name, data, value }]. */
+    self.getRemoteExtensions = function(){
+        return session.getRemoteExtensions ? session.getRemoteExtensions() : [];
+    };
+
+    /** One peer extension by numeric type, or null. */
+    self.getRemoteExtension = function(type){
+        return session.getRemoteExtension ? session.getRemoteExtension(type) : null;
+    };
+
     /** Request Key Update — refresh outgoing encryption keys (TLS 1.3 only). */
     self.rekeySend = function(){ if (session.requestKeyUpdate) session.requestKeyUpdate(false); };
 

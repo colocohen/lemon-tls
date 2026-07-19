@@ -433,48 +433,61 @@ function toHex(buf) {
 function addCompatMethods(socket) {
   let session = socket._getTLSSession();
 
+  // Polyfill semantics: only define a method if the socket doesn't already
+  // provide it natively. TLSSocket has been growing first-class
+  // implementations (exportKeyingMaterial, getRemoteExtension(s), …) and a
+  // blind `socket.x = …` here would clobber them with a thinner shim —
+  // exactly the kind of silent duplication this layer must not create.
+  // compat.js stays what it claims to be: a gap-filler, never an override.
+  function def(name, fn) {
+    if (typeof socket[name] !== 'function') socket[name] = fn;
+  }
+
   /** Node.js compat: isSessionReused() — method form (same as isResumed getter) */
-  socket.isSessionReused = function() {
+  def('isSessionReused', function() {
     return socket.isResumed;
-  };
+  });
 
   /** Node.js compat: getFinished() */
-  socket.getFinished = function() {
+  def('getFinished', function() {
     return session.getFinished ? session.getFinished() : null;
-  };
+  });
 
   /** Node.js compat: getPeerFinished() */
-  socket.getPeerFinished = function() {
+  def('getPeerFinished', function() {
     return session.getPeerFinished ? session.getPeerFinished() : null;
-  };
+  });
 
-  /** Node.js compat: exportKeyingMaterial(length, label, context) */
-  socket.exportKeyingMaterial = function(length, label, context) {
-    return session.exportKeyingMaterial ? session.exportKeyingMaterial(length, label, context) : new Uint8Array(0);
-  };
+  /** Node.js compat: exportKeyingMaterial(length, label, context).
+   *  TLSSocket now ships this natively (RFC 5705 / RFC 8446 §7.5 via the
+   *  session) — this shim only covers older socket-likes. Same
+   *  null-until-ready convention as the native method. */
+  def('exportKeyingMaterial', function(length, label, context) {
+    return session.exportKeyingMaterial ? session.exportKeyingMaterial(length, label, context) : null;
+  });
 
   /** Node.js compat: getEphemeralKeyInfo() */
-  socket.getEphemeralKeyInfo = function() {
+  def('getEphemeralKeyInfo', function() {
     let group = session.context.selected_group;
     if (group === 0x001d) return { type: 'X25519', size: 253 };
     if (group === 0x0017) return { type: 'ECDH', name: 'prime256v1', size: 256 };
     if (group === 0x0018) return { type: 'ECDH', name: 'secp384r1', size: 384 };
     return {};
-  };
+  });
 
   /** Node.js compat: setServername(name) */
-  socket.setServername = function(name) {
+  def('setServername', function(name) {
     session.set_context({ local_sni: name });
-  };
+  });
 
   /** Node.js compat: disableRenegotiation() — no-op (renegotiation not supported) */
-  socket.disableRenegotiation = function() {};
+  def('disableRenegotiation', function() {});
 
   /** Node.js compat: address() — delegates to underlying transport */
-  socket.address = function() {
+  def('address', function() {
     try { return session.context && session.context.transport ? session.context.transport.address() : {}; }
     catch(e) { return {}; }
-  };
+  });
 }
 
 // ===================== Exports =====================

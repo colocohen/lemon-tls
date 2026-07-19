@@ -671,6 +671,93 @@ function get_handshake_finished_with_hash(hashName, traffic_secret, transcript_h
 //  DTLS 1.3: record number encryption key (RFC 9147 §5.9)
 // ============================================================
 
+
+
+// ============================================================
+//  Keying-material exporters (RFC 5705 / RFC 8446 §7.5)
+// ============================================================
+
+/**
+ * TLS 1.3: derive the exporter_master_secret (RFC 8446 §7.1).
+ *
+ *   exporter_master_secret = Derive-Secret(Master Secret, "exp master",
+ *                                          ClientHello...server Finished)
+ *
+ * Called at the same point (and with the same transcript hash) as the
+ * application traffic secrets.
+ */
+function derive_exporter_master_secret_with_hash(hashName, master_secret, transcript_hash) {
+  let hashLen = getHashLen(hashName);
+  return hkdf_expand_label(hashName, master_secret, 'exp master', transcript_hash, hashLen);
+}
+
+/**
+ * TLS 1.3 exporter (RFC 8446 §7.5) — two-stage derivation:
+ *
+ *   TLS-Exporter(label, context_value, key_length) =
+ *     HKDF-Expand-Label(
+ *       Derive-Secret(exporter_master_secret, label, ""),
+ *       "exporter", Hash(context_value), key_length)
+ *
+ * Note the FIRST stage uses Hash("") as its context (Derive-Secret over an
+ * empty transcript), and only the SECOND stage hashes the caller's context.
+ * A single-stage HKDF-Expand-Label(secret, label, ...) is NOT conformant
+ * and will not interoperate with OpenSSL/BoringSSL exporters.
+ *
+ * @param {string}      hashName                 'sha256' | 'sha384'
+ * @param {Uint8Array}  exporter_master_secret
+ * @param {string}      label
+ * @param {Uint8Array|null} context_value        null/undefined ≡ empty (per RFC 8446)
+ * @param {number}      length
+ * @returns {Uint8Array}
+ */
+function tls13_exporter(hashName, exporter_master_secret, label, context_value, length) {
+  let hashFn  = getHashFn(hashName);
+  let hashLen = getHashLen(hashName);
+  let h_empty = hashFn(new Uint8Array(0));
+  let derived = hkdf_expand_label(hashName, exporter_master_secret, label, h_empty, hashLen);
+  let h_ctx   = hashFn(context_value || new Uint8Array(0));
+  return hkdf_expand(hashName, derived, build_hkdf_label('exporter', h_ctx, length), length);
+}
+
+/**
+ * TLS 1.2 exporter (RFC 5705).
+ *
+ *   If no context:   PRF(master_secret, label, client_random + server_random)
+ *   With context:    PRF(master_secret, label,
+ *                        client_random + server_random +
+ *                        uint16(len(context)) + context)
+ *
+ * "No context" and "empty context" produce DIFFERENT output in TLS 1.2
+ * (unlike 1.3) — pass context_value === null/undefined for the no-context
+ * form. DTLS-SRTP (RFC 5764) uses the no-context form with label
+ * 'EXTRACTOR-dtls_srtp'.
+ *
+ * The PRF hash follows the negotiated cipher suite (RFC 5246 §5 /
+ * RFC 5289): SHA-256 for *_SHA256 suites, SHA-384 for *_SHA384 suites.
+ *
+ * @param {string}      hashName        cipher suite's PRF hash
+ * @param {Uint8Array}  master_secret
+ * @param {string}      label
+ * @param {Uint8Array}  client_random   32 bytes
+ * @param {Uint8Array}  server_random   32 bytes
+ * @param {Uint8Array|null} context_value
+ * @param {number}      length
+ * @returns {Uint8Array}
+ */
+function tls12_exporter(hashName, master_secret, label, client_random, server_random, context_value, length) {
+  let seedLen = 64 + (context_value != null ? 2 + context_value.length : 0);
+  let seed = new Uint8Array(seedLen);
+  seed.set(client_random, 0);
+  seed.set(server_random, 32);
+  if (context_value != null) {
+    seed[64] = (context_value.length >>> 8) & 0xFF;
+    seed[65] =  context_value.length        & 0xFF;
+    seed.set(context_value, 66);
+  }
+  return tls12_prf(master_secret, label, seed, length, hashName);
+}
+
 function derive_sn_key(hashName, traffic_secret, cipher_suite) {
   let keylen = TLS_CIPHER_SUITES[cipher_suite].keylen;
   return hkdf_expand_label(hashName, traffic_secret, 'sn', new Uint8Array(0), keylen);
@@ -708,4 +795,7 @@ export {
   get_handshake_finished,
   get_handshake_finished_with_hash,
   derive_sn_key,
+  derive_exporter_master_secret_with_hash,
+  tls13_exporter,
+  tls12_exporter,
 };

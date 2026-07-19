@@ -81,6 +81,13 @@ function DTLSSocket(udpSocket, options) {
     ev.emit('session', ticket);
   });
 
+  // Server-side callers use this to inspect the peer's offered extensions
+  // (session.getRemoteExtension) and answer via set_context BEFORE the
+  // ServerHello is built — e.g. DTLS-SRTP's use_srtp (RFC 5764).
+  session.on('clienthello', function(data, message) {
+    ev.emit('clienthello', data, message);
+  });
+
   /**
    * Feed an incoming UDP datagram (filtered by remote address/port).
    * Called by the UDP socket's message handler or by DTLSServer.
@@ -121,6 +128,21 @@ function DTLSSocket(udpSocket, options) {
   self.getNegotiationResult = function() { return session.getNegotiationResult(); };
   self.getALPN = function() { return session.getALPN(); };
   self.getPeerCertificate = function() { return session.getPeerCertificate(); };
+
+  /** RFC 5705 / RFC 8446 §7.5 exporter (Node tls.TLSSocket parity).
+   *  DTLS-SRTP: exportKeyingMaterial(len, 'EXTRACTOR-dtls_srtp') — no context.
+   *  Returns Buffer, or null before secrets are available. */
+  self.exportKeyingMaterial = function(length, label, context_value) {
+    return session.exportKeyingMaterial(length, label, context_value);
+  };
+
+  /** Peer hello extensions / single extension by numeric type. */
+  self.getRemoteExtensions = function() { return session.getRemoteExtensions(); };
+  self.getRemoteExtension = function(type) { return session.getRemoteExtension(type); };
+
+  /** Pass config through to the underlying session (e.g. local_extensions
+   *  from a 'clienthello' handler). */
+  self.set_context = function(opts) { session.set_context(opts); };
 
   /** Access to internal DTLSSession (for advanced use). */
   self.session = session;

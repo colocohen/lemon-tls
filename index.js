@@ -9,6 +9,9 @@ import {
   hkdf_expand,
   hkdf_expand_label,
   hmac,
+  tls12_prf,
+  tls12_exporter,
+  tls13_exporter,
 } from './src/crypto.js';
 import * as wire from './src/wire.js';
 import * as record from './src/record.js';
@@ -43,6 +46,13 @@ var crypto = {
   hkdf_expand,
   hkdf_expand_label,
   hmac,
+  // Keying-material exporters (RFC 5705 / RFC 8446 §7.5) — standalone
+  // primitives for consumers that hold raw secrets (offline analysis,
+  // custom transports). Live sessions should prefer
+  // session.exportKeyingMaterial(), which picks the right one.
+  tls12_prf,
+  tls12_exporter,
+  tls13_exporter,
 };
 
 export {

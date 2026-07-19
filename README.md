@@ -210,7 +210,7 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `session` | `(Buffer)` | **Opaque session blob** — pass back to `connect({ session })` to resume |
 | `keyUpdate` | `(direction)` | Traffic keys refreshed: `'send'` or `'receive'` |
 | `keylog` | `(Buffer)` | SSLKEYLOGFILE-format line (for Wireshark) |
-| `clienthello` | `(raw, parsed)` | Raw ClientHello received (server, for JA3) |
+| `clienthello` | `(raw, parsed)` | ClientHello received (server side). Fires **synchronously before the ServerHello is built** — use it for JA3 fingerprinting, or to inspect the client's offered extensions (`parsed.extensions` / `getRemoteExtension`) and answer them via `set_context({ local_extensions })` (e.g. DTLS-SRTP `use_srtp`) |
 | `handshakeMessage` | `(type, raw, parsed)` | Every handshake message (debugging) |
 | `certificateRequest` | `(msg)` | Server requested a client certificate |
 | `error` | `(Error)` | TLS or transport error |
@@ -234,7 +234,7 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `socket.getPeerFinished()` | Peer Finished verify_data (Buffer) |
 | `socket.getSharedSigalgs()` | Array of shared signature algorithm names (server-side) |
 | `socket.getEphemeralKeyInfo()` | `{ type: 'X25519', size: 253 }` |
-| `socket.exportKeyingMaterial(len, label, ctx)` | RFC 5705 keying material |
+| `socket.exportKeyingMaterial(len, label, ctx)` | Exported keying material — RFC 5705 on (D)TLS 1.2, RFC 8446 §7.5 on (D)TLS 1.3. Returns `null` before secrets are ready (Node throws instead). Omit `ctx` for the no-context form (≠ empty context on 1.2!) — that's what DTLS-SRTP's `'EXTRACTOR-dtls_srtp'` uses |
 | `socket.isSessionReused()` | `true` if session was resumed |
 | `socket.setMaxSendFragment(size)` | Cap outgoing record plaintext size `[512, 16384]` |
 | `socket.setServername(name)` | Set SNI (client-side, before handshake) |
@@ -262,12 +262,16 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `socket.getNegotiationResult()` | `{ version, cipher, group, sni, alpn, resumed, helloRetried, ... }` |
 | `socket.rekeySend()` | Refresh outgoing encryption keys (TLS 1.3) |
 | `socket.rekeyBoth()` | Refresh keys for both directions (TLS 1.3) |
+| `socket.getRemoteExtensions()` | All extensions the peer sent in its hello: `[{ type, name, data, value }]`. On TLS 1.3 clients this is the union of ServerHello + EncryptedExtensions |
+| `socket.getRemoteExtension(type)` | One peer extension by numeric type (e.g. `14` = use_srtp, `0x39` = QUIC transport params), or `null` |
 
 ### `TLSSession`
 
 The **core state machine** for a TLS connection. Performs handshake, key derivation, and state management - but does **no I/O**. You provide the transport.
 
 This is the API to use for QUIC, DTLS, or any custom transport.
+
+Key methods (in addition to `set_context` / `feedDatagram`-style plumbing): `getTrafficSecrets()`, `getHandshakeSecrets()`, `exportKeyingMaterial(length, label, context?)` (RFC 5705 / RFC 8446 §7.5, version-dispatched), `getRemoteExtensions()` / `getRemoteExtension(type)` for inspecting what the peer offered, and the `'clienthello'` event — emitted **synchronously before the ServerHello is built**, so a server can read the client's offered extensions and answer them via `set_context({ local_extensions })`. `DTLSSession` and both socket classes delegate all of these.
 
 ```js
 import { TLSSession } from 'lemon-tls';
@@ -314,6 +318,45 @@ session.on('clienthello', (raw, parsed) => {
 });
 ```
 
+### DTLS API
+
+Everything above has a DTLS twin. Same TLS state machine underneath, same
+methods, plus datagram-specific plumbing (retransmission flights, epoch
+handling, cookie exchange):
+
+```js
+import { DTLSSession, DTLSSocket, createDTLSServer, connectDTLS } from 'lemon-tls';
+```
+
+**`DTLSSession`** — transport-less state machine (the DTLS analog of
+`TLSSession`). You move the datagrams:
+
+```js
+const dtls = new DTLSSession({
+  cert, key,
+  isServer: true,
+  minVersion: 'DTLSv1.2',      // DTLS 1.2 and 1.3 both supported
+  maxVersion: 'DTLSv1.3',
+  requestCert: true,           // mutual auth (WebRTC-style)
+  rejectUnauthorized: false,   // when doing fingerprint verification yourself
+});
+
+dtls.on('packet', (data) => udp.send(data, rport, raddr));  // outgoing datagrams
+udp.on('message', (msg) => dtls.feedDatagram(msg));         // incoming datagrams
+dtls.on('connect', () => { /* handshake done */ });
+dtls.on('data', (plaintext) => { /* decrypted app data */ });
+dtls.send(appData);
+```
+
+Delegated from the underlying `TLSSession` (identical semantics):
+`exportKeyingMaterial`, `getRemoteExtensions` / `getRemoteExtension`,
+`set_context`, `getNegotiationResult`, `getALPN`, `getPeerCertificate`,
+the `'clienthello'` event, plus `.tls` for direct access to the session.
+
+**`DTLSSocket` / `createDTLSServer` / `connectDTLS`** — UDP-transport
+wrappers over `DTLSSession`, mirroring the TCP socket layer's shape.
+The same delegated methods and events are available on the socket.
+
 ### Record Layer Module
 
 Shared encrypt/decrypt primitives for QUIC, DTLS, and custom transport consumers:
@@ -326,6 +369,62 @@ const { key, iv } = deriveKeys(trafficSecret, cipherSuite);
 const nonce = getNonce(iv, sequenceNumber);
 const algo = getAeadAlgo(cipherSuite);  // 'aes-128-gcm' | 'chacha20-poly1305'
 const encrypted = encryptRecord(contentType, plaintext, key, nonce, algo);
+```
+
+
+### DTLS-SRTP (WebRTC-style key export)
+
+The full RFC 5764 flow — negotiate an SRTP profile via the `use_srtp`
+extension, then export the SRTP master keys from the handshake:
+
+```js
+import { DTLSSession } from 'lemon-tls';
+
+// Client side: offer profiles (GCM preferred, CM fallback):
+//   body = u16 list_len | u16 profiles[] | u8 mki_len(0)
+client.set_context({ local_extensions: [
+  { type: 14, data: new Uint8Array([0x00,0x04, 0x00,0x07, 0x00,0x01, 0x00]) },
+]});
+
+// Server side: pick ONE from the client's offer, before ServerHello:
+server.on('clienthello', (raw, parsed) => {
+  const offer = parsed.extensions.find(e => e.type === 14);
+  // ...parse offer.data, pick a profile `p`...
+  server.set_context({ local_extensions: [
+    { type: 14, data: new Uint8Array([0x00,0x02, p >> 8, p & 0xFF, 0x00]) },
+  ]});
+});
+
+// After 'connect' on both sides — identical on client and server:
+const km = session.exportKeyingMaterial(60, 'EXTRACTOR-dtls_srtp');
+// (60 bytes for AES_CM_128_HMAC_SHA1_80, 56 for AEAD_AES_128_GCM.
+//  Feed straight into rtp-packet's SrtpSession.fromDtlsKeyingMaterial.)
+```
+
+Works on DTLS 1.2 (answer in ServerHello) and DTLS 1.3 (answer in
+EncryptedExtensions — `getRemoteExtension` sees both transparently).
+
+### Crypto Primitives Module
+
+The key-schedule building blocks are exported for consumers that hold raw
+secrets (QUIC stacks, offline capture analysis, custom transports):
+
+```js
+import { crypto } from 'lemon-tls';
+
+crypto.hkdf_extract(hash, salt, ikm);
+crypto.hkdf_expand(hash, prk, info, len);
+crypto.hkdf_expand_label(hash, secret, label, context, len);   // TLS 1.3 form
+crypto.hmac(hash, key, data);
+crypto.tls12_prf(secret, label, seed, len, hash);              // RFC 5246 PRF
+crypto.TLS_CIPHER_SUITES;                                      // suite registry
+
+// Standalone keying-material exporters — the same primitives
+// session.exportKeyingMaterial() dispatches to. Use these directly only
+// when you hold the raw secrets yourself; live connections should call
+// the session/socket method, which picks the right one per version:
+crypto.tls12_exporter(hash, masterSecret, label, clientRandom, serverRandom, ctxOrNull, len);  // RFC 5705
+crypto.tls13_exporter(hash, exporterMasterSecret, label, ctxOrNull, len);                      // RFC 8446 §7.5
 ```
 
 ## 🔧 Advanced Options (Not Available in Node.js)
@@ -444,6 +543,9 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ✅ | Node.js `tls` compat — **41 API methods/properties verified** |
 | ✅ | TypeScript typings bundled (`index.d.ts`) |
 | ✅ | DTLS 1.2 baseline (via `DTLSSocket` / `createDTLSServer`) |
+| ✅ | `exportKeyingMaterial` — RFC 5705 (1.2) + RFC 8446 §7.5 (1.3, proper two-stage `exporter_master_secret` derivation) |
+| ✅ | Peer-extension introspection (`getRemoteExtension(s)`) + custom `local_extensions` answered in the 1.2 ServerHello and 1.3 EncryptedExtensions |
+| ✅ | DTLS-SRTP keying flow (use_srtp negotiation + key export) verified end-to-end against rtp-packet |
 | ✅ | Zero dependencies - `node:crypto` only |
 | ✅ | **72 automated tests** (compat, resumption, data transfer) |
 | ✅ | Browser-tested (Chrome) |

@@ -2867,27 +2867,45 @@ function TLSSession(options){
           ];
       context.local_supported_signature_algorithms = ch_sigalgs; // for CH2 reuse
 
-      let extensions = [
-        { 
-          type: 'SUPPORTED_VERSIONS', 
+      // supported_versions (43) and key_share (51) are the TLS 1.3
+      // negotiation machinery (RFC 8446 §4.1.2, §4.2.8). Offer them only
+      // when 1.3 is actually in the offered version set — a pure 1.2
+      // hello must look like a 1.2 hello, exactly as OpenSSL/BoringSSL
+      // behave with max_version=1.2. Previously both were emitted
+      // unconditionally, so even a maxVersion:'DTLSv1.2' profile (the
+      // WebRTC default) advertised a single-entry supported_versions and
+      // a dangling key_share: spec-legal (receivers MUST ignore unknown
+      // extensions, RFC 5246 §7.4.1.4) but non-canonical — and fatal to
+      // at least one deployed stack (webrtc-dtls ≤0.7 hard-errors on any
+      // extension outside its known set, then poisons its replay window
+      // so no retransmission can ever recover the handshake).
+      let offers13 = context.local_supported_versions.some(function (v) {
+        return v === wire.TLS_VERSION.TLS1_3 || v === wire.DTLS_VERSION.DTLS1_3;
+      });
+      let extensions = [];
+      if (offers13) {
+        extensions.push({
+          type: 'SUPPORTED_VERSIONS',
           value: context.local_supported_versions
-        },
-        {
-          type: 'SUPPORTED_GROUPS', 
-          value: context.local_supported_groups
-        },
-        {
-          type: 'KEY_SHARE', 
+        });
+      }
+      extensions.push({
+        type: 'SUPPORTED_GROUPS',
+        value: context.local_supported_groups
+      });
+      if (offers13) {
+        extensions.push({
+          type: 'KEY_SHARE',
           value: [{
-            group: 0x001d, 
-            key_exchange: public_key 
+            group: 0x001d,
+            key_exchange: public_key
           }]
-        },
-        {
-          type: 'SIGNATURE_ALGORITHMS', 
-          value: ch_sigalgs
-        }
-      ];
+        });
+      }
+      extensions.push({
+        type: 'SIGNATURE_ALGORITHMS',
+        value: ch_sigalgs
+      });
       if (!tls13Only) {
         // TLS 1.2 compatibility — meaningless (and suspicious to strict
         // stacks) in a 1.3-only/QUIC hello

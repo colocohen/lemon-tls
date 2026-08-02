@@ -44,8 +44,11 @@ import {
 
 import {
   TLS_CIPHER_SUITES,
+  default_cipher_suites,
   hkdf_expand_label,
   derive_sn_key,
+  LABEL_PREFIX_TLS13,
+  LABEL_PREFIX_DTLS13,
 } from './crypto.js';
 
 import {
@@ -59,9 +62,12 @@ import {
   parseDtlsDatagram,
   buildDtlsAck,
   parseDtlsAck,
+  decryptEncryptedDtls13,
 } from './record.js';
 
 import { timingSafeEqualU8 } from './utils.js';
+import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS } from './session/ecdh.js';
+import { default_signature_schemes } from './session/signing.js';
 
 
 // ============================================================
@@ -141,6 +147,7 @@ function DTLSSession(options) {
     // byte and never the body, so any non-empty sid shears its whole
     // ClientHello parse.)
     sessionId: new Uint8Array(0),
+    srtpProfiles: options.srtpProfiles,
     servername: options.servername,
     SNICallback: options.SNICallback,
     rejectUnauthorized: options.rejectUnauthorized,
@@ -194,8 +201,22 @@ function DTLSSession(options) {
     // keyed by msg_seq, and drained in order once the gap is filled.
     pendingMessages: {},   // msg_seq → { type, body }
 
-    // Flight tracking for retransmission
-    currentFlight: [],     // array of { epoch, data: Uint8Array (complete datagram) }
+    // Flight tracking for retransmission.
+    //
+    // Stores PRE-ENCRYPTION descriptors — { epoch, contentType, payload } —
+    // never built records. Rebuilding at retransmit time (resendFlight) gives
+    // every retransmitted record a FRESH record sequence number, which is not
+    // an optimization but a hard requirement on two independent grounds:
+    //   1. DTLS 1.3 (RFC 9147 §4.2.1): the AEAD nonce is derived from the
+    //      record seq. Re-emitting a stored ciphertext repeats (key, nonce) —
+    //      catastrophic for GCM (key-stream reuse reveals plaintext XOR and
+    //      enables tag forgery). The old code stored fully-built records and
+    //      replayed the exact bytes.
+    //   2. Receivers reconstruct the full seq from its truncated wire form
+    //      relative to the highest seq seen (and BoGo outright requires
+    //      monotonic seqs from the shim) — a replayed old seq reconstructs to
+    //      a wrong full value and fails deprotection as "bad record MAC".
+    currentFlight: [],     // array of { epoch, contentType, payload: Uint8Array }
     // RFC 6347 §4.2.4 flight discipline: a NEW flight begins with the first
     // record we send after having accepted new handshake data from the peer.
     // Set when inbound processing advances state; consumed (and reset) by
@@ -253,24 +274,17 @@ function DTLSSession(options) {
   // Server defaults — TLSSession client auto-populates these, but server expects them set externally
   if (isServer) {
     if (!tlsSetup.local_supported_cipher_suites) {
-      let ciphers = [];
-      if (versions.indexOf(DTLS_VERSION.DTLS1_3) >= 0) {
-        ciphers.push(0x1301, 0x1302, 0x1303); // TLS 1.3 AEAD ciphers
-      }
-      if (versions.indexOf(DTLS_VERSION.DTLS1_2) >= 0) {
-        ciphers.push(0xC02F, 0xC030, 0xC02B, 0xC02C); // TLS 1.2 ECDHE ciphers
-      }
-      tlsSetup.local_supported_cipher_suites = ciphers;
+      // crypto.js owns the default suite list (see default_cipher_suites).
+      tlsSetup.local_supported_cipher_suites = default_cipher_suites(
+        versions.indexOf(DTLS_VERSION.DTLS1_3) >= 0,
+        versions.indexOf(DTLS_VERSION.DTLS1_2) >= 0
+      );
     }
     if (!tlsSetup.local_supported_groups) {
-      tlsSetup.local_supported_groups = [0x001d, 0x0017, 0x0018];
+      tlsSetup.local_supported_groups = ECDH_SUPPORTED_GROUPS.slice(); // whatever ecdh.js implements
     }
-    tlsSetup.local_supported_signature_algorithms = [
-      0x0804, 0x0805, 0x0806,  // RSA-PSS
-      0x0403, 0x0503, 0x0603,  // ECDSA
-      0x0807, 0x0808,          // EdDSA
-      0x0401, 0x0501, 0x0601,  // PKCS#1
-    ];
+    // signing.js owns the scheme list; DTLS spans 1.2+1.3 so include PKCS#1.
+    tlsSetup.local_supported_signature_algorithms = default_signature_schemes();
   }
 
   // Server cert/key
@@ -308,10 +322,18 @@ function DTLSSession(options) {
     }
     transcriptMsgSeqs.push(msgSeq);
 
-    if (ctx.selectedVersion === DTLS_VERSION.DTLS1_2) {
-      return build_dtls_handshake(data, msgSeq);
-    }
-    return data; // TLS format for DTLS 1.3 or unknown version
+    // RFC 9147 §5.5: the DTLS 1.3 transcript is made of *TLS-style* Handshake
+    // messages — message_seq, fragment_offset and fragment_length are REMOVED.
+    // DTLS 1.2 is the opposite: RFC 6347 §4.2.6 keeps the 12-byte DTLS header
+    // in the transcript. Getting this backwards breaks the Finished MAC only,
+    // long after every message parsed cleanly — which is why it presents as a
+    // late, unrelated-looking failure.
+    let entry = (ctx.selectedVersion === DTLS_VERSION.DTLS1_2)
+      ? build_dtls_handshake(data, msgSeq)
+      : data; // TLS format for DTLS 1.3 or not-yet-negotiated
+
+
+    return entry;
   };
 
   /**
@@ -332,30 +354,69 @@ function DTLSSession(options) {
   //  Key derivation
   // ============================================================
 
+  /**
+   * RFC 9147 §5.9: DTLS 1.3 derives with the "dtls13" label prefix (no trailing
+   * space), NOT TLS 1.3's "tls13 ". Using the TLS prefix yields a handshake in
+   * which every message parses and the transcripts match on both sides, and
+   * only the keys differ — the peer reports "bad record MAC" and nothing else.
+   * DTLS 1.2 does not use HKDF-Expand-Label at all (it uses the 1.2 PRF), so
+   * the branch only has to distinguish 1.3.
+   */
+  function dtlsLabelPrefix() {
+    return ctx.selectedVersion === DTLS_VERSION.DTLS1_3
+      ? LABEL_PREFIX_DTLS13
+      : LABEL_PREFIX_TLS13;
+  }
+
   function deriveEpochKeys(secret) {
     let cs = TLS_CIPHER_SUITES[ctx.cipherSuite];
     let empty = new Uint8Array(0);
-    let key = hkdf_expand_label(cs.hash, secret, 'key', empty, cs.keylen);
-    let iv = hkdf_expand_label(cs.hash, secret, 'iv', empty, 12);
+    let lp = dtlsLabelPrefix();
+    let key = hkdf_expand_label(cs.hash, secret, 'key', empty, cs.keylen, lp);
+    let iv = hkdf_expand_label(cs.hash, secret, 'iv', empty, 12, lp);
 
     let result = { key, iv };
 
     // DTLS 1.3: derive sn_key for record number encryption
     if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
-      result.snKey = derive_sn_key(cs.hash, secret, ctx.cipherSuite);
+      result.snKey = derive_sn_key(cs.hash, secret, ctx.cipherSuite, dtlsLabelPrefix());
       result.algo = getAeadAlgo(ctx.cipherSuite);
     }
 
     return result;
   }
 
+  /**
+   * The DTLS epoch a given key generation belongs to.
+   *
+   * DTLS 1.3 (RFC 9147 §6.1) numbers epochs 0=plaintext, 1=early data,
+   * 2=handshake, 3=application. DTLS 1.2 uses a single encrypted epoch 1.
+   * Which numbering applies depends on the negotiated version, so this must
+   * resolve the version FIRST and never assume a previous sync happened.
+   *
+   * The two callers used to differ: the handshake-secrets handler synced the
+   * version from the TLS session, the application-secrets handler did not sync
+   * at all. That asymmetry is only harmless while the version happens to be
+   * committed by the time each event fires. When it is not — the TLS engine
+   * commits negotiated values at the END of a reactive pass, and these events
+   * are emitted DURING one — the keys are filed under epoch 1 while records are
+   * later built for epoch 2/3. buildRecord then finds no keys, returns null,
+   * and the record is dropped silently: the peer sees nothing at all and times
+   * out. One helper, so both generations decide the same way.
+   */
+  function dtlsEpochForSecrets(isApplication) {
+    if (ctx.selectedVersion === null && tls.context.selected_version) {
+      ctx.selectedVersion = tls.context.selected_version;
+      if (ctx.selectedVersion === DTLS_VERSION.DTLS1_2) fixTranscriptForDtls12();
+    }
+    if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) return isApplication ? 3 : 2;
+    return 1;
+  }
+
   tls.on('handshakeSecrets', function(localSecret, remoteSecret) {
-    // Ensure version is detected before key derivation
-    if (ctx.selectedVersion === null) ctx.selectedVersion = tls.context.selected_version;
+    let dtlsEpoch = dtlsEpochForSecrets(false);
     ctx.cipherSuite = tls.getCipher();
     ctx.hashName = TLS_CIPHER_SUITES[ctx.cipherSuite].hash;
-
-    let dtlsEpoch = ctx.selectedVersion === DTLS_VERSION.DTLS1_3 ? 2 : 1;
 
     ctx.keys[dtlsEpoch] = {
       write: deriveEpochKeys(localSecret),
@@ -365,7 +426,7 @@ function DTLSSession(options) {
   });
 
   tls.on('appSecrets', function(localSecret, remoteSecret) {
-    let dtlsEpoch = ctx.selectedVersion === DTLS_VERSION.DTLS1_3 ? 3 : 1;
+    let dtlsEpoch = dtlsEpochForSecrets(true);
 
     ctx.keys[dtlsEpoch] = {
       write: deriveEpochKeys(localSecret),
@@ -445,8 +506,21 @@ function DTLSSession(options) {
     // Build DTLS records and emit
     for (let i = 0; i < frags.length; i++) {
       let record = buildRecord(dtlsEpoch, CT.HANDSHAKE, frags[i]);
-      ctx.currentFlight.push(record);
-      ev.emit('packet', record);
+      // The flight captures the fragment, not the record — see currentFlight.
+      ctx.currentFlight.push({ epoch: dtlsEpoch, contentType: CT.HANDSHAKE, payload: frags[i] });
+      if (record) {
+        ev.emit('packet', record);
+      } else {
+        // buildRecord refused to build (no keys for an encrypted epoch).
+        // Dropping the record here without a word is how a key-epoch mismatch
+        // turns into an unexplained peer timeout instead of a diagnosable
+        // failure: nothing reaches the wire and nothing is reported. Surface
+        // it — the handshake cannot proceed either way.
+        ev.emit('error', new Error(
+          'DTLS: could not build outgoing handshake record for epoch ' + dtlsEpoch +
+          ' — no keys installed for that epoch'));
+        return;
+      }
     }
 
     // Start retransmit timer after sending flight messages.
@@ -476,8 +550,21 @@ function DTLSSession(options) {
   function buildRecord(epoch, contentType, payload) {
     let epochKeys = ctx.keys[epoch];
 
+
     if (!epochKeys) {
-      // No keys → plaintext record
+      // DTLS 1.3 epochs 2 (handshake) and 3 (application) are ALWAYS
+      // encrypted — they carry the unified header (first byte 0x2c–0x2f). If
+      // we reach here without keys for such an epoch, emitting a classic
+      // 13-byte plaintext header (first byte = content type, e.g. 0x16/0x1a)
+      // would make the peer reject the record as "bad type byte" (RFC 9147
+      // §4). That only happens on a caller ordering bug (record built before
+      // its epoch's keys were installed); surface it instead of putting a
+      // malformed record on the wire. Epoch 0 is legitimately plaintext.
+      if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3 && epoch >= 2) {
+        ev.emit('error', new Error('DTLS 1.3: attempted to build epoch ' + epoch + ' record before keys installed'));
+        return null;
+      }
+      // No keys → plaintext record (epoch 0, or DTLS 1.2 pre-CCS)
       return buildDtlsPlaintext(contentType, epoch, nextWriteSeq(epoch), payload);
     }
 
@@ -538,6 +625,11 @@ function DTLSSession(options) {
    */
   function sendAlertRecord(epoch, alertData) {
     let record = buildRecord(epoch, CT.ALERT, alertData);
+    // buildRecord returns null when it refuses to emit a malformed record
+    // (DTLS 1.3 epoch >= 2 with no keys installed). Emitting that null as a
+    // packet pushes `null` into the transport; drop it instead — we already
+    // surfaced the reason through 'error'.
+    if (!record) return;
     ev.emit('packet', record);
   }
 
@@ -555,11 +647,13 @@ function DTLSSession(options) {
     }
     let record = buildDtlsPlaintext(CT.CHANGE_CIPHER_SPEC, 0, nextWriteSeq(0), new Uint8Array([1]));
     // RFC 6347 §4.2.4: the CCS is part of the flight and MUST be included
-    // when the flight is retransmitted. Previously it was emitted but never
-    // captured, so a retransmitted final flight arrived WITHOUT the cipher-
-    // spec change and the peer could never decrypt the accompanying
-    // Finished — an unrecoverable stall under single-datagram loss.
-    ctx.currentFlight.push(record);
+    // when the flight is retransmitted. Captured as a descriptor (epoch 0,
+    // plaintext), so resendFlight rebuilds it with a fresh seq like every
+    // other record. Previously it was emitted but never captured, so a
+    // retransmitted final flight arrived WITHOUT the cipher-spec change and
+    // the peer could never decrypt the accompanying Finished — an
+    // unrecoverable stall under single-datagram loss.
+    ctx.currentFlight.push({ epoch: 0, contentType: CT.CHANGE_CIPHER_SPEC, payload: new Uint8Array([1]) });
     ev.emit('packet', record);
   }
 
@@ -600,6 +694,24 @@ function DTLSSession(options) {
     let ackable = [];
 
     for (let i = 0; i < records.length; i++) {
+      // A record we could not decrypt when the datagram was parsed. Keys may
+      // have arrived since — processing an earlier record in THIS datagram
+      // (the ServerHello) is exactly what installs them. Retry now, in order,
+      // so a peer that packs its whole flight into one datagram is handled
+      // without waiting for a retransmit.
+      if (records[i].deferred) {
+        let epochKeys = ctx.keys[records[i].epoch];
+        let readKeys = epochKeys ? epochKeys.read : null;
+        if (!readKeys) continue;                 // still unreadable — let the peer retransmit
+        let dec = null;
+        try { dec = decryptEncryptedDtls13(records[i].raw, readKeys); } catch (e) { dec = null; }
+        if (!dec) continue;
+        records[i] = {
+          type: dec.type, epoch: dec.epoch, seq: dec.seq,
+          content: dec.content, encrypted: true, deferred: false,
+        };
+      }
+
       if (records[i].type === CT.HANDSHAKE &&
           ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
         ackable.push({ epoch: records[i].epoch, seq: records[i].seq });
@@ -751,9 +863,7 @@ function DTLSSession(options) {
       // bounds the total effort; the resend rate is naturally bounded by
       // the peer's own retransmission schedule. DTLS 1.3 is excluded —
       // it uses explicit ACKs (RFC 9147 §7) instead of flight inference.
-      for (let f = 0; f < ctx.currentFlight.length; f++) {
-        ev.emit('packet', ctx.currentFlight[f]);
-      }
+      resendFlight();
     }
   }
 
@@ -828,6 +938,7 @@ function DTLSSession(options) {
       coveredAfter += merged[ca][1] - merged[ca][0];
     }
 
+
     // Complete when a single range covers [0, totalLength).
     if (merged.length === 1 && merged[0][0] === 0 && merged[0][1] === frag.totalLength) {
       delete ctx.fragments[key];
@@ -871,11 +982,45 @@ function DTLSSession(options) {
     //
     // Note: msg_seq is NOT advanced for a rejected/HVR-triggering ClientHello, so
     // the client's retried CH (which reuses msg_seq per RFC 6347) is still accepted.
-    if (type === 1 && isServer && options.useCookies === true &&
-        ctx.selectedVersion !== DTLS_VERSION.DTLS1_3) {
-
+    if (type === 1 && isServer) {
       let ch = null;
       try { ch = parse_hello({ kind: 'client', body: body }); } catch (e) { ch = null; }
+
+      // Does this ClientHello offer DTLS 1.3?
+      //
+      // RULE: a decision derived from an incoming message is read from that
+      // message, never from state the message itself is about to establish.
+      // (Stated in full next to params_to_set in tls_session.js; this is the
+      // fourth bug it has caused.) Read it from the MESSAGE, never
+      // from ctx.selectedVersion — when the first ClientHello arrives nothing
+      // has been negotiated yet, so a state-based test reads null and fails
+      // OPEN. That matters because the two rules below are MUST-level and
+      // version-specific.
+      let offersDtls13 = false;
+      if (ch && Array.isArray(ch.supported_versions)) {
+        offersDtls13 = ch.supported_versions.indexOf(DTLS_VERSION.DTLS1_3) >= 0;
+      }
+
+      // RFC 9147 §5.3: "A DTLS 1.3-only client MUST set the legacy_cookie field
+      // to zero length. If a DTLS 1.3 ClientHello is received with any other
+      // value in this field, the server MUST abort the handshake with an
+      // 'illegal_parameter' alert." DTLS 1.3 carries cookies in the `cookie`
+      // EXTENSION; the legacy body field is vestigial and must stay empty.
+      if (offersDtls13 && ch && ch.dtls_cookie && ch.dtls_cookie.length > 0) {
+        tls.sendAlert(2, 47); // fatal, illegal_parameter
+        ev.emit('error', new Error(
+          'DTLS 1.3 ClientHello carries a non-empty legacy_cookie (' +
+          ch.dtls_cookie.length + ' bytes) — RFC 9147 §5.3 requires zero length'));
+        return false;
+      }
+
+      // RFC 9147 §5.1: "DTLS 1.3-compliant implementations MUST NOT use the
+      // HelloVerifyRequest to execute a return-routability check." DTLS 1.3
+      // does return-routability with HelloRetryRequest + the cookie extension
+      // instead. The old guard tested ctx.selectedVersion, which is null here,
+      // so a DTLS 1.3 handshake could still be answered with an HVR.
+      if (options.useCookies === true && !offersDtls13) {
+
       let incomingCookie = (ch && ch.dtls_cookie) ? ch.dtls_cookie : new Uint8Array(0);
 
       if (incomingCookie.length === 0) {
@@ -911,9 +1056,10 @@ function DTLSSession(options) {
       // feedHandshakeToTls records the incoming wire seq and outgoing
       // messages record message_sent_seq at emission — which is exactly
       // what the Finished MAC hashes (RFC 6347 §4.2.6).
-      ctx.nextReadMsgSeq = 1;
-      tls.context.message_sent_seq = 1;
-      // Fall through and process the ClientHello normally.
+        ctx.nextReadMsgSeq = 1;
+        tls.context.message_sent_seq = 1;
+        // Fall through and process the ClientHello normally.
+      }
     }
 
     // ---- In-order delivery (RFC 6347 §4.2.4 / RFC 9147 §5.2) ----
@@ -1077,8 +1223,8 @@ function DTLSSession(options) {
     // Build DTLS message and send — msg_seq 1 per the RFC figure above.
     let dtlsMsg = build_dtls_handshake(ch2, 1);
     let record = buildRecord(0, CT.HANDSHAKE, dtlsMsg);
-    ctx.currentFlight = [record];
-    ev.emit('packet', record);
+    ctx.currentFlight = [{ epoch: 0, contentType: CT.HANDSHAKE, payload: dtlsMsg }];
+    if (record) ev.emit('packet', record);
 
     tls.context.message_sent_seq = 2;
     startRetransmitTimer();
@@ -1088,6 +1234,21 @@ function DTLSSession(options) {
   // ============================================================
   //  Flight tracking + retransmission
   // ============================================================
+
+  /**
+   * Rebuild and re-emit the current flight with FRESH record sequence numbers.
+   * See currentFlight's comment for why re-encryption (not byte replay) is
+   * mandatory. Each descriptor goes back through buildRecord, which pulls the
+   * next write seq for its epoch — so a retransmitted DTLS 1.3 record gets a
+   * new nonce, and a monotonic seq the receiver can reconstruct.
+   */
+  function resendFlight() {
+    for (let i = 0; i < ctx.currentFlight.length; i++) {
+      let f = ctx.currentFlight[i];
+      let record = buildRecord(f.epoch, f.contentType, f.payload);
+      if (record) ev.emit('packet', record);
+    }
+  }
 
   function startRetransmitTimer() {
     cancelRetransmit();
@@ -1099,10 +1260,8 @@ function DTLSSession(options) {
         return;
       }
 
-      // Retransmit entire current flight
-      for (let i = 0; i < ctx.currentFlight.length; i++) {
-        ev.emit('packet', ctx.currentFlight[i]);
-      }
+      // Retransmit entire current flight with fresh record seqs.
+      resendFlight();
 
       ctx.retransmitCount++;
       ctx.retransmitTimeout = Math.min(ctx.retransmitTimeout * 2, 60000);
@@ -1200,7 +1359,21 @@ function DTLSSession(options) {
 
   function close() {
     if (ctx.state === 'closed') return;
-    let epoch = ctx.state === 'connected' ? (ctx.selectedVersion === DTLS_VERSION.DTLS1_3 ? 3 : 1) : 0;
+    // Choose the epoch by what the PEER can read, not by whether WE consider
+    // the handshake finished — the same rule the TLS branch uses for alerts.
+    //
+    // "not connected yet" does not mean "no keys": once handshake keys exist
+    // the peer has switched to reading protected records, and a plaintext
+    // close_notify arrives with a classic DTLSPlaintext header where the peer
+    // requires the RFC 9147 §4 unified header. It then reports a bad record
+    // type instead of a clean shutdown. Mirror the ACK path, which already
+    // picks the highest epoch we hold write keys for.
+    let epoch;
+    if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
+      epoch = ctx.keys[3] ? 3 : (ctx.keys[2] ? 2 : 0);
+    } else {
+      epoch = ctx.keys[1] ? 1 : 0;
+    }
     sendAlertRecord(epoch, new Uint8Array([1, 0])); // warning, close_notify
     ctx.state = 'closed';
     cancelRetransmit();
@@ -1253,6 +1426,16 @@ function DTLSSession(options) {
      */
     exportKeyingMaterial: function(length, label, context_value) {
       return tls.exportKeyingMaterial(length, label, context_value);
+    },
+
+    /**
+     * The negotiated DTLS-SRTP protection profile (RFC 5764), or null.
+     * Surfaced here because DTLS-SRTP is the reason the exporter exists for
+     * this transport — a caller that can export keying material must also be
+     * able to learn which profile those keys are for.
+     */
+    getSelectedSrtpProfile: function() {
+      return tls.getSelectedSrtpProfile();
     },
 
     /** Peer's hello extensions: [{ type, name, data, value }]. */

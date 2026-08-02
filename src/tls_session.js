@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   TLS_CIPHER_SUITES,
+  default_cipher_suites,
   build_cert_verify_tbs,
   build_cert_verify_tbs_with_hash,
   get_handshake_finished,
@@ -24,6 +25,10 @@ import {
   derive_exporter_master_secret_with_hash,
   tls13_exporter,
   tls12_exporter,
+  LABEL_PREFIX_TLS13,
+  LABEL_PREFIX_DTLS13,
+  suite_matches_version,
+  is_usable_cipher_suite,
 } from './crypto.js';
 
 import {
@@ -36,9 +41,10 @@ import {
 import * as wire from './wire.js';
 
 // Extracted modules
-import { pick_scheme, sign_with_scheme } from './session/signing.js';
+import { pick_scheme, sign_with_scheme, verify_with_scheme, default_signature_schemes } from './session/signing.js';
 import createSecureContext from './secure_context.js';
-import { x25519_get_public_key, x25519_get_shared_secret, p256_generate_keypair, p256_get_shared_secret, p384_generate_keypair, p384_get_shared_secret } from './session/ecdh.js';
+import { x25519_get_public_key, SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, generate_keypair as ecdh_generate_keypair, get_shared_secret as ecdh_get_shared_secret, is_supported_group
+} from './session/ecdh.js';
 import { build_tls_message, parse_tls_message } from './session/message.js';
 import { encrypt_session_blob, decrypt_session_blob, encode_client_session, decode_client_session } from './session/ticket.js';
 
@@ -93,6 +99,13 @@ function TLSSession(options){
 
     local_random: null,
     local_extensions: [],
+    // DTLS-SRTP protection profiles we accept, in preference order (RFC 5764).
+    // Value-based, not key-based: transports forward the option unconditionally,
+    // so the key is present with an undefined value when it was never set.
+    srtp_profiles: Array.isArray(options.srtpProfiles) ? options.srtpProfiles.slice() : [],
+    selected_srtp_profile: null,
+    // Extension types we offered — see note_offered_extensions().
+    offered_extension_types: [],
 
 
     local_supported_versions: [],
@@ -182,12 +195,30 @@ function TLSSession(options){
     remote_handshake_traffic_secret: null,
     local_handshake_traffic_secret: null,
     
-    remote_app_traffic_secret: null,
+    // RFC 8446 §7.1: the application traffic secrets (and exporter_master_secret)
+    // are derived from the transcript hash through the SERVER's Finished —
+    // ClientHello..server Finished, and nothing after it.
+    //
+    // This is a SEMANTIC checkpoint, so it is captured at the moment that event
+    // happens (server: when it pushes its own Finished; client: when it accepts
+    // the server's), NOT read off the live transcript wherever the derivation
+    // block happens to sit in the reactive loop. Those two differ: on the
+    // client, the loop may already have emitted its own Certificate (when the
+    // server requested client auth) before reaching the derivation block, which
+    // silently derived app keys over a longer transcript than the server used —
+    // a split-key handshake that surfaced only as a late bad_record_mac.
+    tls13_app_transcript_hash: null,
+
     local_app_traffic_secret: null,
 
     local_cert_chain: null,
     remote_cert_chain: null,
     peerAuthorized: false,
+    // Set only after the peer's handshake signature (TLS 1.3
+    // CertificateVerify, or TLS 1.2 ServerKeyExchange) actually verified
+    // against its certificate's public key. Gates handshake completion.
+    peerSignatureVerified: false,
+    peerSignatureScheme: null,
     authorizationError: null,
 
     selected_cert: null,
@@ -206,6 +237,11 @@ function TLSSession(options){
 
     // HelloRetryRequest
     helloRetried: false,                      // true if HRR was sent/received
+    // What a received HelloRetryRequest committed the server to; the second
+    // ServerHello is validated against these (RFC 8446 §4.1.4).
+    hrr_version: null,
+    hrr_group: null,
+    hrr_cipher: null,
 
     // DTLS cookie (set by DTLSSession via set_context)
     dtls_cookie: undefined,                   // Uint8Array or undefined
@@ -301,6 +337,406 @@ function TLSSession(options){
    * so subsequent calls to get_transcript_hash() run in O(1) clone+digest time
    * instead of re-hashing the entire transcript.
    */
+  /**
+   * Negotiated-version predicates.
+   *
+   * The engine deliberately handles TLS 1.2 and 1.3 in ONE state machine: the
+   * version is chosen *during* the handshake, so the machine must start
+   * version-agnostic, and a large part of the flow (hello parsing, extensions,
+   * transcript, certificates, ALPN/SNI, alerts) is genuinely shared. What
+   * differs is expressed as guards on individual steps.
+   *
+   * These two helpers exist so those guards read as the protocol question they
+   * actually are. Each site used to spell out
+   *   (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+   *    context.selected_version === wire.DTLS_VERSION.DTLS1_3)
+   * — ~90 characters that buried the *rest* of the condition it was ANDed with.
+   * (D)TLS 1.3 and 1.2 are treated as one version each because the record layer
+   * differences live in record.js / the transports, not here.
+   */
+  function is13() {
+    return context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+           context.selected_version === wire.DTLS_VERSION.DTLS1_3;
+  }
+
+  function is12() {
+    return context.selected_version === wire.TLS_VERSION.TLS1_2 ||
+           context.selected_version === wire.DTLS_VERSION.DTLS1_2;
+  }
+
+  /**
+   * Assemble the ClientHello extension list.
+   *
+   * ONE builder for both the initial ClientHello and the post-HelloRetryRequest
+   * CH2. RFC 8446 §4.1.2 requires CH2 to be identical to CH1 except for
+   * key_share, cookie and (optionally) a trimmed PSK — so building them from
+   * two hand-maintained copies is a standing invitation to divergence, and the
+   * copies HAD already diverged: one gated supported_versions/key_share on
+   * "do we offer 1.3", the other always emitted them, and the 1.3-only test
+   * differed between them (one accounted for DTLS 1.3, the other did not).
+   *
+   * @param {object} opts
+   *   keyShareGroup  — NamedGroup for the key_share entry (null = omit)
+   *   keySharePublic — public key bytes for that group
+   *   cookie         — HRR cookie to echo (RFC 8446 §4.2.2), or null
+   */
+  function build_client_hello_extensions(opts) {
+    opts = opts || {};
+
+    let offers13 = context.local_supported_versions.some(function (v) {
+      return v === wire.TLS_VERSION.TLS1_3 || v === wire.DTLS_VERSION.DTLS1_3;
+    });
+    // "1.3-only" means every offered version is (D)TLS 1.3 — a QUIC-style
+    // profile that must not carry TLS 1.2 legacy extensions.
+    let tls13Only = context.local_supported_versions.length > 0 &&
+                    context.local_supported_versions.every(function (v) {
+                      return v === wire.TLS_VERSION.TLS1_3 || v === wire.DTLS_VERSION.DTLS1_3;
+                    });
+
+    let extensions = [];
+
+    if (offers13) {
+      extensions.push({ type: 'SUPPORTED_VERSIONS', value: context.local_supported_versions });
+    }
+    // supported_groups is a CAPABILITY claim, not a copy of configuration.
+    //
+    // A configured list may name groups ecdh.js does not implement — a caller
+    // passing a curve list through, a post-quantum group in a profile we do not
+    // yet support. Advertising one is a promise: RFC 8446 §4.2.7 lets the
+    // server pick any group in this list and send a HelloRetryRequest for it.
+    // We would then have to abort a handshake the server conducted correctly,
+    // purely because we over-promised. Filtering here keeps the configured list
+    // intact for introspection while never claiming more than we can do.
+    let advertisable = [];
+    for (let gi = 0; gi < context.local_supported_groups.length; gi++) {
+      let g = context.local_supported_groups[gi];
+      if (is_supported_group(g)) advertisable.push(g);
+    }
+    extensions.push({ type: 'SUPPORTED_GROUPS', value: advertisable });
+    if (offers13 && opts.keySharePublic) {
+      extensions.push({
+        type: 'KEY_SHARE',
+        value: [{ group: opts.keyShareGroup, key_exchange: opts.keySharePublic }]
+      });
+    }
+    extensions.push({
+      type: 'SIGNATURE_ALGORITHMS',
+      value: context.local_supported_signature_algorithms
+    });
+
+    if (!tls13Only) {
+      // TLS 1.2 compatibility — meaningless (and suspicious to strict stacks)
+      // in a 1.3-only hello.
+      extensions.push({ type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) });
+      extensions.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
+    } else {
+      // psk_key_exchange_modes: a server MUST NOT send NewSessionTicket to a
+      // client that omitted it (RFC 8446 §4.2.9).
+      extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
+    }
+
+    // SNI must come first.
+    if (context.local_sni) {
+      extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
+    }
+
+    if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
+      extensions.push({ type: 'ALPN', value: context.local_supported_alpns });
+    }
+
+    // RFC 5077 SessionTicket. This belongs HERE, not at the CH1 call site,
+    // because RFC 8446 §4.1.2 requires the second ClientHello to be identical
+    // to the first except for key_share, cookie and pre_shared_key. Anything
+    // appended to CH1 *after* this assembler returns is silently absent from
+    // CH2, and a strict peer rejects the retry ("second ClientHello missing
+    // extension 35"). Every extension common to both hellos has to be produced
+    // by the one function that builds both.
+    //
+    // It is a TLS 1.2 mechanism (1.3 resumes via NewSessionTicket/PSK), so it
+    // is never offered in a 1.3-only profile. Skipped for DTLS as well:
+    // implementations often do not handle RFC 5077 there and it broke interop
+    // with openssl s_server -dtls1_2.
+    let isDtlsProfile = context.local_supported_versions &&
+                        context.local_supported_versions.some(function (v) { return (v & 0xFF00) === 0xFE00; });
+    if (!isDtlsProfile && !tls13Only && context.sessionTickets) {
+      if (opts.sessionTicket) {
+        extensions.push({ type: 'SESSION_TICKET', value: opts.sessionTicket });
+      } else {
+        extensions.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
+      }
+    }
+
+    // Cookie from HelloRetryRequest — MUST be echoed when present.
+    if (opts.cookie) {
+      extensions.push({ type: 'COOKIE', value: opts.cookie });
+    }
+
+    // Caller-supplied extensions (e.g. transport parameters).
+    // DTLS-SRTP offer (RFC 5764 §4.1.1): the client advertises every profile it
+    // accepts. Built here so CH1 and CH2 stay identical (RFC 8446 §4.1.2).
+    if (!context.isServer && Array.isArray(context.srtp_profiles) &&
+        context.srtp_profiles.length > 0) {
+      extensions.push({ type: 'USE_SRTP',
+                        value: { profiles: context.srtp_profiles.slice(),
+                                 mki: new Uint8Array(0) } });
+    }
+
+    for (let i = 0; i < context.local_extensions.length; i++) {
+      extensions.push(context.local_extensions[i]);
+    }
+
+    note_offered_extensions(extensions);
+    return extensions;
+  }
+
+  /**
+   * Remember which extension types we actually offered.
+   *
+   * RFC 8446 §4.2: "Implementations MUST NOT send extension responses if the
+   * remote endpoint did not send the corresponding extension requests ...
+   * Upon receiving such an extension, an endpoint MUST abort the handshake
+   * with an unsupported_extension alert."
+   *
+   * Enforcing that needs one fact — what we asked for — recorded in one place.
+   * The assembler is that place: every ClientHello, first or post-HRR, is built
+   * through it, so the record cannot drift from what actually went on the wire.
+   * Extensions appended after assembly (pre_shared_key, session_ticket) call
+   * this again to add themselves.
+   */
+  /**
+   * RFC 8446 §4.2 (TLS 1.3): a server MUST NOT answer with an extension the
+   * client did not request, and a client receiving one MUST abort with
+   * unsupported_extension.
+   *
+   * IMPORTANT: this function does NOT gate on version itself, because the
+   * ServerHello caller cannot rely on context.selected_version yet (it is set
+   * in a later pass of the reactive loop). The caller decides scope from the
+   * message's own supported_versions, which is authoritative.
+   *
+   * TLS/DTLS 1.2 (RFC 5246 §7.4.1.4) is deliberately looser: unknown
+   * extensions must be ignored. Applying the 1.3 rule to a 1.2 handshake
+   * rejects entirely valid peers (the WebRTC regression against pion /
+   * webrtc-rs).
+   *
+   * One rule for every server-originated extension block (ServerHello,
+   * EncryptedExtensions) — they all fail for the same reason and must fail
+   * the same way. Returns true when the caller should stop processing.
+   *
+   * HelloRetryRequest is handled earlier and returns before this point, so its
+   * cookie — which by definition we could not have offered — never lands here.
+   */
+  function reject_unsolicited_extensions(message, where) {
+    if (context.isServer) return false;                       // servers answer, not ask
+    if (!Array.isArray(message.extensions)) return false;
+    if (context.offered_extension_types.length === 0) return false;  // nothing recorded yet
+
+    for (let i = 0; i < message.extensions.length; i++) {
+      let et = message.extensions[i] && message.extensions[i].type;
+      if (typeof et !== 'number') continue;
+      if (context.offered_extension_types.indexOf(et) < 0) {
+        fatalAlert(wire.TLS_ALERT.UNSUPPORTED_EXTENSION,
+          where + ' carried extension ' + et + ' which we did not offer');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function note_offered_extensions(list) {
+    if (!Array.isArray(context.offered_extension_types)) {
+      context.offered_extension_types = [];
+    }
+    for (let i = 0; i < list.length; i++) {
+      let t = list[i] && list[i].type;
+      let code = (typeof t === 'number') ? t : wire.TLS_EXT[t];
+      if (typeof code === 'number' && context.offered_extension_types.indexOf(code) < 0) {
+        context.offered_extension_types.push(code);
+      }
+    }
+  }
+
+  /**
+   * The peer's leaf-certificate public key, as a crypto.KeyObject.
+   *
+   * Single place that turns remote_cert_chain[0] into a usable key. Both the
+   * TLS 1.3 CertificateVerify path and the TLS 1.2 ServerKeyExchange path need
+   * it, and having two copies means a future change to how we read the chain
+   * (chain building, alternative encodings) could be applied to one and missed
+   * on the other — the kind of half-fix that has bitten us before.
+   *
+   * Returns null if there is no chain or the leaf cannot be parsed; callers
+   * turn that into the appropriate alert for their context.
+   */
+  function peer_leaf_public_key() {
+    if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) return null;
+    try {
+      return new crypto.X509Certificate(Buffer.from(context.remote_cert_chain[0].cert)).publicKey;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * The cipher suite a ServerHello / HelloRetryRequest selected.
+   *
+   * parse_hello normalises the server's single choice into `cipher_suites[0]`,
+   * but some paths surface it as `cipher_suite`. Both spellings are in use, so
+   * reading only one of them silently yields undefined — which is how the
+   * HelloRetryRequest cipher-consistency check came to accept every mismatch.
+   */
+  function hello_cipher_suite(message) {
+    if (Array.isArray(message.cipher_suites) && message.cipher_suites.length > 0) {
+      return message.cipher_suites[0];
+    }
+    if (typeof message.cipher_suite === 'number') return message.cipher_suite;
+    return null;
+  }
+
+  /**
+   * Build and send the second ClientHello after a HelloRetryRequest.
+   *
+   * ONE emitter for both retry shapes — the server asked for a different group,
+   * or it asked only for a cookie. They differ in exactly two values
+   * (which group's key share to carry, and whether a cookie is echoed) and in
+   * nothing else, so writing them out twice means every future change to CH2
+   * has to be made in two places. That is precisely how the "second ClientHello
+   * missing extension 35" bug arose: an extension was added to one path and not
+   * the other.
+   *
+   * RFC 8446 §4.1.2 requires CH2 to be identical to CH1 apart from key_share,
+   * cookie and pre_shared_key — an invariant that is only cheap to hold when a
+   * single function produces it.
+   */
+  function send_second_client_hello(keyShareGroup, keySharePublic, cookie) {
+    let extensions = build_client_hello_extensions({
+      keyShareGroup: keyShareGroup,
+      keySharePublic: keySharePublic,
+      cookie: cookie
+    });
+
+    let ch2 = build_tls_message({
+      type: 'client_hello',
+      version: 0x0303,
+      random: context.local_random,
+      session_id: context.local_session_id,
+      cookie: context.dtls_cookie,
+      cipher_suites: context.local_supported_cipher_suites,
+      cipher_suite: context.local_supported_cipher_suites,
+      extensions: extensions,
+    });
+
+    pushTranscript(ch2);
+    ev.emit('message', 0, context.message_sent_seq, 'hello', ch2);
+    context.message_sent_seq++;
+  }
+
+  /**
+   * The signature algorithms the peer asked us to sign a client certificate
+   * with, from its CertificateRequest.
+   *
+   * There is deliberately NO fallback to our own offer list. Both call sites
+   * used to do `certificateRequestSigAlgs.length > 0 ? … : local_supported…`,
+   * which reads as caution but is not: signing with an algorithm the verifier
+   * never requested produces a signature it rejects, and it hid the real bug
+   * (the 1.3 list was never extracted from the CertificateRequest extensions,
+   * so the fallback fired on every handshake and looked like it worked).
+   *
+   * An empty list is a genuine protocol error — RFC 8446 §4.3.2 makes
+   * signature_algorithms mandatory in a TLS 1.3 CertificateRequest, and the
+   * decoder now rejects one without it — so returning empty here lets
+   * pick_scheme return null and the caller raise handshake_failure, which is
+   * the honest outcome.
+   */
+  function peer_requested_sig_algs() {
+    return context.certificateRequestSigAlgs || [];
+  }
+
+  /**
+   * Hash of the negotiated cipher suite — the hash the whole TLS 1.3 key
+   * schedule, every transcript hash and every Finished MAC are computed with.
+   *
+   * It was spelled out as negotiated_hash()
+   * at nineteen sites. That is a named protocol concept, not an incidental
+   * lookup, and writing it out each time means nineteen places to touch if the
+   * suite table ever changes shape — and nineteen chances to read the wrong
+   * field.
+   */
+  function negotiated_hash() {
+    let meta = TLS_CIPHER_SUITES[context.selected_cipher_suite];
+    return meta ? meta.hash : null;
+  }
+
+  /**
+   * Our certificate's private key as a crypto.KeyObject.
+   *
+   * The DER/pkcs8 encoding of `cert_private_key` is an internal storage
+   * detail; four sites repeated the same three-line construction to undo it.
+   * Keeping the shape in one place means a future change to how keys are held
+   * (PEM, an external signer, a KeyObject cached up front) is a change here
+   * and nowhere else.
+   */
+  function local_private_key() {
+    if (!context.cert_private_key) return null;
+    return crypto.createPrivateKey({
+      key: Buffer.from(context.cert_private_key),
+      format: 'der',
+      type: 'pkcs8',
+    });
+  }
+
+  /**
+   * HKDF-Expand-Label prefix for THIS session's key schedule.
+   *
+   * RFC 8446 §7.1 uses "tls13 "; RFC 9147 §5.9 requires "dtls13" (no trailing
+   * space) for DTLS 1.3, precisely so that the two protocols cannot derive the
+   * same keys from the same secrets. Using the TLS prefix over DTLS produces a
+   * handshake where every message parses and every transcript matches, and only
+   * the keys differ — which surfaces as "bad record MAC" with no other clue.
+   */
+  function label_prefix() {
+    return context.selected_version === wire.DTLS_VERSION.DTLS1_3
+      ? LABEL_PREFIX_DTLS13
+      : LABEL_PREFIX_TLS13;
+  }
+
+  /**
+   * DTLS-SRTP profile negotiation (RFC 5764 §4.1).
+   *
+   * The library previously decoded the client's use_srtp extension and handed
+   * it to the caller, but selected nothing and answered nothing — so every
+   * consumer had to re-implement the negotiation, and a peer that expects the
+   * stack to answer (as BoringSSL's SSL_CTX_set_tlsext_use_srtp does) got no
+   * use_srtp back at all.
+   *
+   * Selection is by SERVER preference over the mutually supported set, matching
+   * how the cipher suite and group are chosen. The answer carries exactly one
+   * profile and an empty MKI: RFC 5764 §4.1.1 says the server "MUST include
+   * exactly one" protection profile, and §4.1.2 that an MKI it does not
+   * understand is ignored rather than fatal.
+   *
+   * Returns the chosen profile, or null when there is no overlap — in which
+   * case NO use_srtp extension is sent, which is how RFC 5764 §4.1.2 says a
+   * server declines ("if no acceptable profile is found, the server SHOULD NOT
+   * include the extension").
+   */
+  function negotiate_srtp_profile() {
+    if (!context.isServer) return null;
+    if (!Array.isArray(context.srtp_profiles) || context.srtp_profiles.length === 0) return null;
+
+    let offered = null;
+    for (let i = 0; i < context.remote_extensions.length; i++) {
+      let e = context.remote_extensions[i];
+      if (e && e.type === wire.TLS_EXT.USE_SRTP) { offered = e.value; break; }
+    }
+    if (!offered || !Array.isArray(offered.profiles) || offered.profiles.length === 0) return null;
+
+    for (let i = 0; i < context.srtp_profiles.length; i++) {
+      let p = context.srtp_profiles[i] | 0;
+      if (offered.profiles.indexOf(p) >= 0) return p;
+    }
+    return null;
+  }
+
   function pushTranscript(data) {
     if (context.transcriptHook) {
       data = context.transcriptHook(data);
@@ -353,7 +789,25 @@ function TLSSession(options){
     }
   }
 
+  /**
+   * Abort the handshake with a fatal alert.
+   * Single funnel for every protocol-violation path: sends the alert (which
+   * also flips context.state to 'error', making the session inert — the
+   * reactive loop and process_income_message both early-return on terminal
+   * states, so a poisoned context can never keep producing messages), then
+   * surfaces the reason to the owner via 'error'.
+   */
+  function fatalAlert(description, msg) {
+    if (context.state === 'error' || context.state === 'closed') return;
+    sendAlert(2, description); // sets context.state = 'error'
+    ev.emit('error', new Error(msg));
+  }
+
   function process_income_message(data){
+
+    // Terminal states: a fatal alert (ours or a parse failure) already ended
+    // this session. Feeding more data must not resurrect the state machine.
+    if (context.state === 'error' || context.state === 'closed') return;
 
     // Track handshake start time
     if (context.handshakeStartTime === null) context.handshakeStartTime = Date.now();
@@ -361,16 +815,84 @@ function TLSSession(options){
     // Track handshake size and enforce limit
     context.handshakeBytes += data.length;
     if (context.maxHandshakeSize > 0 && context.handshakeBytes > context.maxHandshakeSize) {
-      ev.emit('error', new Error('Handshake size exceeded maxHandshakeSize (' + context.maxHandshakeSize + ')'));
+      // Must go through the same funnel as every other abort: previously this
+      // emitted 'error' but sent no alert and left the session in a live state,
+      // so the reactive loop could keep processing the very flood the limit
+      // exists to stop, and the peer was never told why we went quiet.
+      fatalAlert(wire.TLS_ALERT.INTERNAL_ERROR,
+        'Handshake size exceeded maxHandshakeSize (' + context.maxHandshakeSize + ')');
       return;
     }
 
-    let message = parse_tls_message(data, context.selected_version);
+    // The ONE place peer bytes become structured messages. wire.js throws
+    // parse errors carrying .alertDesc (decode_error / illegal_parameter);
+    // convert them to a fatal alert instead of letting them crash the
+    // transport's data handler (remote DoS) or be silently swallowed.
+    let message;
+    try {
+      message = parse_tls_message(data, context.selected_version);
+    } catch (e) {
+      fatalAlert(e.alertDesc || wire.TLS_ALERT.DECODE_ERROR, 'Malformed handshake message: ' + e.message);
+      return;
+    }
+
+    // Direction enforcement (RFC 8446 §5.1 / unexpected_message): each
+    // handshake type is legal from exactly one peer role. Without this, a
+    // client-sent EncryptedExtensions (etc.) walks straight into server
+    // state it was never meant to touch.
+    {
+      let t = message.type;
+      let serverOnly = t === 'server_hello' || t === 'encrypted_extensions' ||
+                       t === 'server_hello_done' || t === 'certificate_request' ||
+                       t === 'server_key_exchange' || t === 'new_session_ticket';
+      let clientOnly = t === 'client_hello' || t === 'client_key_exchange';
+      if ((context.isServer && serverOnly) || (!context.isServer && clientOnly)) {
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'Unexpected ' + t + ' from ' + (context.isServer ? 'client' : 'server'));
+        return;
+      }
+    }
 
     // Emit 'handshakeMessage' hook for every message
     ev.emit('handshakeMessage', message.type, data, message);
 
     if((context.isServer==false && message.type=='server_hello') || (context.isServer==true && message.type=='client_hello')){
+
+      // Server-side ClientHello policy checks — BEFORE the transcript push,
+      // the 'clienthello' emit and set_context's reactive loop, because the
+      // loop may synchronously build and send a ServerHello for a hello we
+      // are about to reject.
+      if (context.isServer && message.type === 'client_hello') {
+        let comp = message.legacy_compression || [];
+
+        // RFC 5246 §7.4.1.2: null compression MUST be present in every CH.
+        if (comp.indexOf(0) < 0) {
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'ClientHello without null compression');
+          return;
+        }
+
+        // RFC 8446 §4.1.2: a CH offering TLS 1.3 must carry exactly one
+        // compression method: null. Enforced when 1.3 is on the table for
+        // this negotiation (client offers it and we support it — an empty
+        // local list means "not configured yet", which defaults to 1.3+1.2).
+        let sv = message.supported_versions || [];
+        let offers13 = sv.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || sv.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+        let lv = context.local_supported_versions || [];
+        let we13 = lv.length === 0 || lv.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || lv.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+        if (offers13 && we13 && comp.length !== 1) {
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'TLS 1.3 ClientHello must offer exactly the null compression method');
+          return;
+        }
+
+        // RFC 8446 §4.2.11: one binder per identity, and never zero of either.
+        if (message.pre_shared_key && Array.isArray(message.pre_shared_key.identities)) {
+          let nIds = message.pre_shared_key.identities.length;
+          let nBinders = Array.isArray(message.pre_shared_key.binders) ? message.pre_shared_key.binders.length : 0;
+          if (nIds === 0 || nBinders !== nIds) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'pre_shared_key identities/binders count mismatch (' + nIds + '/' + nBinders + ')');
+            return;
+          }
+        }
+      }
 
       pushTranscript(data);
 
@@ -422,12 +944,12 @@ function TLSSession(options){
         if (pskResult && pskResult.psk) {
           let pskCipher = pskResult.cipher || 0x1301;
           let hashName = TLS_CIPHER_SUITES[pskCipher] ? TLS_CIPHER_SUITES[pskCipher].hash : 'sha256';
-          let binder_key = derive_binder_key(hashName, pskResult.psk, false);
+          let binder_key = derive_binder_key(hashName, pskResult.psk, false, label_prefix());
 
           let hashLen = getHashFn(hashName).outputLen;
           let bindersSize = 2 + 1 + hashLen;
           let truncatedCH = data.slice(0, data.length - bindersSize);
-          let expectedBinder = compute_psk_binder(hashName, binder_key, truncatedCH);
+          let expectedBinder = compute_psk_binder(hashName, binder_key, truncatedCH, label_prefix());
 
           dbg('SRV-PSK', 'hash:', hashName, 'hashLen:', hashLen,
               'truncatedCH len:', truncatedCH.length,
@@ -448,6 +970,10 @@ function TLSSession(options){
             context.psk_offered = {
               psk: pskResult.psk instanceof Uint8Array ? pskResult.psk : new Uint8Array(pskResult.psk),
               cipher: pskCipher,
+              // The HASH is what actually constrains cipher selection
+              // (RFC 8446 §4.2.11), not the exact suite the ticket was issued
+              // under. Stored here so selection does not have to re-derive it.
+              hash: hashName,
             };
           }
         }
@@ -500,91 +1026,318 @@ function TLSSession(options){
         // Extract cookie from HRR (if present, must be echoed in CH2)
         let hrrCookie = message.cookie || null;
 
+        // RFC 8446 §4.1.4: "Clients MUST abort the handshake with an
+        // illegal_parameter alert if the HelloRetryRequest would not result in
+        // any change in the ClientHello."
+        //
+        // A retry that names neither a new group nor a cookie asks us to resend
+        // a byte-identical ClientHello, which the server would answer with the
+        // same retry — an unbounded loop. Detecting it is not an optimisation:
+        // without it we neither retried nor failed, we simply stopped, and the
+        // peer sat waiting until it timed out. A stall is a denial of service.
+        if (!requestedGroup && !hrrCookie) {
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+            'HelloRetryRequest requests no change (no key_share and no cookie)');
+          return;
+        }
+
+        // Record EVERYTHING the retry committed to, in one place, before the
+        // branch below splits on whether a group was requested.
+        //
+        // RFC 8446 §4.1.4: the second ServerHello must agree with the retry on
+        // version, cipher suite and group. Those three checks need three
+        // recorded values, and recording them in two different places — the
+        // cipher here, the version and group inside the requestedGroup branch —
+        // meant a cookie-only retry recorded the cipher and nothing else, so
+        // two of the three consistency checks silently never fired for it. One
+        // concept, one place.
+        let hrrCipherSel = hello_cipher_suite(message);
+        if (hrrCipherSel !== null) context.hrr_cipher = hrrCipherSel;
+
+        let hrrVersionSel = null;
+        if (Array.isArray(message.supported_versions) && message.supported_versions.length > 0) {
+          hrrVersionSel = message.supported_versions[0];
+        } else if (typeof message.supported_versions === 'number') {
+          hrrVersionSel = message.supported_versions;
+        }
+        if (hrrVersionSel !== null) context.hrr_version = hrrVersionSel;
+
+        // Null for a cookie-only retry — which is correct: it committed to no
+        // group, so there is nothing for SH2 to contradict.
+        context.hrr_group = requestedGroup;
+
+        // A cookie-only retry is legal: the server is asking us to prove
+        // reachability without changing our key share. The group path below is
+        // skipped, so drive CH2 from here — previously this case produced no
+        // second ClientHello at all and stalled exactly like the empty retry.
+        if (!requestedGroup && hrrCookie) {
+          set_context({
+            selected_version: (Array.isArray(message.supported_versions) && message.supported_versions.length > 0)
+              ? message.supported_versions[0]
+              : (typeof message.supported_versions === 'number' ? message.supported_versions : null),
+            // NOTE: dtls_cookie is the DTLS ClientHello's own cookie FIELD
+            // (RFC 6347 §4.2.1), which lives in the message body and makes
+            // wire.js encode the hello in DTLS framing. The HelloRetryRequest
+            // cookie is a completely different thing — a TLS EXTENSION
+            // (RFC 8446 §4.2.2) that build_client_hello_extensions already
+            // carries. They share a name and nothing else. Assigning the HRR
+            // cookie here injected a 1-byte length plus the cookie into a TLS
+            // ClientHello body, which strict peers reject outright ("error
+            // decoding ClientHello message"). Leave the DTLS field alone.
+          });
+
+          let firstGroup = context.local_supported_groups[0];
+          let firstShare = context.local_key_groups[firstGroup]
+            ? context.local_key_groups[firstGroup].public_key : null;
+          send_second_client_hello(firstGroup, firstShare, hrrCookie);
+          return;
+        }
+
         if (requestedGroup) {
-          // Generate key for the requested group
+          // RFC 8446 §4.1.4: the retry must ask for a group the client offered
+          // in supported_groups but did NOT already send a key_share for.
+          // Asking for one we already shared is pointless — the server had
+          // everything it needed — and the RFC requires the client to abort
+          // rather than send a second share for the same group.
+          if (requestedGroup in context.local_key_groups) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'HelloRetryRequest asked for group 0x' + (requestedGroup >>> 0).toString(16) +
+              ' for which we already sent a key share');
+            return;
+          }
+
+          // The retry must also stay within what we advertised: a group absent
+          // from our supported_groups was never on offer.
+          if (context.local_supported_groups.length > 0 &&
+              context.local_supported_groups.indexOf(requestedGroup) < 0) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'HelloRetryRequest asked for group 0x' + (requestedGroup >>> 0).toString(16) +
+              ' which we did not offer');
+            return;
+          }
+
+          // Generate key for the requested group (ecdh.js owns curve dispatch).
+          // A group we don't implement means the server asked for something we
+          // never offered -- RFC 8446 4.1.4 makes that illegal_parameter.
           let newKeyGroup = null;
-          if (requestedGroup === 0x001d) {
-            let pk = new Uint8Array(crypto.randomBytes(32));
-            let pub = x25519_get_public_key(pk);
-            newKeyGroup = { group: requestedGroup, public_key: pub, private_key: pk };
-            context.local_key_groups[requestedGroup] = { public_key: pub, private_key: pk };
-          } else if (requestedGroup === 0x0017) {
-            let kp = p256_generate_keypair();
-            newKeyGroup = { group: requestedGroup, public_key: kp.public_key, private_key: kp.private_key };
-            context.local_key_groups[requestedGroup] = { public_key: kp.public_key, private_key: kp.private_key };
-          } else if (requestedGroup === 0x0018) {
-            let kp = p384_generate_keypair();
-            newKeyGroup = { group: requestedGroup, public_key: kp.public_key, private_key: kp.private_key };
-            context.local_key_groups[requestedGroup] = { public_key: kp.public_key, private_key: kp.private_key };
+          let hrrKp = ecdh_generate_keypair(requestedGroup);
+          if (hrrKp) {
+            newKeyGroup = { group: requestedGroup, public_key: hrrKp.public_key, private_key: hrrKp.private_key };
+            context.local_key_groups[requestedGroup] = { public_key: hrrKp.public_key, private_key: hrrKp.private_key };
+          } else {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'HelloRetryRequest asked for unsupported group 0x' + (requestedGroup >>> 0).toString(16));
+            return;
           }
 
           if (newKeyGroup) {
-            // Build and send new ClientHello (CH2) with:
-            // - key_share for requested group
-            // - cookie (if HRR included one)
-            // - ALPN (same as CH1)
-            // - custom extensions (QUIC transport params etc.)
-            // - same cipher_suites, session_id, random as CH1
-            // CH2 MUST match CH1 exactly except key_share/cookie (RFC 8446
-            // §4.1.2) — so mirror CH1's conditional composition: same sigalg
-            // source (CH1 wrote its final list back to the context), and the
-            // same tls13Only rules for the legacy extensions and psk modes.
-            let tls13Only2 = context.local_supported_versions.length > 0 &&
-                             context.local_supported_versions.every(v => v === 0x0304);
-            let extensions = [
-              { type: 'SUPPORTED_VERSIONS', value: context.local_supported_versions },
-              { type: 'SUPPORTED_GROUPS', value: context.local_supported_groups },
-              { type: 'KEY_SHARE', value: [{ group: requestedGroup, key_exchange: newKeyGroup.public_key }] },
-              { type: 'SIGNATURE_ALGORITHMS', value: context.local_supported_signature_algorithms },
-            ];
-            if (!tls13Only2) {
-              extensions.push({ type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) });
-              extensions.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
-            } else {
-              extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
+            // Record what the HelloRetryRequest told us THROUGH set_context,
+            // rather than only acting on it locally. The HRR carries the
+            // server's chosen version and group; skipping the reactive setter
+            // left selected_version unset for the whole CH2 exchange, which is
+            // why the record layer could not tell a 1.3 compat-CCS from a 1.2
+            // cipher change and had to be given a weaker test. State the peer
+            // told us belongs in the context like any other negotiated value.
+            let hrrVersion = null;
+            if (Array.isArray(message.supported_versions) && message.supported_versions.length > 0) {
+              hrrVersion = message.supported_versions[0];
+            } else if (typeof message.supported_versions === 'number') {
+              hrrVersion = message.supported_versions;
             }
 
-            // SNI (must be first)
-            if (context.local_sni) extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
-
-            // ALPN (same as CH1 — required for QUIC/h3)
-            if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
-              extensions.push({ type: 'ALPN', value: context.local_supported_alpns });
-            }
-
-            // Cookie from HRR (RFC 8446 §4.2.2 — MUST echo if present)
-            if (hrrCookie) {
-              extensions.push({ type: 'COOKIE', value: hrrCookie });
-            }
-
-            // Custom extensions (e.g. QUIC transport params 0x39)
-            for (let ci = 0; ci < context.local_extensions.length; ci++) {
-              extensions.push(context.local_extensions[ci]);
-            }
-
-            let ch2 = build_tls_message({
-              type: 'client_hello',
-              version: 0x0303,
-              random: context.local_random,
-              session_id: context.local_session_id,
-              cookie: context.dtls_cookie,
-          // BUGFIX: `cipher_suites` (plural) is what wire.js's client_hello
-              // builder actually reads; the singular key was silently ignored and
-              // wire.js substituted its own hardcoded fallback list — the
-              // configured cipher suites never reached the wire. Both names passed.
-              cipher_suites: context.local_supported_cipher_suites,
-              cipher_suite: context.local_supported_cipher_suites,
-              extensions: extensions,
+            set_context({
+              selected_version: hrrVersion,
+              selected_group: requestedGroup,
+              // See the note above: the HRR cookie is an extension, not the
+              // DTLS ClientHello cookie field. Preserve whatever DTLS cookie
+              // the transport established, and nothing more.
+              dtls_cookie: context.dtls_cookie,
+              add_local_key_groups: [{
+                group: requestedGroup,
+                private_key: newKeyGroup.private_key,
+                public_key: newKeyGroup.public_key
+              }],
             });
 
-            pushTranscript(ch2);
-            ev.emit('message', 0, context.message_sent_seq, 'hello', ch2);
-            context.message_sent_seq++;
+            // CH2 MUST match CH1 except key_share/cookie (RFC 8446 §4.1.2) —
+            // guaranteed here by building both from the same assembler.
+            send_second_client_hello(requestedGroup, newKeyGroup.public_key, hrrCookie);
           }
         }
 
         // Don't process HRR as a regular ServerHello
         return;
+      }
+
+      // Whether THIS ServerHello is 1.3: the server declares its choice via
+      // the supported_versions extension (RFC 8446 §4.2.1). Reading
+      // context.selected_version here would be too early — that field is set
+      // in the set_context below, in a later pass of the reactive loop. Base
+      // the decision on the message itself, which is authoritative.
+      let sh_is_13 = false;
+      if (Array.isArray(message.supported_versions)) {
+        sh_is_13 = message.supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
+                   message.supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+      } else if (typeof message.supported_versions === 'number') {
+        sh_is_13 = message.supported_versions === wire.TLS_VERSION.TLS1_3 ||
+                   message.supported_versions === wire.DTLS_VERSION.DTLS1_3;
+      }
+
+      // ── Second ServerHello must honour the HelloRetryRequest ──
+      // RFC 8446 §4.1.4: after a retry, the ServerHello that follows must name
+      // the SAME version and the SAME group the retry asked for. A server that
+      // changes its mind between the two is either broken or steering us, and
+      // §4.1.4 makes the mismatch an illegal_parameter. Checked here, once,
+      // against the values the HRR committed to (hrr_version / hrr_group) —
+      // the HRR branch itself has already returned by this point, so this only
+      // ever sees the real ServerHello.
+      if (!context.isServer && message.type === 'server_hello' && context.helloRetried) {
+
+        if (context.hrr_version !== null) {
+          let shVersion = null;
+          if (Array.isArray(message.supported_versions) && message.supported_versions.length > 0) {
+            shVersion = message.supported_versions[0];
+          } else if (typeof message.supported_versions === 'number') {
+            shVersion = message.supported_versions;
+          }
+          if (shVersion !== null && shVersion !== context.hrr_version) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'Second ServerHello version 0x' + (shVersion >>> 0).toString(16) +
+              ' does not match the HelloRetryRequest (0x' + (context.hrr_version >>> 0).toString(16) + ')');
+            return;
+          }
+        }
+
+        // RFC 8446 §4.1.4: "the server MUST send the same cipher suite in the
+        // ServerHello as it did in the HelloRetryRequest." The retry already
+        // fixed the hash that the whole key schedule depends on, so a change
+        // here is not a preference the client may follow — it is a mismatch
+        // that would silently derive different keys on each side.
+        let shCipherSel = hello_cipher_suite(message);
+        if (context.hrr_cipher !== null && shCipherSel !== null &&
+            shCipherSel !== context.hrr_cipher) {
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+            'ServerHello cipher suite 0x' + (shCipherSel >>> 0).toString(16) +
+            ' differs from the HelloRetryRequest (0x' + (context.hrr_cipher >>> 0).toString(16) + ')');
+          return;
+        }
+
+        if (context.hrr_group !== null &&
+            Array.isArray(message.key_groups) && message.key_groups.length > 0) {
+          let shGroup = message.key_groups[0] && message.key_groups[0].group;
+          if (typeof shGroup === 'number' && shGroup !== context.hrr_group) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'Second ServerHello selected group 0x' + (shGroup >>> 0).toString(16) +
+              ' but the HelloRetryRequest asked for 0x' + (context.hrr_group >>> 0).toString(16));
+            return;
+          }
+        }
+      }
+
+      // Record the server's DTLS-SRTP choice (it answers in EncryptedExtensions
+      // for 1.3, in the ServerHello for 1.2 — both land in remote_extensions).
+      if (!context.isServer && Array.isArray(message.extensions)) {
+        for (let sx = 0; sx < message.extensions.length; sx++) {
+          let e = message.extensions[sx];
+          if (e && e.type === wire.TLS_EXT.USE_SRTP && e.value &&
+              Array.isArray(e.value.profiles) && e.value.profiles.length > 0) {
+            context.selected_srtp_profile = e.value.profiles[0];
+          }
+        }
+      }
+
+      if (sh_is_13 && reject_unsolicited_extensions(message, 'ServerHello')) return;
+
+      // ── legacy_session_id_echo (RFC 8446 §4.1.3) ──
+      // "A client which receives a legacy_session_id_echo field that does not
+      // match what it sent in the ClientHello MUST abort the handshake with an
+      // illegal_parameter alert."
+      //
+      // This is unconditional for the client, and RFC 9147's errata is explicit
+      // that it still applies over DTLS 1.3 — DTLS disables the *server* side of
+      // TLS 1.3's compatibility mode (Appendix D.4) but NOT this check. We were
+      // not verifying it at all: a server could echo anything, or nothing, and
+      // we accepted it. The field is also the one signal that distinguishes a
+      // genuine ServerHello from one replayed or crafted for a different
+      // ClientHello, so skipping it is not cosmetic.
+      // TLS 1.3 ONLY. In TLS 1.2 the server is free to return a NEW session_id
+      // to establish a new session (RFC 5246 §7.4.1.3) — echoing the client's is
+      // how it signals RESUMPTION, not a requirement. Applying the 1.3 rule there
+      // rejects every ordinary 1.2 handshake.
+      if (sh_is_13 && !context.isServer && message.type === 'server_hello') {
+        let sentSid = context.local_session_id || new Uint8Array(0);
+        let echoSid = message.session_id || new Uint8Array(0);
+        let sameSid = sentSid.length === echoSid.length;
+        if (sameSid) {
+          for (let si = 0; si < sentSid.length; si++) {
+            if (sentSid[si] !== echoSid[si]) { sameSid = false; break; }
+          }
+        }
+        if (!sameSid) {
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+            'ServerHello legacy_session_id_echo does not match the ClientHello (' +
+            'sent ' + sentSid.length + ' bytes, echoed ' + echoSid.length + ')');
+          return;
+        }
+      }
+
+
+      // ── Client side of the negotiation-outcome rule ──
+      // RFC 8446 §4.2.8 (TLS 1.3 ONLY): "servers offer exactly one
+      // KeyShareEntry in the ServerHello ... This value MUST be in the same
+      // group as the KeyShareEntry value offered by the client." §4.1.4 says a
+      // server that wants a different group must send HelloRetryRequest
+      // instead.
+      //
+      // Scoped to 1.3 explicitly. DTLS 1.2 (and TLS 1.2) do not use key_share
+      // at all — they carry the server's ECDHE public key in
+      // ServerKeyExchange, and the ServerHello may legitimately carry
+      // extensions the parser exposes on the same field. Running this check
+      // there rejects entirely valid 1.2 handshakes and was the WebRTC
+      // regression against pion / webrtc-rs.
+      //
+      // Testing membership in local_key_groups — the shares we actually SENT —
+      // is the RFC's own test, and is stricter than "was it in our
+      // supported_groups": offering a group is not the same as having sent a
+      // key share for it. HelloRetryRequest has returned earlier, and its
+      // requested group is added to local_key_groups before CH2, so a genuine
+      // retry passes here.
+      if (!context.isServer && message.type === 'server_hello' &&
+          sh_is_13 &&
+          Array.isArray(message.key_groups) && message.key_groups.length > 0) {
+        for (let ki = 0; ki < message.key_groups.length; ki++) {
+          let g = message.key_groups[ki] && message.key_groups[ki].group;
+          if (typeof g !== 'number') continue;
+          if (!(g in context.local_key_groups)) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+              'ServerHello selected key_share group 0x' + (g >>> 0).toString(16) +
+              ' for which we sent no key share');
+            return;
+          }
+        }
+      }
+
+      // Resolve our certificate BEFORE the set_context below.
+      //
+      // The reactive loop derives the cipher suite from the inputs present when
+      // it runs, and (D)TLS 1.2 suites name an authentication algorithm that
+      // MUST match our certificate's key type (RFC 4492 §2). Resolving the
+      // certificate afterwards — as the SNI callback used to — meant selection
+      // ran with no key in hand, so a server holding an ECDSA certificate could
+      // pick an ECDHE_RSA suite and then present a certificate the peer rejects
+      // as "wrong certificate type". Inputs first, then the loop.
+      if (context.isServer === true && message.type === 'client_hello' &&
+          typeof context.SNICallback === 'function') {
+        context.SNICallback(message.sni || null, function (err, creds) {
+          if (!err && creds) {
+            // Direct assignment, not set_context: we are deliberately seeding
+            // inputs ahead of the single set_context below, which is what
+            // actually runs the loop. Going through set_context here would run
+            // it twice, once with a half-populated hello.
+            context.local_cert_chain  = creds.certificateChain;
+            context.cert_private_key  = creds.privateKey;
+          }
+        });
       }
 
       set_context({
@@ -618,8 +1371,11 @@ function TLSSession(options){
         if (timingSafeEqualU8(tail, DOWNGRADE_SENTINEL_TLS12) ||
             timingSafeEqualU8(tail, DOWNGRADE_SENTINEL_TLS11)) {
           dbg('DOWNGRADE', 'sentinel detected in ServerHello.random — aborting');
-          sendAlert(2, wire.TLS_ALERT.ILLEGAL_PARAMETER); // fatal, illegal_parameter (47)
-          ev.emit('error', new Error('TLS downgrade attack detected (RFC 8446 §4.1.3 sentinel present)'));
+          // Same abort funnel as everything else (fatalAlert = alert + terminal
+          // state + 'error'); the hand-rolled pair here predated it and was the
+          // one abort path that could drift out of sync with the rest.
+          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+            'TLS downgrade attack detected (RFC 8446 §4.1.3 sentinel present)');
           return;
         }
       }
@@ -742,24 +1498,59 @@ function TLSSession(options){
 
       ev.emit('hello');
 
-      if(context.isServer==true){
-        if(typeof context.SNICallback=='function'){
-          context.SNICallback(context.remote_sni, function (err, creds) {
-            if (!err && creds) {
-              set_context({
-                  local_cert_chain: creds.certificateChain,
-                  cert_private_key: creds.privateKey
-              });
-            }
-          });
-        }
-      }
 
 
 
     }else if(message.type=='client_key_exchange' || message.type=='server_key_exchange'){
 
       pushTranscript(data);
+
+      // TLS 1.2 ECDHE: the ServerKeyExchange is signed over
+      //   client_random | server_random | ServerECDHParams
+      // (RFC 4492 §5.4). Verifying it is what binds the ephemeral key to the
+      // certificate — without it an active attacker can substitute their own
+      // ECDHE public key and the handshake still completes. This was never
+      // checked before.
+      if (message.type === 'server_key_exchange' && !context.isServer &&
+          message.signature && message.public_key) {
+
+        if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'ServerKeyExchange before Certificate');
+          return;
+        }
+
+        let skePubKey = peer_leaf_public_key();
+        if (!skePubKey) {
+          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'Cannot read server certificate public key');
+          return;
+        }
+
+        // Rebuild the exact signed payload: randoms in wire order (client
+        // first) followed by the ServerECDHParams as they appeared.
+        let ecdhParams = wire.build_server_ecdh_params(message.group, message.public_key);
+        let skeTbs = concatUint8Arrays([
+          context.local_random,    // client_random (we are the client)
+          context.remote_random,   // server_random
+          ecdhParams
+        ]);
+
+        let skeOk = verify_with_scheme(
+          wire.TLS_VERSION.TLS1_2,
+          message.sig_alg,
+          skeTbs,
+          skePubKey,
+          message.signature
+        );
+
+        // Same strict test as the CertificateVerify gate: fail closed.
+        if (skeOk !== true) {
+          fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'ServerKeyExchange signature verification failed');
+          return;
+        }
+
+        context.peerSignatureVerified = true;
+        context.peerSignatureScheme = message.sig_alg;
+      }
 
       if ([0xC02F,0xC02B,0xC030,0xC02C,0xC013,0xC014,0xC009,0xC00A].includes(context.selected_cipher_suite)==true) {//ECDHE
 
@@ -804,6 +1595,38 @@ function TLSSession(options){
 
     }else if(message.type=='encrypted_extensions'){
 
+      if (reject_unsolicited_extensions(message, 'EncryptedExtensions')) return;
+
+      // RFC 8446 §4.2 (table): extensions with a defined home elsewhere MUST
+      // NOT appear in EncryptedExtensions — a peer that puts key_share (etc.)
+      // here is violating the extension placement rules → illegal_parameter.
+      // Everything unknown/custom is allowed through: EE is exactly where
+      // application extensions (QUIC transport params, use_srtp, ALPN) live.
+      {
+        let forbiddenInEE = {
+          5: 1,      // status_request (CH/CR/Certificate only)
+          13: 1,     // signature_algorithms
+          21: 1,     // padding (CH only)
+          23: 1,     // extended_master_secret (not a TLS 1.3 extension)
+          35: 1,     // session_ticket (not a TLS 1.3 extension)
+          41: 1,     // pre_shared_key
+          43: 1,     // supported_versions
+          44: 1,     // cookie
+          45: 1,     // psk_key_exchange_modes
+          47: 1,     // certificate_authorities (CH/CR only)
+          50: 1,     // signature_algorithms_cert
+          51: 1,     // key_share
+          0xff01: 1, // renegotiation_info (not a TLS 1.3 extension)
+        };
+        let eeExts = Array.isArray(message.extensions) ? message.extensions : [];
+        for (let fi = 0; fi < eeExts.length; fi++) {
+          if (eeExts[fi] && forbiddenInEE[eeExts[fi].type] === 1) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'Forbidden extension ' + eeExts[fi].type + ' in EncryptedExtensions');
+            return;
+          }
+        }
+      }
+
       pushTranscript(data);
 
       // TLS 1.3: most server extensions arrive HERE, not in the
@@ -834,22 +1657,146 @@ function TLSSession(options){
 
       pushTranscript(data);
 
-      set_context({
-        remote_cert_chain: message.entries,
-      });
+      let entries = message.entries || [];
 
-      // Validate peer certificate
-      validatePeerCertificate();
-      if (context.rejectUnauthorized && !context.peerAuthorized) {
-        sendAlert(2, 42); // fatal, bad_certificate
-        return;
+      // RFC 8446 §4.4.2.4 / RFC 5246 §7.4.6.
+      //  - From a SERVER an empty certificate_list is always illegal: the
+      //    server has nothing else to authenticate with, so this is fatal here
+      //    and now.
+      //  - From a CLIENT it is legal — it means "I have no certificate". Whether
+      //    that is acceptable is a POLICY question answered at the completion
+      //    gate, which also catches the client that omits the message entirely.
+      //    So we only record the outcome and let the reactive loop proceed;
+      //    returning early here would skip the set_context that drives it.
+      if (entries.length === 0) {
+        if (!context.isServer) {
+          fatalAlert(wire.TLS_ALERT.DECODE_ERROR, 'Server sent an empty certificate_list');
+          return;
+        }
+        context.authorizationError = 'NO_PEER_CERTIFICATE';
+        context.peerAuthorized = false;   // no set_context setter for this field
+        set_context({ remote_cert_chain: [] });
+      } else {
+        set_context({
+          remote_cert_chain: entries,
+        });
+
+        // Validate peer certificate
+        validatePeerCertificate();
+        if (context.rejectUnauthorized && !context.peerAuthorized) {
+          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE,
+            'Peer certificate validation failed: ' + (context.authorizationError || 'unknown'));
+          return;
+        }
       }
 
     }else if(message.type=='certificate_verify'){
 
+      // RFC 8446 §4.4.3 — verify the peer's handshake signature.
+      //
+      // This is the step that actually authenticates the peer: without it,
+      // ANY party able to send us a certificate (which is public data) is
+      // accepted, because nothing proves they hold the matching private key.
+      // Previously this branch only pushed to the transcript.
+      //
+      // Ordering is critical: the signed transcript covers everything up to
+      // but NOT including this message, so the hash MUST be taken before
+      // pushTranscript(data) below.
+      // A TLS 1.3 CertificateVerify that we cannot verify must NEVER be
+      // silently skipped. The block below is the only thing standing between
+      // us and accepting an unauthenticated peer, so every path that isn't a
+      // successful verification has to be an abort — including "we somehow got
+      // here without a negotiated cipher suite", which would otherwise fall
+      // through with peerSignatureVerified still false and no explanation.
+      if (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+          context.selected_version === wire.DTLS_VERSION.DTLS1_3) {
+
+        if (context.selected_cipher_suite === null) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
+            'CertificateVerify received before a cipher suite was negotiated');
+          return;
+        }
+
+        if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'CertificateVerify without a preceding Certificate');
+          return;
+        }
+
+        // Note on ordering: the cryptographic check below is the SECURITY
+        // decision and must be the thing that gates acceptance. An additional
+        // "was this scheme in our signature_algorithms" policy check
+        // (RFC 8446 §4.4.3) used to run FIRST here and abort with
+        // illegal_parameter. That was wrong in two ways: it let a
+        // scheme-decoding anomaly turn into a spurious rejection before the
+        // signature was ever checked, and it reported a policy error for what
+        // may be a signature failure. verify_with_scheme already rejects any
+        // scheme it cannot map to a (hash, algorithm, padding) triple, and
+        // binds the scheme to the certificate's key type, so an unoffered or
+        // unknown scheme still cannot verify.
+
+        let peerPubKey = peer_leaf_public_key();
+        if (!peerPubKey) {
+          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'Cannot read peer certificate public key');
+          return;
+        }
+
+        let cvHashName = negotiated_hash();
+        // isServer=false here means "we are the client, so the signature we
+        // are checking is the SERVER's" — the label follows the SIGNER's role,
+        // which is the opposite of ours.
+        let signerIsServer = !context.isServer;
+        let tbs = build_cert_verify_tbs_with_hash(cvHashName, signerIsServer, get_transcript_hash(cvHashName));
+
+        let sigOk = verify_with_scheme(
+          wire.TLS_VERSION.TLS1_3,     // DTLS 1.3 shares TLS 1.3 scheme semantics
+          message.scheme,
+          tbs,
+          peerPubKey,
+          message.signature
+        );
+
+        // Gate on "is exactly true", not on truthiness. verify_with_scheme
+        // already returns a strict boolean, but writing the test this way means
+        // a future refactor that lets some path fall through returning
+        // undefined fails CLOSED rather than open. The distinction matters here
+        // more than almost anywhere else in the library: this single value is
+        // what stands between us and an unauthenticated peer.
+        if (sigOk !== true) {
+          fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'CertificateVerify signature verification failed');
+          return;
+        }
+
+        context.peerSignatureVerified = true;
+        context.peerSignatureScheme = message.scheme;
+      }
+
       pushTranscript(data);
 
     }else if(message.type=='finished'){
+
+      // ── Order enforcement: Finished may not follow a bare Certificate ──
+      //
+      // RFC 8446 §4.4.3: a peer that sends a non-empty Certificate MUST follow
+      // it with CertificateVerify. Skipping it and going straight to Finished
+      // means the peer never proved possession of the certificate's private
+      // key — it merely presented somebody's certificate.
+      //
+      // A completion-time check alone is not enough here. A peer that omits
+      // CertificateVerify still shares the ECDHE secret, so it can compute a
+      // perfectly valid Finished; we would verify that Finished, derive
+      // application keys and only then notice. Rejecting on ARRIVAL keeps the
+      // omission from ever influencing the key schedule, and reports the
+      // protocol error (unexpected_message) rather than a downstream symptom.
+      //
+      // Applies in both roles: a client checks the server's certificate, and a
+      // server checks a client certificate it was offered.
+      if (is13() && context.remote_cert_chain && context.remote_cert_chain.length > 0 &&
+          context.peerSignatureVerified !== true) {
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
+          'Finished received after a certificate that was never proved by a CertificateVerify');
+        return;
+      }
+
 
       set_context({
         remote_finished: message.body
@@ -859,10 +1806,10 @@ function TLSSession(options){
 
       // Client receives NewSessionTicket from server (post-handshake in TLS 1.3, pre-CCS in TLS 1.2)
       if(!context.isServer){
-        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.resumption_master_secret) {
+        if ((is13()) && context.resumption_master_secret) {
           // TLS 1.3: derive PSK from resumption_master_secret + ticket_nonce
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-          let psk = derive_psk(hashName, context.resumption_master_secret, message.ticket_nonce);
+          let hashName = negotiated_hash();
+          let psk = derive_psk(hashName, context.resumption_master_secret, message.ticket_nonce, label_prefix());
 
           dbg('CLI-NST', 'received TLS 1.3 NST — cipher:', '0x' + context.selected_cipher_suite.toString(16),
               'hash:', hashName,
@@ -919,16 +1866,16 @@ function TLSSession(options){
     }else if(message.type=='key_update'){
 
       // Peer is updating their traffic secret (we update our read key)
-      if(context.state==='connected' && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
-        let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+      if(context.state==='connected' && (is13())){
+        let hashName = negotiated_hash();
         let hashLen = getHashLen(hashName);
-        let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen);
+        let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
         context.remote_app_traffic_secret = newRemoteSecret;
         ev.emit('keyUpdate', { direction: 'receive', secret: newRemoteSecret });
 
         // If peer requested us to update too
         if(message.request_update === 1){
-          let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen);
+          let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
           context.local_app_traffic_secret = newLocalSecret;
 
           // Send our KeyUpdate (not requesting back)
@@ -951,12 +1898,32 @@ function TLSSession(options){
         ev.emit('certificateRequest', message);
       }
 
+    }else{
+
+      // Terminal branch: a handshake message we do not implement, or one that
+      // is illegal at the negotiated version (RFC 8446 §4: HelloRequest and the
+      // other TLS 1.2-only types have no place in a 1.3 handshake). Anything
+      // reaching here was NOT processed, so it must not be ignored — silently
+      // dropping unknown messages let a peer stream them forever and hid real
+      // protocol errors behind a handshake that simply never progressed.
+      fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
+        'Unexpected handshake message type ' +
+        (message.handshake_type !== undefined ? message.handshake_type : message.type));
+      return;
+
     }
 
   }
 
 
   function set_context(options){
+    // Terminal states are terminal: after a fatal alert ('error') or a close,
+    // the reactive loop must not keep selecting parameters, deriving keys or
+    // emitting messages. This is also what stops it from writing into a
+    // transport whose peer already went away (see TLSSocket's destroyed
+    // marking — the two guards meet in the middle).
+    if (context.state === 'error' || context.state === 'closed') return;
+
     let has_changed=false;
 
     if (options && typeof options === 'object'){
@@ -1356,7 +2323,63 @@ function TLSSession(options){
 
     if(has_changed==true){
 
+      /**
+       * Values decided during THIS pass of the reactive loop.
+       *
+       * They are written here and only copied into `context` when the pass
+       * commits. That gives one rule, and getting it wrong has already caused
+       * three separate bugs (a spurious ServerHello rejection, the wrong cipher
+       * on PSK resumption, and a HelloRetryRequest that was never sent — the
+       * last two presenting as hangs rather than as wrong answers):
+       *
+       *   A gate whose decision MUST be made on the same pass that the input
+       *   arrived reads params_to_set first, falling back to context. Use the
+       *   `pending()` helper defined just below rather than writing the
+       *   ternary out:
+       *
+       *       if (pending('selected_version') === wire.TLS_VERSION.TLS1_3) { … }
+       *
+       *   A step that can simply wait may read `context` directly. Writing to
+       *   params_to_set sets has_changed, so the loop runs again and the value
+       *   will be in `context` next time round.
+       *
+       * A SECOND rule, same root, different shape — worth stating because it has
+       * now caused four bugs (a spurious ServerHello rejection, the wrong cipher
+       * on PSK resumption, a HelloRetryRequest that was never sent, and a
+       * HelloVerifyRequest sent in violation of RFC 9147 §5.1):
+       *
+       *   A decision derived from an INCOMING MESSAGE must be read from that
+       *   message, never from state the message itself is about to establish.
+       *
+       * `is13()` answers "what did we negotiate", which is the right question
+       * once negotiation is done and the wrong one while processing the very
+       * message that decides it. When handling a ClientHello or ServerHello,
+       * take the version from the message's own supported_versions — see
+       * `sh_is_13` in the ServerHello path and `offersDtls13` in dtls_session.
+       *
+       * The test is whether deferring changes the OUTCOME. Key generation and
+       * shared-secret derivation can wait — they just happen a pass later.
+       * HelloRetryRequest cannot: by the next pass the ServerHello may already
+       * have been sent, and the opportunity is gone. Anything gated on
+       * `hello_sent`, `finished_sent` or another one-shot latch is in that
+       * category.
+       */
       let params_to_set = {};
+
+      /**
+       * The value of a negotiated field AS OF THIS PASS.
+       *
+       * Reads params_to_set first, then context — the rule documented above,
+       * expressed once so no gate can forget the fallback half of it. Seven
+       * gates spelled this ternary out under seven different local names
+       * (pickedVersion, pskPassVersion, hrrVersionNow …), which meant a reader
+       * had to re-derive the intent each time and a new gate could easily copy
+       * only the `context` half. `pending('selected_version')` says what it is.
+       */
+      function pending(field) {
+        return (field in params_to_set) ? params_to_set[field] : context[field];
+      }
+
 
       
 
@@ -1407,23 +2430,112 @@ function TLSSession(options){
           }
         }
 
-        // TLS 1.3 PSK resumption: per RFC 8446 §4.2.11, server MUST select a cipher compatible
-        // with the selected PSK (same hash algorithm). Since we accepted the PSK based on its
-        // stored cipher's hash (for binder verification), we force the same cipher here.
-        if (context.isServer && context.psk_accepted && context.psk_offered && context.psk_offered.cipher &&
-            (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)) {
-          let pskCipher = context.psk_offered.cipher | 0;
-          if (context.remote_supported_cipher_suites.indexOf(pskCipher) >= 0 &&
-              context.local_supported_cipher_suites.indexOf(pskCipher) >= 0) {
-            params_to_set['selected_cipher_suite'] = pskCipher;
+        // TLS 1.3 PSK resumption — RFC 8446 §4.2.11:
+        //   "The server MUST ensure that it selects a compatible PSK (if any)
+        //    and cipher suite ... a cipher suite with the same hash algorithm."
+        //
+        // The constraint is on the HASH, not on the exact suite the ticket was
+        // issued under. Two bugs lived in the previous version, which forced
+        // the stored suite and otherwise fell through:
+        //
+        //   - it ignored our own preference order among the suites that DO
+        //     match the hash, so a client offering several compatible suites
+        //     got whichever one the ticket happened to carry;
+        //   - when the stored suite was no longer on offer it silently
+        //     continued with the PSK anyway and let ordinary selection pick a
+        //     suite with a DIFFERENT hash — resuming under a key schedule the
+        //     peer never agreed to.
+        //
+        // Correct rule: choose, by our normal preference, among the mutually
+        // supported suites whose hash matches the PSK. If none exists the PSK
+        // is unusable and must be dropped so the handshake falls back to a full
+        // one — accepting a PSK we cannot honour is not an "edge case", it is a
+        // resumption the peer will reject.
+        // Version check reads params_to_set first: selection runs in the same
+        // pass that decides the version, so context.selected_version is still
+        // null here and is13() would report false for every 1.3 handshake.
+        let pskPassVersion = pending('selected_version');
+        let pskPassIs13 = pskPassVersion === wire.TLS_VERSION.TLS1_3 ||
+                          pskPassVersion === wire.DTLS_VERSION.DTLS1_3;
+
+
+        if (context.isServer && context.psk_accepted && context.psk_offered &&
+            context.psk_offered.hash && pskPassIs13) {
+
+          let pskHash = context.psk_offered.hash;
+          let chosen = null;
+
+          for (let i = 0; i < context.local_supported_cipher_suites.length; i++) {
+            let cs = context.local_supported_cipher_suites[i] | 0;
+            if (context.remote_supported_cipher_suites.indexOf(cs) < 0) continue;
+            let meta = TLS_CIPHER_SUITES[cs];
+            if (!meta || meta.hash !== pskHash) continue;
+            // Describable is not usable — record.js implements AEAD only.
+            if (!is_usable_cipher_suite(cs)) continue;
+            chosen = cs;
+            break;
           }
-          // If client no longer offers this cipher, PSK can't be used — but we already accepted it.
-          // This is an edge case; fall through to normal selection and hope for the best.
+
+
+          if (chosen !== null) {
+            params_to_set['selected_cipher_suite'] = chosen;
+          } else {
+            // No compatible suite → the PSK cannot be used. Undo acceptance and
+            // let the normal path run a full handshake.
+            dbg('SRV-PSK', 'no mutually-supported cipher with hash', pskHash,
+                '— rejecting PSK, falling back to full handshake');
+            context.psk_accepted = false;
+            context.isResumed = false;
+            context.psk_offered = null;
+          }
         }
 
         if (!('selected_cipher_suite' in params_to_set)) {
+          // RFC 4492 §2 / RFC 5246 §7.4.2: a (D)TLS 1.2 cipher suite names the
+          // authentication algorithm, and it MUST match the key type of the
+          // certificate we are going to present — an ECDHE_RSA suite cannot be
+          // used with an ECDSA certificate. Selecting purely by mutual support
+          // let a server with an EC certificate pick ECDHE_RSA and then send a
+          // certificate the peer rejects as "wrong certificate type".
+          //
+          // The suite→auth mapping already exists in crypto.js's cipher table
+          // (the `sig` field), so this reads that authority rather than
+          // re-deriving it. TLS 1.3 suites are authentication-agnostic
+          // (sig: 'TLS13'), so they are never filtered here.
+          let localAuth = null;
+          if (context.isServer) {
+            try {
+              if (context.cert_private_key) {
+                let lk = local_private_key();
+                localAuth = lk ? lk.asymmetricKeyType : null;
+              }
+            } catch (e) { localAuth = null; }
+          }
+
+          let suiteAuthOk = function (suite) {
+            if (!context.isServer || localAuth === null) return true;   // client, or key type unknown
+            let meta = TLS_CIPHER_SUITES[suite];
+            if (!meta || !meta.sig || meta.sig === 'TLS13') return true; // not auth-bound
+            if (meta.sig === 'RSA')   return localAuth === 'rsa' || localAuth === 'rsa-pss';
+            if (meta.sig === 'ECDSA') return localAuth === 'ec';
+            return true;
+          };
+
           for (let i2 = 0; i2 < context.local_supported_cipher_suites.length; i2++) {
             let cs = context.local_supported_cipher_suites[i2] | 0;
+            if (!suiteAuthOk(cs)) continue;
+            // A suite belongs to exactly one protocol generation (RFC 8446
+            // §B.4). Selecting a 1.3 suite while negotiating 1.2 — which a
+            // configured list can easily contain — yields a ServerHello the
+            // peer cannot act on. This is the server-side mirror of not
+            // OFFERING 1.3 suites from a 1.2-only client profile.
+            if (!suite_matches_version(cs, pending('selected_version'))) continue;
+            // The suite table names more suites than the record layer can
+            // protect (CBC entries exist for parsing peer offers). Selecting a
+            // described-but-unimplemented suite yields a handshake that agrees
+            // on parameters and then cannot encrypt a record — the cipher-suite
+            // analogue of picking a key-exchange group we cannot compute.
+            if (!is_usable_cipher_suite(cs)) continue;
             for (let j2 = 0; j2 < context.remote_supported_cipher_suites.length; j2++) {
               
               if ((context.remote_supported_cipher_suites[j2] | 0) == cs) {
@@ -1494,67 +2606,124 @@ function TLSSession(options){
       if (context.selected_group == null){
         if(context.local_supported_groups.length > 0 && context.remote_supported_groups.length > 0) {
           for (let i = 0; i < context.local_supported_groups.length; i++) {
-            if(context.remote_supported_groups.indexOf(context.local_supported_groups[i])>=0){
-              params_to_set['selected_group'] = context.local_supported_groups[i];
-              break;
-            }
+            let g = context.local_supported_groups[i];
+            if (context.remote_supported_groups.indexOf(g) < 0) continue;
+
+            // Mutual support is not enough: we must be able to actually PRODUCE
+            // a key share for the group. ecdh.js is the single source of truth
+            // for which groups are implemented, and generate_keypair returns
+            // null (rather than throwing) for one it does not know — so a group
+            // that reaches here from configuration alone, such as a
+            // post-quantum group named in a --curves list we merely echo back,
+            // gets selected and then silently never produces a key. The
+            // reactive loop then waits forever for a key share that cannot
+            // exist: no ServerHello, no alert, connection held open. That is a
+            // denial of service, and it is caused by trusting a configured list
+            // over the implementation.
+            if (!is_supported_group(g)) continue;
+
+            params_to_set['selected_group'] = g;
+            break;
           }
         }
       }
       
 
 
-      //create the key by the group if dont have...
-      if(context.selected_group !== null && context.selected_group in context.local_key_groups==false){
+      // ── Negotiation outcome: decidable, or impossible? ──
+      //
+      // Every selection step above is written as "if not chosen yet, try to
+      // choose" — which quietly conflates two very different states: the
+      // inputs have not arrived yet, and the inputs HAVE arrived and share
+      // nothing with ours. The first must wait; the second can never succeed.
+      // Treating both as "wait" is what made a ClientHello offering only
+      // groups/ciphers/versions we do not implement hang forever instead of
+      // being refused — a stall is a DoS, and it is also how an unimplemented
+      // post-quantum group (Kyber, X25519MLKEM768) took the connection down
+      // without a single line of code mentioning it.
+      //
+      // This is deliberately ONE check covering all three negotiated
+      // parameters rather than a special case per parameter: they fail for the
+      // same reason and must fail the same way. RFC 8446 §4.1.1 / RFC 5246
+      // §7.4.1.3.
+      //
+      // Only the server decides these; the client validates the server's
+      // choice elsewhere. A non-empty remote cipher list is the signal that a
+      // ClientHello was actually processed, so we never fire before the peer
+      // has spoken.
+      if (context.isServer && context.remote_supported_cipher_suites.length > 0) {
 
-        if (context.selected_group === 0x001d) {
+        let pickedVersion = pending('selected_version');
 
-          const private_key = new Uint8Array(crypto.randomBytes(32));
-          let public_key  = x25519_get_public_key(private_key);
-
-          params_to_set['add_local_key_groups']=[
-            {
-              group: context.selected_group,
-              private_key: private_key,
-              public_key: public_key
-            }
-          ];
-
-        } else if (context.selected_group === 0x0017) {
-
-          let kp = p256_generate_keypair();
-          let private_key = kp.private_key;
-          let public_key  = kp.public_key;
-
-          params_to_set['add_local_key_groups']=[
-            {
-              group: context.selected_group,
-              private_key: private_key,
-              public_key: public_key
-            }
-          ];
-
-        } else if (context.selected_group === 0x0018) {
-
-          let kp = p384_generate_keypair();
-          let private_key = kp.private_key;
-          let public_key  = kp.public_key;
-
-          params_to_set['add_local_key_groups']=[
-            {
-              group: context.selected_group,
-              private_key: private_key,
-              public_key: public_key
-            }
-          ];
-
+        if (pickedVersion === null && context.local_supported_versions.length > 0 &&
+            context.remote_supported_versions.length > 0) {
+          fatalAlert(wire.TLS_ALERT.PROTOCOL_VERSION,
+            'No protocol version in common with the peer');
+          return;
         }
 
-        
+        // Cipher and group are checked INDEPENDENTLY of the version outcome.
+        //
+        // These used to be nested inside `if (pickedVersion !== null)`, which
+        // silently made "we could not agree on a group" undetectable whenever
+        // version selection had not completed — and version selection does not
+        // complete when local_supported_versions has not been configured yet,
+        // which is exactly the state a bare server session is in. The result
+        // was the original stall surviving for the one shape that matters:
+        // a ClientHello offering ONLY an unimplemented group (Kyber,
+        // X25519MLKEM768). Each parameter's failure is terminal on its own; one
+        // undecided parameter must not mask another's impossibility.
+        let pickedCipher = pending('selected_cipher_suite');
+        if (pickedCipher === null &&
+            context.local_supported_cipher_suites.length > 0 &&
+            context.remote_supported_cipher_suites.length > 0) {
+          fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE,
+            'No cipher suite in common with the peer');
+          return;
+        }
+
+        // Groups: only meaningful once the peer actually offered some. An
+        // offer we share nothing with is terminal; note that a shared group
+        // for which the peer merely sent no key_share is NOT this case —
+        // selected_group is set there and HelloRetryRequest handles it.
+        let pickedGroup = pending('selected_group');
+        if (pickedGroup === null &&
+            context.remote_supported_groups.length > 0 &&
+            context.local_supported_groups.length > 0) {
+          fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE,
+            'No key-exchange group in common with the peer');
+          return;
+        }
+      }
+
+      //create the key by the group if dont have...
+      // Curve-specific keygen lives in ecdh.js (single source of truth for
+      // which groups exist and how their keys are formed); the loop only
+      // decides WHEN a key is needed.
+      if(context.selected_group !== null && context.selected_group in context.local_key_groups==false){
+
+        let kp = ecdh_generate_keypair(context.selected_group);
+        if (kp) {
+          params_to_set['add_local_key_groups']=[
+            {
+              group: context.selected_group,
+              private_key: kp.private_key,
+              public_key: kp.public_key
+            }
+          ];
+        }
+
       }
 
       //get shared_secret...
-      if(context.selected_group !== null && context.ecdhe_shared_secret == null && context.selected_group in context.local_key_groups==true && context.selected_group in context.remote_key_groups==true){
+      // Can we compute the ECDHE secret yet? Needs a chosen group, both halves
+      // of the exchange present, and no secret computed already.
+      let ecdheReady = context.selected_group !== null &&
+                       context.ecdhe_shared_secret == null &&
+                       (context.selected_group in context.local_key_groups) &&
+                       (context.selected_group in context.remote_key_groups);
+
+      if (ecdheReady) {
 
         //check we have remote public key and local private key...
         if(context.remote_key_groups[context.selected_group].public_key!==null && context.local_key_groups[context.selected_group].private_key!==null){
@@ -1562,24 +2731,21 @@ function TLSSession(options){
           let remote_public_key=context.remote_key_groups[context.selected_group].public_key;
           let local_private_key=context.local_key_groups[context.selected_group].private_key;
 
-          if (context.selected_group === 0x001d) { // X25519
-
-            let ecdhe_shared_secret = x25519_get_shared_secret(local_private_key, remote_public_key);
-
-            params_to_set['ecdhe_shared_secret']=ecdhe_shared_secret;
-
-          } else if (context.selected_group === 0x0017) { // secp256r1 (P-256)
-
-            let ecdhe_shared_secret = p256_get_shared_secret(local_private_key, remote_public_key);
-
-            params_to_set['ecdhe_shared_secret']=ecdhe_shared_secret;
-
-          } else if (context.selected_group === 0x0018) { // secp384r1 (P-384)
-
-            let ecdhe_shared_secret = p384_get_shared_secret(local_private_key, remote_public_key);
-
-            params_to_set['ecdhe_shared_secret']=ecdhe_shared_secret;
-
+          // The peer's key share is fully attacker-controlled. ecdh.js owns the
+          // point-format rules and throws on anything malformed (wrong length,
+          // bad prefix, off-curve, low-order producing an all-zero secret per
+          // RFC 7748 6.1); node:crypto throws too. Our job here is only to turn
+          // any such failure into a fatal illegal_parameter (RFC 8446 4.2.8)
+          // rather than let it escape through set_context into the transport's
+          // data handler -- that would be a remote DoS on every transport.
+          // fatalAlert moves us to a terminal state, so the reactive loop
+          // cannot re-enter and retry the poisoned computation.
+          try {
+            params_to_set['ecdhe_shared_secret'] =
+              ecdh_get_shared_secret(context.selected_group, local_private_key, remote_public_key);
+          } catch (e) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'Invalid peer key share for group 0x' + context.selected_group.toString(16) + ': ' + e.message);
+            return;
           }
 
         }
@@ -1592,14 +2758,31 @@ function TLSSession(options){
       if(context.isServer==true){
 
         // HelloRetryRequest: if we selected a group but client didn't send a key_share for it
-        if(context.hello_sent==false && !context.helloRetried && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) &&
-           context.selected_group !== null && context.selected_cipher_suite !== null &&
-           !(context.selected_group in context.remote_key_groups)){
+        // Read the negotiated values from params_to_set first. Version, cipher
+        // and group are all decided EARLIER IN THIS SAME PASS and are only
+        // copied into `context` when the pass commits, so reading `context`
+        // here sees nulls on exactly the pass that processes the ClientHello.
+        //
+        // The consequence was a hang, not a wrong choice: a client that offers
+        // a group we support but sends its key_share for a different one (very
+        // much including an unimplemented post-quantum group offered alongside
+        // X25519) needs a HelloRetryRequest, and we silently sent nothing at
+        // all. The connection then sat open until the peer timed out — the same
+        // "impossible mistaken for not-yet-decidable" confusion, one layer up.
+        let hrrVersionNow = pending('selected_version');
+        let hrrIs13 = hrrVersionNow === wire.TLS_VERSION.TLS1_3 ||
+                      hrrVersionNow === wire.DTLS_VERSION.DTLS1_3;
+        let hrrGroupNow = pending('selected_group');
+        let hrrCipherNow = pending('selected_cipher_suite');
+
+        if(context.hello_sent==false && !context.helloRetried && hrrIs13 &&
+           hrrGroupNow !== null && hrrCipherNow !== null &&
+           !(hrrGroupNow in context.remote_key_groups)){
 
           context.helloRetried = true;
 
           // Replace transcript with message_hash (RFC 8446 §4.4.1)
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let hashName = TLS_CIPHER_SUITES[hrrCipherNow].hash;
           let ch1_hash = getHashFn(hashName)(concatUint8Arrays(context.transcript));
           let message_hash = wire.build_message(wire.TLS_MESSAGE_TYPE.MESSAGE_HASH, ch1_hash);
           context.transcript = [message_hash];
@@ -1609,9 +2792,9 @@ function TLSSession(options){
 
           // Build and send HRR (it's a ServerHello with magic random)
           let hrr_body = wire.build_hello_retry_request({
-            cipher_suite: context.selected_cipher_suite,
+            cipher_suite: hrrCipherNow,
             selected_version: context.selected_version,
-            selected_group: context.selected_group,
+            selected_group: hrrGroupNow,
             session_id: context.remote_session_id,
           });
           let hrr_data = wire.build_message(wire.TLS_MESSAGE_TYPE.SERVER_HELLO, hrr_body);
@@ -1635,14 +2818,14 @@ function TLSSession(options){
         if(context.hello_sent==false){
           
           if(context.selected_version!==null && context.selected_cipher_suite!==null && context.selected_session_id!==null){
-            if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+            if((is13())){
               if(context.selected_group in context.local_key_groups==true && context.local_key_groups[context.selected_group].public_key!==null){
                 // After HRR, don't send ServerHello until CH2 provides the requested key_share
                 if (!context.helloRetried || (context.selected_group in context.remote_key_groups)) {
                   can_send_hello=true;
                 }
               }
-            }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
+            }else if((is12())){
               // Block ServerHello while waiting for async resumeSession decision
               if (!context.tls12_resume_pending) {
                 can_send_hello=true;
@@ -1673,7 +2856,7 @@ function TLSSession(options){
 
           let build_message_params=null;
 
-          if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+          if((is13())){
 
             let shExtensions = [
               { 
@@ -1698,13 +2881,34 @@ function TLSSession(options){
               type: 'server_hello',
               version: context.selected_version,
               random: context.local_random,
-              session_id: context.remote_session_id,
+              // legacy_session_id_echo.
+              //
+              // TLS 1.3 (RFC 8446 §4.1.3) requires the server to echo the
+              // client's legacy_session_id verbatim — that is the whole point
+              // of the Appendix D.4 compatibility mode.
+              //
+              // DTLS 1.3 requires the OPPOSITE. RFC 9147 §5: "DTLS
+              // implementations do not use the TLS 1.3 'compatibility mode'
+              // described in Appendix D.4 of [TLS13]. DTLS servers MUST NOT
+              // echo the 'legacy_session_id' value from the client and
+              // endpoints MUST NOT send ChangeCipherSpec messages."
+              //
+              // Same field, same struct, opposite MUST — and the shared engine
+              // was doing the TLS thing for both transports. A DTLS peer that
+              // enforces §5 sees an echo it never expected. This is exactly the
+              // shape of the other DTLS 1.3 bugs: a legacy field whose meaning
+              // inverted between the two protocols.
+              session_id: (function () {
+                // RFC 9147 §5 — see the note above.
+                let isDtls = context.selected_version === wire.DTLS_VERSION.DTLS1_3;
+                return isDtls ? new Uint8Array(0) : context.remote_session_id;
+              })(),
               cipher_suite: context.selected_cipher_suite,
               extensions: shExtensions
             };
             
 
-          }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
+          }else if((is12())){
 
             
             // TLS 1.2 ServerHello: no SUPPORTED_VERSIONS or KEY_SHARE.
@@ -1742,6 +2946,15 @@ function TLSSession(options){
             // Responsibility for only answering extensions the client
             // actually offered stays with the caller (it can inspect the
             // ClientHello via the 'clienthello' event / getRemoteExtension).
+            // DTLS-SRTP answer for (D)TLS 1.2, where it rides the ServerHello
+            // rather than EncryptedExtensions (which does not exist in 1.2).
+            let srtpSel12 = negotiate_srtp_profile();
+            if (srtpSel12 !== null) {
+              context.selected_srtp_profile = srtpSel12;
+              ext_list.push({ type: 'USE_SRTP',
+                              value: { profiles: [srtpSel12], mki: new Uint8Array(0) } });
+            }
+
             for (let lei = 0; lei < context.local_extensions.length; lei++) {
               ext_list.push(context.local_extensions[lei]);
             }
@@ -1803,18 +3016,18 @@ function TLSSession(options){
 
       //get base_secret
       if (context.base_secret==null && context.selected_cipher_suite !== null){
-        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && (context.ecdhe_shared_secret !== null)){
+        if((is13()) && (context.ecdhe_shared_secret !== null)){
 
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let hashName = negotiated_hash();
           let result;
           // Use incremental transcript hash — avoids concat+hash of full transcript
           let tx_hash = get_transcript_hash(hashName);
           if (context.psk_accepted && context.psk_offered && context.psk_offered.psk) {
             // PSK + ECDHE key schedule
-            result = derive_handshake_traffic_secrets_psk_with_hash(hashName, context.psk_offered.psk, context.ecdhe_shared_secret, tx_hash);
+            result = derive_handshake_traffic_secrets_psk_with_hash(hashName, context.psk_offered.psk, context.ecdhe_shared_secret, tx_hash, label_prefix());
           } else {
             // Standard key schedule (no PSK)
-            result = derive_handshake_traffic_secrets_with_hash(hashName, context.ecdhe_shared_secret, tx_hash);
+            result = derive_handshake_traffic_secrets_with_hash(hashName, context.ecdhe_shared_secret, tx_hash, label_prefix());
           }
 
           params_to_set['base_secret']=result.handshake_secret;
@@ -1827,7 +3040,7 @@ function TLSSession(options){
             params_to_set['remote_handshake_traffic_secret']=result.server_handshake_traffic_secret;
           }
 
-        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.local_random!==null && context.remote_random!==null){
+        }else if((is12()) && context.local_random!==null && context.remote_random!==null){
           if(context.ecdhe_shared_secret !== null){
 
 
@@ -1845,7 +3058,7 @@ function TLSSession(options){
               // Server: CKE just arrived, transcript is complete.
               // Client: must wait until CKE is sent and in transcript.
               if(context.isServer || context.key_exchange_sent){
-                let hashFn  = getHashFn(TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+                let hashFn  = getHashFn(negotiated_hash());
 
                 // Use snapshot up to CKE if available (excludes CertificateVerify)
                 let emsTranscript = context._emsTranscriptLen
@@ -1853,12 +3066,12 @@ function TLSSession(options){
                   : context.transcript;
                 let transcript_hash = hashFn(concatUint8Arrays(emsTranscript));
 
-                let master_secret = tls12_prf(context.ecdhe_shared_secret, "extended master secret", transcript_hash, 48, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+                let master_secret = tls12_prf(context.ecdhe_shared_secret, "extended master secret", transcript_hash, 48, negotiated_hash());
 
                 params_to_set['base_secret']=master_secret;
               }
             }else{
-              let master_secret = tls12_prf(context.ecdhe_shared_secret, "master secret", concatUint8Arrays([client_random, server_random]), 48, TLS_CIPHER_SUITES[context.selected_cipher_suite].hash);
+              let master_secret = tls12_prf(context.ecdhe_shared_secret, "master secret", concatUint8Arrays([client_random, server_random]), 48, negotiated_hash());
 
               params_to_set['base_secret']=master_secret;
             }
@@ -1875,7 +3088,7 @@ function TLSSession(options){
 
 
       //send encrypted_extensions...
-      if (context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+      if (context.isServer==true && (is13())){
         if(context.encrypted_exts_sent==false && context.hello_sent==true && context.local_handshake_traffic_secret!==null){
 
           let extensions=[];
@@ -1883,6 +3096,31 @@ function TLSSession(options){
             extensions.push({ type: 'ALPN', value: [context.selected_alpn] });
           }
 
+          // server_name acknowledgement (RFC 6066 §3, RFC 8446 §4.4.2).
+          // When a client sent SNI and we accepted it, the server confirms by
+          // echoing an EMPTY server_name extension here — no ServerNameList,
+          // zero-length body. The extension is asymmetric: the list only ever
+          // travels client→server.
+          //
+          // NOT on a resumed handshake. RFC 6066 §3: the acknowledgement means
+          // "I used this name to select my certificate", which only happens in
+          // a full handshake — on resumption the identity comes from the
+          // established session instead, and sending the extension anyway is a
+          // protocol error ("server acknowledged server_name when resuming").
+          // The psk_accepted flag is the same signal the Certificate and
+          // CertificateVerify steps already use to know they must be skipped.
+          if (context.remote_sni && !context.psk_accepted) {
+            extensions.push({ type: 'SERVER_NAME', value: null });
+          }
+
+
+          // DTLS-SRTP answer (RFC 5764 §4.1). One profile, empty MKI.
+          let srtpSel = negotiate_srtp_profile();
+          if (srtpSel !== null) {
+            context.selected_srtp_profile = srtpSel;
+            extensions.push({ type: 'USE_SRTP',
+                              value: { profiles: [srtpSel], mki: new Uint8Array(0) } });
+          }
 
           for(let i = 0; i < context.local_extensions.length; i++){
             extensions.push(context.local_extensions[i]);
@@ -1907,7 +3145,7 @@ function TLSSession(options){
 
       //send certificate... (skip for PSK resumption — no cert needed)
       // But first: send CertificateRequest if requestCert is set (TLS 1.3 only, between EE and Cert)
-      if(context.isServer==true && context.requestCert==true && !context.certificateRequestSent && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && !context.psk_accepted){
+      if(context.isServer==true && context.requestCert==true && !context.certificateRequestSent && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null && (is13()) && !context.psk_accepted){
         let cr_data = build_tls_message({
           type: 'certificate_request',
           certificate_request_context: new Uint8Array(0),
@@ -1920,7 +3158,15 @@ function TLSSession(options){
       }
 
       if(context.isServer==true && context.cert_sent==false && context.local_cert_chain!==null && !context.psk_accepted && !context.tls12_abbreviated){
-        if(((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.encrypted_exts_sent==true && context.local_handshake_traffic_secret!==null) || ((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.hello_sent==true)){
+        // When may we put our Certificate on the wire?
+        //  1.3: it is encrypted, so it follows EncryptedExtensions and needs
+        //       the handshake traffic secret to exist.
+        //  1.2: it is cleartext and follows the ServerHello directly.
+        let certDue13 = is13() && context.encrypted_exts_sent === true &&
+                        context.local_handshake_traffic_secret !== null;
+        let certDue12 = is12() && context.hello_sent === true;
+
+        if(certDue13 || certDue12){
 
           let message_data = build_tls_message({
             type: 'certificate',
@@ -1931,7 +3177,7 @@ function TLSSession(options){
 
           context.cert_sent=true;
 
-          if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+          if ((is13())){
             ev.emit('message',1,context.message_sent_seq,'certificate',message_data);
           }else{
             ev.emit('message',0,context.message_sent_seq,'certificate',message_data);
@@ -1949,106 +3195,43 @@ function TLSSession(options){
 
 
       //send certificate verify...
-      if (context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+      if (context.isServer==true && (is13())){
         if(context.cert_sent==true && context.cert_verify_sent==false && context.local_cert_chain!==null && context.local_handshake_traffic_secret!==null && context.selected_cipher_suite!==null){
 
-          let tbsHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let tbsHashName = negotiated_hash();
           let tbs_data = build_cert_verify_tbs_with_hash(tbsHashName, true, get_transcript_hash(tbsHashName));
 
-          let cert_private_key_obj = crypto.createPrivateKey({
-            key: Buffer.from(context.cert_private_key),
-            format: 'der',
-            type: 'pkcs8',
-          });
+          let cert_private_key_obj = local_private_key();
 
-          const SIG = {
-            ECDSA_P256_SHA256: 0x0403,
-            ECDSA_P384_SHA384: 0x0503,
-            ECDSA_P521_SHA512: 0x0603,
-            RSA_PSS_SHA256:    0x0804,
-            RSA_PSS_SHA384:    0x0805,
-            RSA_PSS_SHA512:    0x0806,
-            ED25519:           0x0807,
-            ED448:             0x0808
-          };
+          // Scheme choice and signing belong to session/signing.js, which owns
+          // the SignatureScheme registry for BOTH signing and verification.
+          // This block used to re-declare the scheme constants, re-implement
+          // pick_scheme's candidate/preference logic and re-implement
+          // sign_with_scheme's padding+salt switch — ~90 lines duplicating that
+          // module. It was already drifting: the fix that made RSA-PSS and
+          // EdDSA usable in TLS 1.2 (RFC 8447/8422) landed in signing.js and
+          // never reached this copy. One implementation, used by both roles.
+          let selected_scheme = pick_scheme(
+            wire.TLS_VERSION.TLS1_3,
+            cert_private_key_obj,
+            context.remote_supported_signature_algorithms || []
+          );
 
-          let candidates=[];
-          if (cert_private_key_obj.asymmetricKeyType === 'ed25519') candidates.push(SIG.ED25519);
-          if (cert_private_key_obj.asymmetricKeyType === 'ed448')   candidates.push(SIG.ED448);
-          if (cert_private_key_obj.asymmetricKeyType === 'rsa')     candidates.push(SIG.RSA_PSS_SHA256, SIG.RSA_PSS_SHA384, SIG.RSA_PSS_SHA512); // TLS 1.3: PSS only
-
-          if (cert_private_key_obj.asymmetricKeyType === 'ec') {
-            let c = (cert_private_key_obj.asymmetricKeyDetails && cert_private_key_obj.asymmetricKeyDetails && cert_private_key_obj.asymmetricKeyDetails.namedCurve) || '';
-            if (c === 'prime256v1') candidates.push(SIG.ECDSA_P256_SHA256);
-            if (c === 'secp384r1')  candidates.push(SIG.ECDSA_P384_SHA384);
-            if (c === 'secp521r1')  candidates.push(SIG.ECDSA_P521_SHA512);
+          let sig_data = null;
+          if (selected_scheme !== null) {
+            sig_data = sign_with_scheme(
+              wire.TLS_VERSION.TLS1_3,
+              selected_scheme,
+              tbs_data,
+              cert_private_key_obj
+            );
           }
 
-
-          let preference_order = [
-            SIG.ED25519, 
-            SIG.ED448,
-            SIG.ECDSA_P256_SHA256, 
-            SIG.ECDSA_P384_SHA384, 
-            SIG.ECDSA_P521_SHA512,
-            SIG.RSA_PSS_SHA256, 
-            SIG.RSA_PSS_SHA384, 
-            SIG.RSA_PSS_SHA512
-          ];
-
-          let selected_scheme = null;
-          for (let s of preference_order) {
-            if (context.remote_supported_signature_algorithms.includes(s)==true && candidates.includes(s)==true) {
-              selected_scheme = s;
-              break;
-            }
+          if (selected_scheme === null || !sig_data) {
+            fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE,
+              'No signature scheme shared with peer for our certificate');
+            return;
           }
-
-          let sig_data=null;
-
-          switch (selected_scheme) {
-            case SIG.ED25519:
-              sig_data = new Uint8Array(crypto.sign(null, tbs_data, cert_private_key_obj));
-              break;
-
-            case SIG.ECDSA_P256_SHA256:
-              sig_data = new Uint8Array(crypto.sign('sha256', tbs_data, cert_private_key_obj));
-              break;
-
-            case SIG.ECDSA_P384_SHA384:
-              sig_data = new Uint8Array(crypto.sign('sha384', tbs_data, cert_private_key_obj));
-              break;
-
-            case SIG.ECDSA_P521_SHA512:
-              sig_data = new Uint8Array(crypto.sign('sha512', tbs_data, cert_private_key_obj));
-              break;
-
-            case SIG.RSA_PSS_SHA256:
-              sig_data = new Uint8Array(crypto.sign('sha256', tbs_data, {
-                key: cert_private_key_obj,
-                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-                saltLength: 32
-              }));
-              break;
-
-            case SIG.RSA_PSS_SHA384:
-              sig_data = new Uint8Array(crypto.sign('sha384', tbs_data, {
-                key: cert_private_key_obj,
-                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-                saltLength: 48
-              }));
-              break;
-
-            case SIG.RSA_PSS_SHA512:
-              sig_data = new Uint8Array(crypto.sign('sha512', tbs_data, {
-                key: cert_private_key_obj,
-                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-                saltLength: 64
-              }));
-              break;
-          }
-
-
 
           if(sig_data){
 
@@ -2083,7 +3266,7 @@ function TLSSession(options){
 
 
       // client/server key exchange - 1.2 only...
-      if (context.key_exchange_sent == false && (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)) {
+      if (context.key_exchange_sent == false && (is12())) {
         if(context.selected_group!==null && context.selected_group in context.local_key_groups==true && context.local_key_groups[context.selected_group].public_key!==null){
 
           if (context.isServer==false && context.remote_hello_done==true) {
@@ -2146,10 +3329,8 @@ function TLSSession(options){
               let transcript_data = concatUint8Arrays(context.transcript);
 
               // Pick scheme matching our cert + server's requested algorithms
-              let cert_key_obj = crypto.createPrivateKey({ key: Buffer.from(context.cert_private_key), format: 'der', type: 'pkcs8' });
-              let reqAlgs = context.certificateRequestSigAlgs.length > 0
-                ? context.certificateRequestSigAlgs
-                : context.local_supported_signature_algorithms;
+              let cert_key_obj = local_private_key();
+              let reqAlgs = peer_requested_sig_algs();
               let scheme = pick_scheme(wire.TLS_VERSION.TLS1_2, cert_key_obj, reqAlgs);
               let signature = sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme, transcript_data, cert_key_obj);
 
@@ -2180,11 +3361,7 @@ function TLSSession(options){
             let tbs_data = concatUint8Arrays([ context.remote_random, context.local_random, params_head ]);
 
 
-            let cert_private_key_obj = crypto.createPrivateKey({
-              key: Buffer.from(context.cert_private_key),
-              format: 'der',
-              type: 'pkcs8'
-            });
+            let cert_private_key_obj = local_private_key();
 
             let scheme12 = pick_scheme(wire.TLS_VERSION.TLS1_2, cert_private_key_obj, context.remote_supported_signature_algorithms);
 
@@ -2246,7 +3423,7 @@ function TLSSession(options){
       }
 
       //server hello done - 1.2 only...
-      if(context.isServer==true && (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
+      if(context.isServer==true && (is12())){
         if(context.hello_done_sent==false && context.key_exchange_sent==true){
 
           let message_data = build_tls_message({
@@ -2351,10 +3528,31 @@ function TLSSession(options){
           context.message_sent_seq++;
 
           // Send CertificateVerify
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let hashName = negotiated_hash();
           let transcript_hash = get_transcript_hash(hashName);
-          let scheme = pick_scheme(context.certificateRequestSigAlgs.length > 0 ? context.certificateRequestSigAlgs : context.local_supported_signature_algorithms, certCtx.privateKey);
-          let signature = sign_with_scheme(scheme, certCtx.privateKey, transcript_hash, false);
+          // Both calls had the wrong arity/order: pick_scheme takes
+          // (version, keyObject, peerSupportedList) and sign_with_scheme takes
+          // (version, scheme, tbs, keyObject). They were being passed a raw
+          // DER key and shuffled arguments, so client-certificate auth could
+          // never produce a valid signature.
+          let clientKeyObj = crypto.createPrivateKey({
+            key: Buffer.from(certCtx.privateKey),
+            format: 'der',
+            type: 'pkcs8',
+          });
+          let peerSigAlgs = peer_requested_sig_algs();
+
+          let scheme = pick_scheme(wire.TLS_VERSION.TLS1_3, clientKeyObj, peerSigAlgs);
+          if (scheme === null) {
+            fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE, 'No signature scheme shared with server for client certificate');
+            return;
+          }
+
+          // TBS uses the CLIENT CertificateVerify label, over the transcript
+          // hash taken before this message is pushed.
+          let cvHash = negotiated_hash();
+          let clientTbs = build_cert_verify_tbs_with_hash(cvHash, false, get_transcript_hash(cvHash));
+          let signature = sign_with_scheme(wire.TLS_VERSION.TLS1_3, scheme, clientTbs, clientKeyObj);
           let cv_data = build_tls_message({
             type: 'certificate_verify',
             scheme: scheme,
@@ -2381,12 +3579,35 @@ function TLSSession(options){
       // base_secret may be null after app secrets are derived, so we also check handshake secret.
       if (context.finished_sent==false && context.selected_cipher_suite!==null && (context.base_secret!==null || context.local_handshake_traffic_secret!==null)){
 
-        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.local_handshake_traffic_secret!==null){
+        if((is13()) && context.local_handshake_traffic_secret!==null){
 
-          if((context.isServer==false && context.remote_finished_ok==true && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (context.isServer==true && context.cert_verify_sent==true && context.local_cert_chain!==null) || (context.isServer==true && context.psk_accepted==true && context.encrypted_exts_sent==true)){
+          // When is our Finished due (TLS 1.3, RFC 8446 §4.4.4)? Three distinct
+          // situations, one per role/handshake kind — named rather than ORed
+          // inline so each stays readable and independently checkable.
+          //
+          //  client: only after the server's Finished verified AND both
+          //          application secrets exist (ours is the last message of
+          //          the handshake).
+          //  server, certificate handshake: after our CertificateVerify.
+          //  server, PSK handshake: no Certificate/CertificateVerify at all,
+          //          so EncryptedExtensions is the predecessor.
+          let clientFinishedDue = context.isServer === false &&
+                                  context.remote_finished_ok === true &&
+                                  context.local_app_traffic_secret !== null &&
+                                  context.remote_app_traffic_secret !== null;
 
-            let finHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-            let finished_data=get_handshake_finished_with_hash(finHashName,context.local_handshake_traffic_secret,get_transcript_hash(finHashName));
+          let serverCertFinishedDue = context.isServer === true &&
+                                      context.cert_verify_sent === true &&
+                                      context.local_cert_chain !== null;
+
+          let serverPskFinishedDue = context.isServer === true &&
+                                     context.psk_accepted === true &&
+                                     context.encrypted_exts_sent === true;
+
+          if(clientFinishedDue || serverCertFinishedDue || serverPskFinishedDue){
+
+            let finHashName = negotiated_hash();
+            let finished_data=get_handshake_finished_with_hash(finHashName,context.local_handshake_traffic_secret,get_transcript_hash(finHashName, label_prefix()));
             context.local_finished_data = finished_data;
 
             let message_data = build_tls_message({
@@ -2396,6 +3617,13 @@ function TLSSession(options){
 
             pushTranscript(message_data);
 
+            // Checkpoint for app-secret derivation (see tls13_app_transcript_hash).
+            // On the SERVER our own Finished IS the server Finished, so the
+            // transcript is now exactly ClientHello..server Finished.
+            if (context.isServer && context.tls13_app_transcript_hash === null) {
+              context.tls13_app_transcript_hash = get_transcript_hash(finHashName);
+            }
+
             context.finished_sent=true;
 
             ev.emit('message',1,context.message_sent_seq,'finished',message_data);
@@ -2404,7 +3632,7 @@ function TLSSession(options){
 
           }
 
-        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2)){
+        }else if((is12())){
 
           // Finished ordering differs between full and abbreviated handshake:
           //   Full:        client sends first (after CKE), then server (after client's Finished).
@@ -2426,7 +3654,7 @@ function TLSSession(options){
 
           if (can_send_finished) {
 
-            let finishedHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let finishedHashName = negotiated_hash();
             let transcript_hash = get_transcript_hash(finishedHashName);
 
             let finished_data;
@@ -2457,14 +3685,26 @@ function TLSSession(options){
       }
 
       //get app traffic secret...
-      if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3)){
+      if ((is13())){
         if(context.base_secret!==null && context.local_app_traffic_secret==null && context.remote_app_traffic_secret==null){
 
           if((context.isServer==true && context.finished_sent==true && context.remote_finished_ok==false) || (context.isServer==false && context.finished_sent==false && context.remote_finished_ok==true)){
 
-            let appHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-            let appTranscriptHash = get_transcript_hash(appHashName);
-            let result2 = derive_app_traffic_secrets_with_hash(appHashName, context.base_secret, appTranscriptHash);
+            let appHashName = negotiated_hash();
+            // Use the checkpoint captured when the server's Finished entered the
+            // transcript. Reading the live transcript here would silently pick up
+            // anything the loop emitted in between (client Certificate /
+            // CertificateVerify), producing app keys the peer never derives.
+            let appTranscriptHash = context.tls13_app_transcript_hash;
+            if (appTranscriptHash === null) {
+              // No checkpoint means we reached derivation without either side's
+              // Finished passing through the transcript — a state-machine bug,
+              // not a peer error. Refuse rather than derive from a guess.
+              fatalAlert(wire.TLS_ALERT.INTERNAL_ERROR,
+                'Internal error: app traffic secrets requested before the server Finished transcript checkpoint');
+              return;
+            }
+            let result2 = derive_app_traffic_secrets_with_hash(appHashName, context.base_secret, appTranscriptHash, label_prefix());
 
             // Save master_secret for resumption before clearing
             params_to_set['tls13_master_secret'] = result2.master_secret;
@@ -2474,7 +3714,7 @@ function TLSSession(options){
             // Kept for the lifetime of the connection so exportKeyingMaterial
             // (RFC 8446 §7.5) works after handshake completion.
             params_to_set['exporter_master_secret'] =
-              derive_exporter_master_secret_with_hash(appHashName, result2.master_secret, appTranscriptHash);
+              derive_exporter_master_secret_with_hash(appHashName, result2.master_secret, appTranscriptHash, label_prefix());
             params_to_set['base_secret']=null;
 
             if (context.isServer === true) {
@@ -2492,21 +3732,34 @@ function TLSSession(options){
       //expected_remote_finished...
       if (context.expected_remote_finished==null && context.selected_cipher_suite!==null){
 
-        if((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.remote_handshake_traffic_secret!==null){
+        if((is13()) && context.remote_handshake_traffic_secret!==null){
 
-          if((context.isServer==true && context.finished_sent==true) || (context.isServer==false && context.remote_finished !== null)){
+          // Compute the expected peer Finished only once the peer's Finished
+          // has actually arrived — for BOTH roles.
+          //
+          // verify_data is a MAC over the transcript as it stands immediately
+          // before the peer's Finished, so the value is only well-defined at
+          // that moment. The server used to compute it as soon as it had sent
+          // its OWN Finished, which is a different point in the transcript:
+          // with client authentication the client's Certificate and
+          // CertificateVerify arrive in between, so the server's expectation
+          // was fixed too early and every client-auth handshake failed with a
+          // verify_data mismatch. (Without client auth the two points coincide,
+          // which is why it went unnoticed.) The client already did this
+          // lazily; both roles now share the same rule.
+          if(context.remote_finished !== null){
 
-            let remoteFinHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
-            params_to_set['expected_remote_finished']=get_handshake_finished_with_hash(remoteFinHashName,context.remote_handshake_traffic_secret,get_transcript_hash(remoteFinHashName));
+            let remoteFinHashName = negotiated_hash();
+            params_to_set['expected_remote_finished']=get_handshake_finished_with_hash(remoteFinHashName,context.remote_handshake_traffic_secret,get_transcript_hash(remoteFinHashName, label_prefix()));
 
           }
 
-        }else if((context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2) && context.base_secret!==null){
+        }else if((is12()) && context.base_secret!==null){
 
           if(context.remote_finished!==null){
 
 
-            let tls12FinHashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+            let tls12FinHashName = negotiated_hash();
             let transcript_hash = get_transcript_hash(tls12FinHashName);
 
             if(context.isServer==true){
@@ -2530,6 +3783,16 @@ function TLSSession(options){
       //compare finished to expected...
       if(context.remote_finished_ok==false && context.remote_finished!==null && context.expected_remote_finished!==null){
 
+        // RFC 8446 §4.4.4: verify_data has exactly Hash.length bytes. A body
+        // of any other length (BoGo: TrailingDataWithFinished) is a framing
+        // violation — decode_error, checked BEFORE the value comparison so the
+        // constant-time compare below always runs on equal-length inputs.
+        if (context.remote_finished.length !== context.expected_remote_finished.length) {
+          fatalAlert(wire.TLS_ALERT.DECODE_ERROR, 'Finished verify_data has wrong length (' +
+            context.remote_finished.length + ', expected ' + context.expected_remote_finished.length + ')');
+          return;
+        }
+
         // Constant-time Finished comparison — verify_data is a MAC; a timing
         // oracle here would let a peer forge a valid Finished byte by byte.
         if(timingSafeEqualU8(context.remote_finished, context.expected_remote_finished)==true){
@@ -2541,6 +3804,18 @@ function TLSSession(options){
 
           pushTranscript(message_data);
 
+          // Checkpoint for app-secret derivation (see tls13_app_transcript_hash).
+          // On the CLIENT the peer's Finished IS the server's Finished, so the
+          // transcript is now exactly ClientHello..server Finished. Capture it
+          // here, before the loop can append our own Certificate/CertificateVerify.
+          if (!context.isServer && context.selected_cipher_suite !== null &&
+              (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+               context.selected_version === wire.DTLS_VERSION.DTLS1_3) &&
+              context.tls13_app_transcript_hash === null) {
+            let ckHash = negotiated_hash();
+            context.tls13_app_transcript_hash = get_transcript_hash(ckHash);
+          }
+
           params_to_set['remote_finished_ok']=true;
 
           context.remote_finished_data = context.remote_finished;
@@ -2550,7 +3825,14 @@ function TLSSession(options){
 
 
         }else{
+          // RFC 8446 §4.4.4: "Recipients of Finished messages MUST verify
+          // that the contents are correct and if incorrect MUST terminate the
+          // connection with a decrypt_error alert." The old behavior (null it
+          // out and keep waiting) left the peer hanging with a half-open
+          // handshake — and hid real key-schedule bugs.
           context.remote_finished=null;
+          fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'Finished verify_data mismatch');
+          return;
         }
 
       }
@@ -2558,26 +3840,86 @@ function TLSSession(options){
 
 
 
-      if(context.state!=='connected' && context.remote_finished_ok==true && (((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (context.selected_version === wire.TLS_VERSION.TLS1_2 || context.selected_version === wire.DTLS_VERSION.DTLS1_2))){
+      if(context.state!=='connected' && context.remote_finished_ok==true && (((is13()) && context.local_app_traffic_secret!==null && context.remote_app_traffic_secret!==null) || (is12()))){
+
+        // ── Authentication gate ──
+        // Peer authentication is enforced HERE, at the single point where the
+        // handshake is declared complete, and deliberately not (only) in the
+        // per-message branches. A message-level check can be bypassed simply by
+        // OMITTING the message: BoGo's SkipClientCertificate does exactly that,
+        // and an "empty certificate_list" check in the Certificate branch never
+        // runs because no Certificate ever arrives. In a reactive state machine
+        // the durable place for a MUST-have-happened invariant is the state
+        // transition it guards, not the event that usually satisfies it.
+
+        // Client: the server must have proved possession of its certificate
+        // key — TLS 1.3 CertificateVerify, or the TLS 1.2 ServerKeyExchange
+        // signature. PSK/abbreviated handshakes authenticate via the binder /
+        // resumed master secret instead.
+        if (!context.isServer && !context.psk_accepted && !context.tls12_abbreviated &&
+            context.peerSignatureVerified !== true) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
+            'Handshake completed without a verified server signature');
+          return;
+        }
+
+        // Server-side client authentication. Two DIFFERENT questions, which
+        // were previously collapsed into one condition:
+        //
+        //   (a) Must a client certificate arrive at all?  -> policy, and only
+        //       when we both asked for one and refuse to proceed without it.
+        //   (b) If a certificate DID arrive, must it be proved?  -> ALWAYS.
+        //
+        // Collapsing them meant a server with requestCert but without
+        // rejectUnauthorized skipped the whole block, so a client could send a
+        // certificate — any certificate, including one it does not own — and
+        // never prove possession, because the CertificateVerify check lived
+        // behind the (a) policy flag. Presenting someone else's certificate is
+        // an impersonation, not a policy preference, so (b) cannot be optional.
+        if (context.isServer && !context.psk_accepted && !context.tls12_abbreviated) {
+
+          let clientCertPresent = !!(context.remote_cert_chain && context.remote_cert_chain.length > 0);
+
+          // (a) required-but-absent
+          if (context.requestCert && context.rejectUnauthorized && !clientCertPresent) {
+            fatalAlert(wire.TLS_ALERT.CERTIFICATE_REQUIRED,
+              'Client certificate was required but none was provided');
+            return;
+          }
+
+          // (b) present-but-unproved. Unconditional: it applies even when the
+          // certificate was optional, because the question is not "did we want
+          // one" but "does this peer own the one it sent". In TLS 1.2 the
+          // client's CertificateVerify sets peerSignatureVerified the same way.
+          if (clientCertPresent &&
+              (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
+               context.selected_version === wire.DTLS_VERSION.DTLS1_3) &&
+              context.peerSignatureVerified !== true) {
+            fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
+              'Client sent a certificate without a valid CertificateVerify');
+            return;
+          }
+        }
+
         context.state='connected';
         context.handshakeEndTime = Date.now();
         ev.emit('secureConnect');
 
         // TLS 1.3: compute resumption_master_secret (both client and server need it)
-        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.tls13_master_secret && !context.resumption_master_secret) {
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+        if ((is13()) && context.tls13_master_secret && !context.resumption_master_secret) {
+          let hashName = negotiated_hash();
           context.resumption_master_secret = derive_resumption_master_secret_with_hash(
-            hashName, context.tls13_master_secret, get_transcript_hash(hashName)
+            hashName, context.tls13_master_secret, get_transcript_hash(hashName, label_prefix())
           );
         }
 
         // TLS 1.3 server: send NewSessionTicket
-        if ((context.selected_version === wire.TLS_VERSION.TLS1_3 || context.selected_version === wire.DTLS_VERSION.DTLS1_3) && context.isServer && !context.session_ticket_sent && context.sessionTickets && context.resumption_master_secret) {
+        if ((is13()) && context.isServer && !context.session_ticket_sent && context.sessionTickets && context.resumption_master_secret) {
           context.session_ticket_sent = true;
 
-          let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+          let hashName = negotiated_hash();
           let ticket_nonce = new Uint8Array([context.ticket_nonce_counter++]);
-          let psk = derive_psk(hashName, context.resumption_master_secret, ticket_nonce);
+          let psk = derive_psk(hashName, context.resumption_master_secret, ticket_nonce, label_prefix());
           let ticket_age_add = crypto.randomBytes(4).readUInt32BE(0);
           let ticket_lifetime = context.ticketLifetime;
 
@@ -2775,9 +4117,46 @@ function TLSSession(options){
 
 
   function sendAlert(level, description) {
+    // Nothing may follow a fatal alert (RFC 8446 §6.2). The guard lives here,
+    // at the single point every alert leaves through, rather than at each
+    // caller — a caller that forgets is exactly how the stray close_notify
+    // arose. `fatalAlert` has its own early return for the same reason; this
+    // covers the warning-level paths too.
+    if (context.state === 'error' || context.state === 'closed') return;
+
     let alertData = new Uint8Array([level, description]);
-    // Epoch 0 for alerts during/before handshake
-    let epoch = (context.state === 'connected') ? 2 : 0;
+
+    // Alerts must go out at the protection level the PEER is currently reading
+    // at, otherwise they are unreadable and the real reason for the abort is
+    // lost behind a decrypt failure.
+    //
+    //   epoch 0 — cleartext: before any keys exist, and for all of TLS 1.2's
+    //             handshake (alerts stay cleartext until CCS).
+    //   epoch 1 — handshake keys: TLS 1.3 after ServerHello but before our
+    //             Finished has been sent. This case was missing entirely.
+    //   epoch 2 — application keys.
+    //
+    // The subtlety is that the right answer depends on what the PEER reads,
+    // not on whether WE consider the handshake finished. In TLS 1.3 a server
+    // that has already sent its Finished has handed the client everything it
+    // needs to switch to application keys, and the client does so immediately —
+    // so an abort discovered afterwards (a missing client Certificate is
+    // discovered exactly there) must be encrypted under application keys even
+    // though our own state is not yet 'connected'. Encrypting it under
+    // handshake keys produced an undecryptable record and the peer reported a
+    // decrypt error instead of certificate_required.
+    let epoch;
+    if (context.state === 'connected') {
+      epoch = 2;
+    } else if (is13() && context.local_app_traffic_secret !== null && context.finished_sent) {
+      epoch = 2;
+    } else if (is13() && context.local_handshake_traffic_secret !== null) {
+      epoch = 1;
+    } else {
+      epoch = 0;
+    }
+
+
     ev.emit('message', epoch, 0, 'alert', alertData);
     ev.emit('alert', { level: level, description: description });
     if (level === 2) {
@@ -2787,8 +4166,17 @@ function TLSSession(options){
   }
 
   function close(){
-    if (context.state === 'closed') return;
-    // Send close_notify (warning level, description 0)
+    // 'error' counts as closed. RFC 8446 §6.2: after a fatal alert the
+    // connection is torn down immediately and NO further record may be sent.
+    // close_notify signals an ORDERLY shutdown, so emitting one after a failure
+    // both contradicts the alert we just sent and appends a record the peer is
+    // not expecting — it reads the fatal alert, then hits an extra record and
+    // reports a decrypt failure instead of the reason we actually gave it.
+    // Testing only for 'closed' missed exactly this case.
+    if (context.state === 'closed' || context.state === 'error') {
+      context.state = 'closed';
+      return;
+    }
     sendAlert(1, 0);
     context.state = 'closed';
   }
@@ -2810,44 +4198,69 @@ function TLSSession(options){
       // (RFC 9001), and strict 1.3-only stacks reject hellos with legacy
       // artifacts. Detected from the configured versions, so plain TLS over
       // TCP (which offers 1.3+1.2) keeps the full compatibility behavior.
-      let tls13Only = context.local_supported_versions.length > 0 &&
-                      context.local_supported_versions.every(v => v === 0x0304);
+      // Which versions does this profile actually offer? The suite list must
+      // follow BOTH answers, not just one of them.
+      //
+      // The old form asked only "is this 1.3-only?" and hardcoded the 1.3 half
+      // to true, so a 1.2-ONLY profile still advertised 0x1301..0x1303. Those
+      // suites cannot be negotiated at 1.2 — a TLS 1.3 suite is meaningless in
+      // a 1.2 handshake — so the hello claimed capabilities the profile had
+      // ruled out. The asymmetry was invisible because only the 1.3-only case
+      // had ever been considered.
+      let offers13 = context.local_supported_versions.length === 0 ||
+                     context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
+                     context.local_supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+      let offers12 = context.local_supported_versions.length === 0 ||
+                     context.local_supported_versions.some(v => v !== wire.TLS_VERSION.TLS1_3 &&
+                                                                v !== wire.DTLS_VERSION.DTLS1_3);
 
-      // Support both TLS 1.3 and 1.2 (server picks the best)
       if(context.local_supported_cipher_suites.length<=0){
-        context.local_supported_cipher_suites = tls13Only ? [
-          // TLS 1.3 only — no ECDHE 1.2 suites in a QUIC hello
-          0x1301, // TLS_AES_128_GCM_SHA256
-          0x1302, // TLS_AES_256_GCM_SHA384
-          0x1303, // TLS_CHACHA20_POLY1305_SHA256
-        ] : [
-          // TLS 1.3
-          0x1301, // TLS_AES_128_GCM_SHA256
-          0x1302, // TLS_AES_256_GCM_SHA384
-          0x1303, // TLS_CHACHA20_POLY1305_SHA256
-          // TLS 1.2 ECDHE
-          0xC02F, // ECDHE_RSA_WITH_AES_128_GCM_SHA256
-          0xC030, // ECDHE_RSA_WITH_AES_256_GCM_SHA384
-          0xC02B, // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-          0xCCA8, // ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        ];
+        // crypto.js owns the default suite list; we only say which halves apply.
+        context.local_supported_cipher_suites = default_cipher_suites(offers13, offers12);
       }
 
       if(context.local_supported_groups.length<=0){
-        context.local_supported_groups=[0x001d, 0x0017]; // X25519, P-256
+        context.local_supported_groups = ECDH_SUPPORTED_GROUPS.slice(); // whatever ecdh.js implements
       }
 
       if(context.local_supported_versions.length<=0){
         context.local_supported_versions=[0x0304, 0x0303]; // TLS 1.3, TLS 1.2
       }
 
-      // Generate X25519 keypair for key_share (TLS 1.3) and ECDHE (TLS 1.2)
-      const private_key = new Uint8Array(crypto.randomBytes(32));
-      let public_key  = x25519_get_public_key(private_key);
+      // Initial key_share: generate for our most-preferred group that we can
+      // actually PRODUCE a share for. If the server wants a different one it
+      // sends HelloRetryRequest, handled above.
+      //
+      // The list may name groups ecdh.js does not implement — a configured
+      // curve list is not a capability list, and a post-quantum group can sit
+      // in it because a caller passed it straight through. generate_keypair
+      // returns null for those (it does not throw), and this code used to read
+      // `.public_key` off that null and crash the whole session with a
+      // TypeError before a single byte was sent. Skip what we cannot make; if
+      // that leaves nothing, say so plainly rather than dying.
+      let initialGroup = null;
+      let initialKp = null;
+      for (let gi = 0; gi < context.local_supported_groups.length; gi++) {
+        let g = context.local_supported_groups[gi];
+        if (!is_supported_group(g)) continue;
+        let kp = ecdh_generate_keypair(g);
+        if (!kp) continue;
+        initialGroup = g;
+        initialKp = kp;
+        break;
+      }
 
-      context.local_key_groups[0x001d]={
-        public_key: public_key,
-        private_key: private_key
+      if (initialKp === null) {
+        fatalAlert(wire.TLS_ALERT.INTERNAL_ERROR,
+          'No configured key-exchange group is implemented — cannot build a key_share');
+        return;
+      }
+
+      let public_key = initialKp.public_key;
+
+      context.local_key_groups[initialGroup]={
+        public_key: initialKp.public_key,
+        private_key: initialKp.private_key
       };
 
       // Honor the configured signature algorithms; the hardcoded list is only
@@ -2857,14 +4270,7 @@ function TLSSession(options){
       let ch_sigalgs = (context.local_supported_signature_algorithms &&
                         context.local_supported_signature_algorithms.length > 0)
         ? context.local_supported_signature_algorithms
-        : [
-            // TLS 1.3 (PSS + ECDSA + EdDSA)
-            0x0804, 0x0805, 0x0806,
-            0x0403, 0x0503, 0x0603,
-            0x0807, 0x0808,
-            // TLS 1.2 (PKCS1)
-            0x0401, 0x0501, 0x0601
-          ];
+        : default_signature_schemes();   // signing.js owns the list
       context.local_supported_signature_algorithms = ch_sigalgs; // for CH2 reuse
 
       // supported_versions (43) and key_share (51) are the TLS 1.3
@@ -2879,59 +4285,13 @@ function TLSSession(options){
       // at least one deployed stack (webrtc-dtls ≤0.7 hard-errors on any
       // extension outside its known set, then poisons its replay window
       // so no retransmission can ever recover the handshake).
-      let offers13 = context.local_supported_versions.some(function (v) {
-        return v === wire.TLS_VERSION.TLS1_3 || v === wire.DTLS_VERSION.DTLS1_3;
+      // Same assembler as the post-HelloRetryRequest CH2 (RFC 8446 §4.1.2
+       // requires the two hellos to be identical apart from key_share/cookie).
+      let extensions = build_client_hello_extensions({
+        keyShareGroup: initialGroup,
+        keySharePublic: public_key,
+        cookie: null
       });
-      let extensions = [];
-      if (offers13) {
-        extensions.push({
-          type: 'SUPPORTED_VERSIONS',
-          value: context.local_supported_versions
-        });
-      }
-      extensions.push({
-        type: 'SUPPORTED_GROUPS',
-        value: context.local_supported_groups
-      });
-      if (offers13) {
-        extensions.push({
-          type: 'KEY_SHARE',
-          value: [{
-            group: 0x001d,
-            key_exchange: public_key
-          }]
-        });
-      }
-      extensions.push({
-        type: 'SIGNATURE_ALGORITHMS',
-        value: ch_sigalgs
-      });
-      if (!tls13Only) {
-        // TLS 1.2 compatibility — meaningless (and suspicious to strict
-        // stacks) in a 1.3-only/QUIC hello
-        extensions.push({ type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) });
-        extensions.push({ type: 'EXTENDED_MASTER_SECRET', value: null });
-      } else {
-        // psk_key_exchange_modes: every mainstream 1.3 client sends it, and a
-        // server MUST NOT send NewSessionTicket to a client that omitted it
-        // (RFC 8446 §4.2.9) — required for future 0-RTT/resumption anyway.
-        extensions.push({ type: 'PSK_KEY_EXCHANGE_MODES', value: [1] });
-      }
-
-      // Add SNI if servername was provided
-      if (context.local_sni) {
-        extensions.unshift({ type: 'SERVER_NAME', value: context.local_sni });
-      }
-
-      // Add ALPN if provided (e.g. 'h3' for QUIC)
-      if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
-        extensions.push({ type: 'ALPN', value: context.local_supported_alpns });
-      }
-
-      // Add custom extensions (e.g. QUIC transport params 0x39)
-      for (let i = 0; i < context.local_extensions.length; i++) {
-        extensions.push(context.local_extensions[i]);
-      }
 
       // Resumption: check if session was provided (opaque Buffer) — decode to structured data
       let sessionData = null;
@@ -2978,6 +4338,7 @@ function TLSSession(options){
           }
         };
         extensions.push(pskExt); // MUST be last
+        note_offered_extensions([pskExt]);
 
         // Build the full message with placeholder
         let build_message_params = {
@@ -3001,8 +4362,8 @@ function TLSSession(options){
         let truncatedMessage = tempMessage.slice(0, tempMessage.length - bindersSize);
 
         // Compute real binder
-        let binder_key = derive_binder_key(hashName, context.psk_offered.psk, false);
-        let binder = compute_psk_binder(hashName, binder_key, truncatedMessage);
+        let binder_key = derive_binder_key(hashName, context.psk_offered.psk, false, label_prefix());
+        let binder = compute_psk_binder(hashName, binder_key, truncatedMessage, label_prefix());
 
         dbg('CLI-PSK', 'ticket:', hexPreview(sessionData.ticket, 24),
             'cipher:', '0x' + sessionData.cipher.toString(16),
@@ -3029,8 +4390,18 @@ function TLSSession(options){
         // If we only have a session_id (no ticket), don't include empty SESSION_TICKET ext:
         // servers with SSL_OP_NO_TICKET can behave inconsistently when the extension appears
         // alongside a session_id resumption attempt — they may skip the session_id lookup.
+        // Fill in the ticket on the SESSION_TICKET entry the assembler already
+        // produced, rather than pushing a second one — two extensions of the
+        // same type is itself a protocol violation (RFC 8446 §4.2), and it
+        // would also change CH2's extension list relative to CH1. If the
+        // assembler did not emit one (1.3-only or DTLS profile), there is
+        // nothing to resume with here anyway.
         if (sessionData.ticket && sessionData.ticket.length > 0) {
-          extensions.push({ type: 'SESSION_TICKET', value: sessionData.ticket });
+          let stEntry = null;
+          for (let ei = 0; ei < extensions.length; ei++) {
+            if (extensions[ei] && extensions[ei].type === 'SESSION_TICKET') { stEntry = extensions[ei]; break; }
+          }
+          if (stEntry) stEntry.value = sessionData.ticket;
         }
 
         // If we have a session_id → put it in ClientHello.session_id (overrides the random one)
@@ -3060,13 +4431,6 @@ function TLSSession(options){
         // No resumption — advertise empty SessionTicket extension to offer support.
         // Skip for DTLS (DTLS clients/servers often don't implement RFC 5077 fully,
         // and adding it caused interop issues with openssl s_server -dtls1_2).
-        let isDtls = context.local_supported_versions && context.local_supported_versions.some(v => (v & 0xFF00) === 0xFE00);
-        if (!isDtls && !tls13Only && context.sessionTickets) {
-          // RFC 5077 SessionTicket is a TLS 1.2 mechanism; 1.3 resumption uses
-          // NewSessionTicket/PSK. Never advertise it in a 1.3-only/QUIC hello.
-          extensions.push({ type: 'SESSION_TICKET', value: new Uint8Array(0) });
-        }
-
         // Standard ClientHello
         let build_message_params = {
           type: 'client_hello',
@@ -3144,6 +4508,18 @@ function TLSSession(options){
       return context.selected_version;
     },
 
+    /**
+     * Current session state: 'new' | 'handshaking' | 'connected' | 'error' | 'closed'.
+     *
+     * Exposed so a transport can tell whether the session is still alive
+     * WITHOUT reaching into context. A transport that keeps feeding records to
+     * an aborted session decrypts them under keys the peer no longer uses and
+     * reports a misleading bad_record_mac, hiding the real failure.
+     */
+    getState: function(){
+      return context.state;
+    },
+
     /** Returns the negotiated cipher suite code (e.g. 0x1301, 0xC02F), or null. */
     getCipher: function(){
       return context.selected_cipher_suite;
@@ -3178,6 +4554,12 @@ function TLSSession(options){
         // TLS 1.3
         localAppSecret:   context.local_app_traffic_secret,
         remoteAppSecret:  context.remote_app_traffic_secret,
+        // Handshake-epoch secrets. The record layer needs these to encrypt an
+        // alert raised BEFORE anything has been written at epoch 1 — an abort
+        // during the peer's flight is exactly that case, and without them the
+        // alert could only go out in cleartext.
+        localHandshakeSecret:  context.local_handshake_traffic_secret,
+        remoteHandshakeSecret: context.remote_handshake_traffic_secret,
         // TLS 1.2
         masterSecret:     context.base_secret,
         localRandom:      context.local_random,
@@ -3218,6 +4600,14 @@ function TLSSession(options){
      * @param {Uint8Array|Buffer|null} [context_value]
      * @returns {Buffer|null}
      */
+    /**
+     * The negotiated DTLS-SRTP protection profile (RFC 5764), or null if none
+     * was agreed. Pair with exportKeyingMaterial(len, 'EXTRACTOR-dtls_srtp').
+     */
+    getSelectedSrtpProfile: function(){
+      return context.selected_srtp_profile;
+    },
+
     exportKeyingMaterial: function(length, label, context_value){
       if (!context.selected_cipher_suite || !length || !label) return null;
       var suite = TLS_CIPHER_SUITES[context.selected_cipher_suite];
@@ -3231,7 +4621,7 @@ function TLSSession(options){
         return Buffer.from(tls13_exporter(
           suite.hash, context.exporter_master_secret, label,
           (context_value != null) ? context_value : null, length
-        ));
+        , label_prefix()));
       }
 
       // TLS 1.2 — RFC 5705 over the master secret + hello randoms.
@@ -3335,11 +4725,11 @@ function TLSSession(options){
     /** Request a TLS 1.3 Key Update. requestPeer=true means ask the other side to update too. */
     requestKeyUpdate: function(requestPeer){
       if (context.state !== 'connected' || (context.selected_version !== wire.TLS_VERSION.TLS1_3 && context.selected_version !== wire.DTLS_VERSION.DTLS1_3)) return;
-      let hashName = TLS_CIPHER_SUITES[context.selected_cipher_suite].hash;
+      let hashName = negotiated_hash();
       let hashLen = getHashLen(hashName);
 
       // Derive new local traffic secret
-      let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen);
+      let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
       context.local_app_traffic_secret = newLocalSecret;
 
       // Send KeyUpdate message

@@ -281,6 +281,16 @@ function Server(options, connectionListener) {
       maxRecordSize: options.maxRecordSize,
       sessionTickets: options.sessionTickets,
       requestCert: options.requestCert,
+      // Client-authentication policy. These were missing, so a server's
+      // rejectUnauthorized/ca never reached TLSSession and it fell back to the
+      // session default (rejectUnauthorized: true). The effect was invisible
+      // until client auth was actually exercised: `requestCert: true` WITHOUT
+      // `rejectUnauthorized` is the standard "ask for a certificate but accept
+      // clients that have none" configuration, and it rejected them instead.
+      // requestCert was forwarded and its two companions were not, which is
+      // exactly the kind of half-wired option that looks correct at a glance.
+      rejectUnauthorized: options.rejectUnauthorized,
+      ca: options.ca,
       maxHandshakeSize: options.maxHandshakeSize,
       allowedCipherSuites: options.allowedCipherSuites,
       handshakeTimeout: options.handshakeTimeout,

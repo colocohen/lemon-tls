@@ -33,12 +33,12 @@ function getAeadAlgo(cipherSuite) {
 // ===================== TLS 1.3 primitives =====================
 
 /** Derive write key + IV from a TLS 1.3 traffic secret. */
-function deriveKeys(trafficSecret, cipherSuite) {
+function deriveKeys(trafficSecret, cipherSuite, labelPrefix) {
   const empty = new Uint8Array(0);
   let cs = TLS_CIPHER_SUITES[cipherSuite];
   return {
-    key: hkdf_expand_label(cs.hash, trafficSecret, 'key', empty, cs.keylen),
-    iv:  hkdf_expand_label(cs.hash, trafficSecret, 'iv',  empty, 12)
+    key: hkdf_expand_label(cs.hash, trafficSecret, 'key', empty, cs.keylen, labelPrefix),
+    iv:  hkdf_expand_label(cs.hash, trafficSecret, 'iv',  empty, 12, labelPrefix)
   };
 }
 
@@ -956,7 +956,9 @@ function decryptEncryptedDtls13(data, keys) {
   let seq = reconstructDtlsSeq(truncated, hdr.seqLen2 ? 16 : 8,
                                (keys.maxReadSeq === undefined ? -1 : keys.maxReadSeq));
 
-  // Rebuild AAD with plaintext RN
+  // Rebuild AAD with plaintext RN. AAD depends only on the wire bytes (the
+  // decrypted record number + length), NOT on the reconstructed full seq —
+  // so it's computed once and reused across seq candidates below.
   let hdrLen = 1 + rnLen + (hdr.hasLength ? 2 : 0);
   let aad = new Uint8Array(hdrLen);
   aad[0] = data[0];
@@ -966,7 +968,6 @@ function decryptEncryptedDtls13(data, keys) {
     aad[1 + rnLen + 1] = ctLen & 0xFF;
   }
 
-  let nonce = getNonce(keys.iv, seq);
   let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
   let isChaCha = algo === 'chacha20-poly1305';
 
@@ -974,20 +975,66 @@ function decryptEncryptedDtls13(data, keys) {
   let ct = ciphertext.subarray(0, ciphertext.length - 16);
   let tag = ciphertext.subarray(ciphertext.length - 16);
 
-  try {
-    let decipher = crypto.createDecipheriv(algo, keys.key, nonce,
-      isChaCha ? { authTagLength: 16 } : undefined);
-    decipher.setAAD(aad, isChaCha ? { plaintextLength: ct.length } : undefined);
-    decipher.setAuthTag(tag);
-    let pt = decipher.update(ct);
-    decipher.final();
+  // The wire carries only the low bits of the record seq. reconstructDtlsSeq
+  // returns the most-likely full value, but under large gaps or reordering
+  // the true seq can be one window away in either direction. Only the NONCE
+  // depends on the full seq (AAD does not), so try the neighbouring
+  // candidates on AEAD failure before giving up — this is what lets
+  // DTLS-Replay-TLS13 / -LargeGaps / -NonMonotonic deprotect instead of
+  // failing as "bad record MAC". Candidates are deduped and non-negative.
+  let window = hdr.seqLen2 ? 65536 : 256;
+  let candidates = [seq];
+  if (seq - window >= 0) candidates.push(seq - window);
+  candidates.push(seq + window);
 
+  let pt = null, acceptedSeq = -1;
+  for (let ci = 0; ci < candidates.length; ci++) {
+    let cand = candidates[ci];
+    let nonce = getNonce(keys.iv, cand);
+    try {
+      let decipher = crypto.createDecipheriv(algo, keys.key, nonce,
+        isChaCha ? { authTagLength: 16 } : undefined);
+      decipher.setAAD(aad, isChaCha ? { plaintextLength: ct.length } : undefined);
+      decipher.setAuthTag(tag);
+      let out = decipher.update(ct);
+      decipher.final();
+      pt = out; acceptedSeq = cand;
+      break;
+    } catch (e) {
+      // try next candidate
+    }
+  }
+
+  if (pt === null) return null;
+  seq = acceptedSeq;
+
+  {
     let inner = parseInnerPlaintext(new Uint8Array(pt));
 
-    // Advance the per-epoch high-water mark only after the tag verified, so a
-    // forged/replayed record number can't poison future reconstruction.
-    if (keys.maxReadSeq === undefined || seq > keys.maxReadSeq) {
+    // RFC 9147 §4.5.1 anti-replay: only AFTER the tag verifies do we consult
+    // and update the sliding window. Checking before deprotection would let a
+    // forged record number poison the window; checking after means only
+    // genuine records move it. The window lives on the per-epoch key object,
+    // next to maxReadSeq, because both are per-epoch receive state.
+    //   replayWindow: bitmask of the 64 seqs at or below maxReadSeq that have
+    //   been accepted. Bit 0 = maxReadSeq, bit k = maxReadSeq - k.
+    if (keys.maxReadSeq === undefined || keys.maxReadSeq < 0) {
+      // First accepted record in this epoch: seed the window with this seq as
+      // the high-water mark (bit 0 set), so an immediate replay of it is
+      // caught below rather than sailing through an unset window.
       keys.maxReadSeq = seq;
+      keys.replayWindow = 1n;
+    } else if (seq > keys.maxReadSeq) {
+      // Advance: shift the window up by the gap, then set bit 0.
+      let shift = BigInt(seq - keys.maxReadSeq);
+      keys.replayWindow = shift >= 64n ? 1n : ((keys.replayWindow << shift) | 1n) & ((1n << 64n) - 1n);
+      keys.maxReadSeq = seq;
+    } else {
+      let back = BigInt(keys.maxReadSeq - seq);
+      if (back >= 64n) return null;                // too old — outside window
+      let bit = 1n << back;
+      if (keys.replayWindow & bit) return null;     // already seen — replay
+      keys.replayWindow |= bit;
     }
 
     return {
@@ -997,8 +1044,6 @@ function decryptEncryptedDtls13(data, keys) {
       content: inner.content,
       total_length: off + ctLen,
     };
-  } catch (e) {
-    return null;
   }
 }
 
@@ -1024,15 +1069,36 @@ function parseDtlsDatagram(data, keysByEpoch) {
       let keys = keysByEpoch ? keysByEpoch[hdr.epoch] : null;
 
       if (!keys) {
-        // Can't decrypt — try to skip
+        // No keys for this epoch YET. Do not discard the record: a DTLS peer
+        // legitimately packs its whole flight into one datagram, so the very
+        // record that lets us derive these keys (the ServerHello) can sit
+        // ahead of records encrypted under them. Throwing the rest away meant
+        // the entire encrypted flight vanished and the handshake stalled until
+        // the peer retransmitted — or forever, if it does not.
+        //
+        // Keep the raw bytes and mark the record deferred; the caller retries
+        // it after processing each earlier record, once the keys exist. This
+        // generalises the CCS-only re-decrypt that DTLS 1.2 already had.
         let rnLen = hdr.seqLen2 ? 2 : 1;
         let skip = 1 + rnLen;
+        let total;
         if (hdr.hasLength && off + skip + 2 <= data.length) {
-          skip += 2 + readU16(data, off + skip);
+          total = skip + 2 + readU16(data, off + skip);
         } else {
-          skip = data.length - off;
+          total = data.length - off;
         }
-        off += skip;
+        if (total <= 0 || off + total > data.length) total = data.length - off;
+
+        records.push({
+          type: null,
+          epoch: hdr.epoch,
+          seq: null,
+          content: null,
+          encrypted: false,
+          deferred: true,
+          raw: data.subarray(off, off + total),
+        });
+        off += total;
         continue;
       }
 
@@ -1174,6 +1240,7 @@ export {
   // DTLS 1.3 unified header
   buildUnifiedHdr,
   parseUnifiedHdr,
+  reconstructDtlsSeq,
   maskRecordNumber,
 
   // DTLS 1.3 encrypted records

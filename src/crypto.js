@@ -303,8 +303,26 @@ function hkdf_expand(hashName, prkU8, infoU8, length) {
 // to handshakes (TextEncoder construction is not free in V8).
 const _TEXT_ENCODER = new TextEncoder();
 
-function build_hkdf_label(label, context, length) {
-  const full = _TEXT_ENCODER.encode('tls13 ' + label);
+// Label prefixes (RFC 8446 §7.1 / RFC 9147 §5.9). Exported so transports pick
+// one explicitly instead of spelling the string out at each derivation site.
+const LABEL_PREFIX_TLS13  = 'tls13 ';   // trailing space is part of the label
+const LABEL_PREFIX_DTLS13 = 'dtls13';   // no trailing space — deliberate
+
+/**
+ * RFC 8446 §7.1 HkdfLabel, with the protocol's label prefix.
+ *
+ * TLS 1.3 uses "tls13 " (trailing space). DTLS 1.3 uses "dtls13" with NO
+ * trailing space — RFC 9147 §5.9: "For DTLS 1.3, that label SHALL be
+ * 'dtls13'. This ensures key separation between DTLS 1.3 and TLS 1.3. Note
+ * that there is no trailing space; this is necessary in order to keep the
+ * overall label size inside of one hash iteration."
+ *
+ * The prefix is threaded as a parameter rather than read from module state
+ * because it is a property of ONE session's key schedule; two sessions of
+ * different protocols can be live in the same process.
+ */
+function build_hkdf_label(label, context, length, labelPrefix) {
+  const full = _TEXT_ENCODER.encode((labelPrefix || LABEL_PREFIX_TLS13) + label);
   const info = new Uint8Array(2 + 1 + full.length + 1 + context.length);
 
   info[0] = (length >>> 8) & 0xff;
@@ -319,8 +337,8 @@ function build_hkdf_label(label, context, length) {
   return info;
 }
 
-function hkdf_expand_label(hashName, secret, label, context, length) {
-  let info = build_hkdf_label(label, context, length | 0);
+function hkdf_expand_label(hashName, secret, label, context, length, labelPrefix) {
+  let info = build_hkdf_label(label, context, length | 0, labelPrefix);
   return hkdf_expand(hashName, secret, info, length | 0);
 }
 
@@ -329,7 +347,7 @@ function hkdf_expand_label(hashName, secret, label, context, length) {
 //  TLS 1.3: derive handshake traffic secrets
 // ============================================================
 
-function derive_handshake_traffic_secrets(hashName, shared_secret, transcript) {
+function derive_handshake_traffic_secrets(hashName, shared_secret, transcript, labelPrefix) {
   let hashFn  = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
@@ -337,11 +355,11 @@ function derive_handshake_traffic_secrets(hashName, shared_secret, transcript) {
 
   let early_secret = hkdf_extract(hashName, empty, zeros);
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen, labelPrefix);
   let handshake_secret = hkdf_extract(hashName, derived_secret, shared_secret);
   let transcript_hash = hashFn(transcript);
-  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen);
-  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen);
+  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen, labelPrefix);
+  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     handshake_secret: handshake_secret,
@@ -355,7 +373,7 @@ function derive_handshake_traffic_secrets(hashName, shared_secret, transcript) {
  * hash — skips the hashFn(transcript) step and its allocation. Use this when
  * the caller has already computed the hash via an incremental running hash.
  */
-function derive_handshake_traffic_secrets_with_hash(hashName, shared_secret, transcript_hash) {
+function derive_handshake_traffic_secrets_with_hash(hashName, shared_secret, transcript_hash, labelPrefix) {
   let hashFn  = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
@@ -363,10 +381,10 @@ function derive_handshake_traffic_secrets_with_hash(hashName, shared_secret, tra
 
   let early_secret = hkdf_extract(hashName, empty, zeros);
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen, labelPrefix);
   let handshake_secret = hkdf_extract(hashName, derived_secret, shared_secret);
-  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen);
-  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen);
+  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen, labelPrefix);
+  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     handshake_secret: handshake_secret,
@@ -380,18 +398,18 @@ function derive_handshake_traffic_secrets_with_hash(hashName, shared_secret, tra
 //  TLS 1.3: derive application traffic secrets
 // ============================================================
 
-function derive_app_traffic_secrets(hashName, handshake_secret, transcript) {
+function derive_app_traffic_secrets(hashName, handshake_secret, transcript, labelPrefix) {
   let hashFn  = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
   const zeros = new Uint8Array(hashLen);
 
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, handshake_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, handshake_secret, 'derived', h_empty, hashLen, labelPrefix);
   let master_secret = hkdf_extract(hashName, derived_secret, zeros);
   let transcript_hash = hashFn(transcript);
-  let client_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 'c ap traffic', transcript_hash, hashLen);
-  let server_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 's ap traffic', transcript_hash, hashLen);
+  let client_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 'c ap traffic', transcript_hash, hashLen, labelPrefix);
+  let server_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 's ap traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     client_app_traffic_secret: client_app_traffic_secret,
@@ -403,17 +421,17 @@ function derive_app_traffic_secrets(hashName, handshake_secret, transcript) {
 /**
  * Like derive_app_traffic_secrets but accepts a pre-computed transcript hash.
  */
-function derive_app_traffic_secrets_with_hash(hashName, handshake_secret, transcript_hash) {
+function derive_app_traffic_secrets_with_hash(hashName, handshake_secret, transcript_hash, labelPrefix) {
   let hashFn  = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
   const zeros = new Uint8Array(hashLen);
 
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, handshake_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, handshake_secret, 'derived', h_empty, hashLen, labelPrefix);
   let master_secret = hkdf_extract(hashName, derived_secret, zeros);
-  let client_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 'c ap traffic', transcript_hash, hashLen);
-  let server_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 's ap traffic', transcript_hash, hashLen);
+  let client_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 'c ap traffic', transcript_hash, hashLen, labelPrefix);
+  let server_app_traffic_secret = hkdf_expand_label(hashName, master_secret, 's ap traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     client_app_traffic_secret: client_app_traffic_secret,
@@ -431,28 +449,28 @@ function derive_app_traffic_secrets_with_hash(hashName, handshake_secret, transc
  * Derive the resumption_master_secret from the master_secret.
  * transcript = all handshake messages including both Finished.
  */
-function derive_resumption_master_secret(hashName, master_secret, transcript) {
+function derive_resumption_master_secret(hashName, master_secret, transcript, labelPrefix) {
   let hashFn = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   let transcript_hash = hashFn(transcript);
-  return hkdf_expand_label(hashName, master_secret, 'res master', transcript_hash, hashLen);
+  return hkdf_expand_label(hashName, master_secret, 'res master', transcript_hash, hashLen, labelPrefix);
 }
 
 /**
  * Like derive_resumption_master_secret but accepts a pre-computed transcript hash.
  */
-function derive_resumption_master_secret_with_hash(hashName, master_secret, transcript_hash) {
+function derive_resumption_master_secret_with_hash(hashName, master_secret, transcript_hash, labelPrefix) {
   let hashLen = getHashLen(hashName);
-  return hkdf_expand_label(hashName, master_secret, 'res master', transcript_hash, hashLen);
+  return hkdf_expand_label(hashName, master_secret, 'res master', transcript_hash, hashLen, labelPrefix);
 }
 
 /**
  * Derive PSK from a resumption_master_secret + ticket_nonce.
  * Used by the server when creating a ticket, and by the client when resuming.
  */
-function derive_psk(hashName, resumption_master_secret, ticket_nonce) {
+function derive_psk(hashName, resumption_master_secret, ticket_nonce, labelPrefix) {
   let hashLen = getHashFn(hashName).outputLen | 0;
-  return hkdf_expand_label(hashName, resumption_master_secret, 'resumption', ticket_nonce, hashLen);
+  return hkdf_expand_label(hashName, resumption_master_secret, 'resumption', ticket_nonce, hashLen, labelPrefix);
 }
 
 /**
@@ -460,7 +478,7 @@ function derive_psk(hashName, resumption_master_secret, ticket_nonce) {
  * For resumption PSK, label is "res binder".
  * For external PSK, label is "ext binder".
  */
-function derive_binder_key(hashName, psk, isExternal) {
+function derive_binder_key(hashName, psk, isExternal, labelPrefix) {
   let hashFn = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
@@ -469,7 +487,7 @@ function derive_binder_key(hashName, psk, isExternal) {
   let early_secret = hkdf_extract(hashName, empty, psk);
   let h_empty = hashFn(empty);
   let label = isExternal ? 'ext binder' : 'res binder';
-  return hkdf_expand_label(hashName, early_secret, label, h_empty, hashLen);
+  return hkdf_expand_label(hashName, early_secret, label, h_empty, hashLen, labelPrefix);
 }
 
 /**
@@ -484,11 +502,11 @@ function derive_binder_key(hashName, psk, isExternal) {
  * So we must derive a finished_key from binder_key (as in get_handshake_finished)
  * before the HMAC, NOT use binder_key directly.
  */
-function compute_psk_binder(hashName, binder_key, truncated_transcript) {
+function compute_psk_binder(hashName, binder_key, truncated_transcript, labelPrefix) {
   let hashFn = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
-  let finished_key = hkdf_expand_label(hashName, binder_key, 'finished', empty, hashLen);
+  let finished_key = hkdf_expand_label(hashName, binder_key, 'finished', empty, hashLen, labelPrefix);
   let transcript_hash = hashFn(truncated_transcript);
   return hmac(hashName, finished_key, transcript_hash);
 }
@@ -497,18 +515,18 @@ function compute_psk_binder(hashName, binder_key, truncated_transcript) {
  * Derive handshake secrets for a PSK-based handshake (with ECDHE).
  * Uses the PSK as input to early_secret instead of zeros.
  */
-function derive_handshake_traffic_secrets_psk(hashName, psk, shared_secret, transcript) {
+function derive_handshake_traffic_secrets_psk(hashName, psk, shared_secret, transcript, labelPrefix) {
   let hashFn = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
 
   let early_secret = hkdf_extract(hashName, empty, psk);
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen, labelPrefix);
   let handshake_secret = hkdf_extract(hashName, derived_secret, shared_secret);
   let transcript_hash = hashFn(transcript);
-  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen);
-  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen);
+  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen, labelPrefix);
+  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     handshake_secret: handshake_secret,
@@ -520,17 +538,17 @@ function derive_handshake_traffic_secrets_psk(hashName, psk, shared_secret, tran
 /**
  * Like derive_handshake_traffic_secrets_psk but accepts a pre-computed transcript hash.
  */
-function derive_handshake_traffic_secrets_psk_with_hash(hashName, psk, shared_secret, transcript_hash) {
+function derive_handshake_traffic_secrets_psk_with_hash(hashName, psk, shared_secret, transcript_hash, labelPrefix) {
   let hashFn = getHashFn(hashName);
   let hashLen = hashFn.outputLen | 0;
   const empty = new Uint8Array(0);
 
   let early_secret = hkdf_extract(hashName, empty, psk);
   let h_empty = hashFn(empty);
-  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen);
+  let derived_secret = hkdf_expand_label(hashName, early_secret, 'derived', h_empty, hashLen, labelPrefix);
   let handshake_secret = hkdf_extract(hashName, derived_secret, shared_secret);
-  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen);
-  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen);
+  let client_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 'c hs traffic', transcript_hash, hashLen, labelPrefix);
+  let server_handshake_traffic_secret = hkdf_expand_label(hashName, handshake_secret, 's hs traffic', transcript_hash, hashLen, labelPrefix);
 
   return {
     handshake_secret: handshake_secret,
@@ -648,10 +666,10 @@ function build_cert_verify_tbs_with_hash(hashName, isServer, transcript_hash) {
 //  TLS 1.3 Finished verify_data
 // ============================================================
 
-function get_handshake_finished(hashName, traffic_secret, transcript) {
+function get_handshake_finished(hashName, traffic_secret, transcript, labelPrefix) {
   let hashLen = getHashLen(hashName);
   const empty = new Uint8Array(0);
-  let finished_key = hkdf_expand_label(hashName, traffic_secret, 'finished', empty, hashLen);
+  let finished_key = hkdf_expand_label(hashName, traffic_secret, 'finished', empty, hashLen, labelPrefix);
   let transcript_hash = getHashFn(hashName)(transcript);
   return hmac(hashName, finished_key, transcript_hash);
 }
@@ -659,10 +677,10 @@ function get_handshake_finished(hashName, traffic_secret, transcript) {
 /**
  * Like get_handshake_finished but accepts a pre-computed transcript hash.
  */
-function get_handshake_finished_with_hash(hashName, traffic_secret, transcript_hash) {
+function get_handshake_finished_with_hash(hashName, traffic_secret, transcript_hash, labelPrefix) {
   let hashLen = getHashLen(hashName);
   const empty = new Uint8Array(0);
-  let finished_key = hkdf_expand_label(hashName, traffic_secret, 'finished', empty, hashLen);
+  let finished_key = hkdf_expand_label(hashName, traffic_secret, 'finished', empty, hashLen, labelPrefix);
   return hmac(hashName, finished_key, transcript_hash);
 }
 
@@ -686,9 +704,9 @@ function get_handshake_finished_with_hash(hashName, traffic_secret, transcript_h
  * Called at the same point (and with the same transcript hash) as the
  * application traffic secrets.
  */
-function derive_exporter_master_secret_with_hash(hashName, master_secret, transcript_hash) {
+function derive_exporter_master_secret_with_hash(hashName, master_secret, transcript_hash, labelPrefix) {
   let hashLen = getHashLen(hashName);
-  return hkdf_expand_label(hashName, master_secret, 'exp master', transcript_hash, hashLen);
+  return hkdf_expand_label(hashName, master_secret, 'exp master', transcript_hash, hashLen, labelPrefix);
 }
 
 /**
@@ -711,11 +729,11 @@ function derive_exporter_master_secret_with_hash(hashName, master_secret, transc
  * @param {number}      length
  * @returns {Uint8Array}
  */
-function tls13_exporter(hashName, exporter_master_secret, label, context_value, length) {
+function tls13_exporter(hashName, exporter_master_secret, label, context_value, length, labelPrefix) {
   let hashFn  = getHashFn(hashName);
   let hashLen = getHashLen(hashName);
   let h_empty = hashFn(new Uint8Array(0));
-  let derived = hkdf_expand_label(hashName, exporter_master_secret, label, h_empty, hashLen);
+  let derived = hkdf_expand_label(hashName, exporter_master_secret, label, h_empty, hashLen, labelPrefix);
   let h_ctx   = hashFn(context_value || new Uint8Array(0));
   return hkdf_expand(hashName, derived, build_hkdf_label('exporter', h_ctx, length), length);
 }
@@ -758,9 +776,9 @@ function tls12_exporter(hashName, master_secret, label, client_random, server_ra
   return tls12_prf(master_secret, label, seed, length, hashName);
 }
 
-function derive_sn_key(hashName, traffic_secret, cipher_suite) {
+function derive_sn_key(hashName, traffic_secret, cipher_suite, labelPrefix) {
   let keylen = TLS_CIPHER_SUITES[cipher_suite].keylen;
-  return hkdf_expand_label(hashName, traffic_secret, 'sn', new Uint8Array(0), keylen);
+  return hkdf_expand_label(hashName, traffic_secret, 'sn', new Uint8Array(0), keylen, labelPrefix);
 }
 
 
@@ -768,7 +786,87 @@ function derive_sn_key(hashName, traffic_secret, cipher_suite) {
 //  Exports — identical API surface
 // ============================================================
 
+/**
+ * Default cipher-suite offers, in preference order.
+ *
+ * SINGLE SOURCE OF TRUTH, alongside the TLS_CIPHER_SUITES table this module
+ * already owns — the same rule as ecdh.js/SUPPORTED_GROUPS and
+ * signing.js/default_signature_schemes. Previously TLSSocket, DTLSSession and
+ * the TLSSession client default each carried their own hardcoded list, and
+ * they had already drifted (one offered ChaCha20 for 1.2, another offered
+ * AES-256-ECDSA instead).
+ */
+const DEFAULT_CIPHER_SUITES_TLS13 = [
+  0x1301, // TLS_AES_128_GCM_SHA256
+  0x1302, // TLS_AES_256_GCM_SHA384
+  0x1303, // TLS_CHACHA20_POLY1305_SHA256
+];
+
+const DEFAULT_CIPHER_SUITES_TLS12 = [
+  0xC02F, // ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  0xC030, // ECDHE_RSA_WITH_AES_256_GCM_SHA384
+  0xC02B, // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+  0xC02C, // ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+  0xCCA8, // ECDHE_RSA_WITH_CHACHA20_POLY1305
+  0xCCA9, // ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+];
+
+/** Default offer list for a version range. */
+/**
+ * Can the record layer actually protect traffic with this cipher suite?
+ *
+ * TLS_CIPHER_SUITES describes suites the code can NAME — including CBC ones
+ * kept for parsing peer offers and for reporting — but record.js implements
+ * AEAD only. A suite that is merely described is not a capability: selecting
+ * one produces a handshake that agrees on parameters and then cannot encrypt a
+ * single record.
+ *
+ * This mirrors ecdh.js's is_supported_group, and exists for the same reason: a
+ * configured list is not an implementation. Selection asks this, never the
+ * table's mere presence.
+ */
+function is_usable_cipher_suite(id) {
+  let m = TLS_CIPHER_SUITES[id];
+  return !!(m && m.aead === true);
+}
+
+/**
+ * May this cipher suite be used with this negotiated version?
+ *
+ * RFC 8446 §B.4 defines 0x1301..0x1303 for TLS 1.3 ONLY; they are not valid
+ * TLS 1.2 suites and a 1.2 peer must ignore them. The converse holds too — an
+ * ECDHE_RSA_WITH_AES_128_GCM suite has no meaning in a 1.3 handshake, where
+ * key exchange and authentication are negotiated separately from the AEAD.
+ *
+ * The suite table already records which version each entry belongs to (`tls`:
+ * 12 or 13); this makes selection ask. Without it a server whose configured
+ * list happened to contain a 1.3 suite would select it while negotiating 1.2,
+ * producing a ServerHello no 1.2 client can act on.
+ */
+function suite_matches_version(id, negotiatedVersion) {
+  let m = TLS_CIPHER_SUITES[id];
+  if (!m) return false;
+  if (negotiatedVersion === null || negotiatedVersion === undefined) return true;
+  let is13 = negotiatedVersion === 0x0304 || negotiatedVersion === 0xFEFC;
+  return is13 ? (m.tls === 13) : (m.tls === 12);
+}
+
+function default_cipher_suites(includeTls13, includeTls12) {
+  let out = [];
+  if (includeTls13) out = out.concat(DEFAULT_CIPHER_SUITES_TLS13);
+  if (includeTls12) out = out.concat(DEFAULT_CIPHER_SUITES_TLS12);
+  return out;
+}
+
 export {
+  is_usable_cipher_suite,
+  suite_matches_version,
+  LABEL_PREFIX_TLS13,
+  LABEL_PREFIX_DTLS13,
+  DEFAULT_CIPHER_SUITES_TLS13,
+  DEFAULT_CIPHER_SUITES_TLS12,
+  default_cipher_suites,
+
   TLS_CIPHER_SUITES,
   getHashFn,
   getHashLen,

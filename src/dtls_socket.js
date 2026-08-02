@@ -52,6 +52,7 @@ function DTLSSocket(udpSocket, options) {
     mtu: options.mtu,
     ticketKeys: options.ticketKeys,
     useCookies: options.useCookies,
+    srtpProfiles: options.srtpProfiles,
   });
 
   // Wire session → UDP
@@ -136,6 +137,11 @@ function DTLSSocket(udpSocket, options) {
     return session.exportKeyingMaterial(length, label, context_value);
   };
 
+  /** Negotiated DTLS-SRTP protection profile (RFC 5764), or null. */
+  self.getSelectedSrtpProfile = function() {
+    return session.getSelectedSrtpProfile();
+  };
+
   /** Peer hello extensions / single extension by numeric type. */
   self.getRemoteExtensions = function() { return session.getRemoteExtensions(); };
   self.getRemoteExtension = function(type) { return session.getRemoteExtension(type); };
@@ -190,6 +196,7 @@ function createDTLSServer(options, connectionListener) {
           mtu: options.mtu,
           ticketKeys: options.ticketKeys,
           useCookies: options.useCookies,
+          srtpProfiles: options.srtpProfiles,
         });
 
         connections[key] = socket;

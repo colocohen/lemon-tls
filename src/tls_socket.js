@@ -3,8 +3,10 @@ import TLSSession from './tls_session.js';
 import crypto from 'node:crypto';
 import { Duplex } from 'node:stream';
 
-import { TLS_CIPHER_SUITES } from './crypto.js';
+import { TLS_CIPHER_SUITES, default_cipher_suites } from './crypto.js';
 import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT } from './wire.js';
+import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS } from './session/ecdh.js';
+import { default_signature_schemes } from './session/signing.js';
 import { decrypt_session_blob } from './session/ticket.js';
 
 import {
@@ -159,7 +161,23 @@ function TLSSocket(duplex, options){
     remote_ccs_seen: false,
     local_ccs_sent: false,
 
+    // Middlebox-compatibility CCS (TLS 1.3, RFC 8446 §D.4). This is a record-
+    // layer artifact — a single 0x01 byte sent as a plaintext CCS record so
+    // legacy middleboxes see a "cipher change" and let the flow through. It
+    // is NEVER a handshake message; TLSSession neither sends nor receives it.
+    // That is exactly why it lives here and not in the session: the QUIC
+    // consumer drives TLSSession directly, and RFC 9001 §8.4 forbids CCS in
+    // QUIC — keeping this in the TCP record layer means QUIC can never emit it.
+    tls13_compat_ccs_sent: false,
+
     tls12_read_seq: 0,
+
+    // Record-layer abuse limits. A peer that never advances the handshake but
+    // keeps us parsing is a denial of service even though every individual
+    // record is well formed, so the limit belongs at the record layer where
+    // the records are counted — not in any one message handler.
+    consecutive_empty_records: 0,
+    consecutive_ccs_records: 0,
 
     // Buffers and queues.
     //
@@ -183,6 +201,17 @@ function TLSSocket(duplex, options){
     readBuffer: Buffer.allocUnsafe(65536),
     readStart: 0,
     readEnd: 0,
+
+    // Handshake MESSAGE stream buffer (distinct from readBuffer, which is the
+    // record stream). RFC 8446 §5.1: handshake messages may be coalesced into
+    // one record or fragmented across records — record boundaries carry no
+    // meaning at the message layer. Record payloads are appended here and
+    // complete messages are carved out by their own 4-byte type+length
+    // header. Without this, a record carrying EE+Cert+CV+Finished (as
+    // OpenSSL/BoringSSL routinely pack) fed only its FIRST message to the
+    // session and silently dropped the rest.
+    hsBuf: null,
+
     appWriteQueue: [],
     pendingHandshake: [],
 
@@ -435,7 +464,7 @@ function TLSSocket(duplex, options){
                     // zero-copy view into the decrypted plaintext
                     self.push(out.subarray(0, j));
                 } else if (content_type === CT.HANDSHAKE) {
-                    session.message(out.subarray(0, j));
+                    feedHandshakeBytes(out.subarray(0, j));
                 } else if (content_type === CT.ALERT) {
                     // TODO: handle alert
                 }
@@ -444,7 +473,7 @@ function TLSSocket(duplex, options){
                 if (context.using_app_keys === true) {
                     self.push(out);
                 } else {
-                    session.message(out);
+                    feedHandshakeBytes(out);
                 }
             }
         }
@@ -505,6 +534,44 @@ function TLSSocket(duplex, options){
         context.readEnd = needed;
     }
 
+    /**
+     * Handshake message reassembly (RFC 8446 §5.1).
+     *
+     * Sits between the record layer and TLSSession: record payloads of type
+     * handshake go in; complete handshake messages come out, one
+     * session.message() call each. Handles both directions of mismatch —
+     * several messages coalesced into one record, and one message fragmented
+     * across records. TLSSession keeps receiving exactly what its contract
+     * says: one whole handshake message per call.
+     *
+     * Note on memory: session.message() stashes views of the fed bytes into
+     * its transcript, so every message handed over must be backed by memory
+     * we never overwrite. Buffer.from()/Buffer.concat() below always copy out
+     * of the (reused) record buffers; the carve-out subarrays then alias the
+     * fresh copy, which nothing mutates.
+     */
+    function feedHandshakeBytes(bytes){
+        if (context.hsBuf === null || context.hsBuf.length === 0) {
+            context.hsBuf = Buffer.from(bytes);
+        } else {
+            context.hsBuf = Buffer.concat([context.hsBuf, Buffer.from(bytes)]);
+        }
+
+        while (context.hsBuf.length >= 4) {
+            const len = (context.hsBuf[1] << 16) | (context.hsBuf[2] << 8) | context.hsBuf[3];
+            if (context.hsBuf.length < 4 + len) break; // partial message — wait for more records
+
+            const msg = context.hsBuf.subarray(0, 4 + len);
+            context.hsBuf = context.hsBuf.subarray(4 + len);
+
+            session.message(msg);
+
+            // A message may have fatally ended the session (alert sent,
+            // transport torn down). Don't keep feeding a corpse.
+            if (context.destroyed) return;
+        }
+    }
+
     function parseRecordsAndDispatch(){
         // Hot path — zero-copy parsing:
         //   - Work directly on readBuffer with moving readStart offset (no slicing)
@@ -517,6 +584,24 @@ function TLSSocket(duplex, options){
         const end = context.readEnd;
 
         while (end - off >= 5) {
+            // ── Stop feeding a session that has already failed ──
+            // Once the session aborts (fatalAlert -> state 'error') the
+            // handshake is over: we have sent our alert and are closing. Any
+            // record still in the buffer, or arriving after, belongs to a
+            // conversation that no longer exists — and in TLS 1.3 it is
+            // encrypted under keys the peer derived from a transcript we
+            // rejected, so decrypting it fails and surfaces as a spurious
+            // bad_record_mac that masks the real reason for the abort.
+            //
+            // This lives here, in the one loop every record passes through,
+            // rather than as a guard inside each handler: "the session is
+            // dead, stop processing" is a property of the transport, not of
+            // any particular record type.
+            if (context.destroyed || (session && session.getState &&
+                (session.getState() === 'error' || session.getState() === 'closed'))) {
+                return;
+            }
+
             const type = rb[off];
             // Version at rb[off+1..off+3] — currently unused (legacy 0x0303 always)
             const len  = (rb[off + 3] << 8) | rb[off + 4];
@@ -527,6 +612,48 @@ function TLSSocket(duplex, options){
             const header = rb.subarray(off, off + 5);
             const body = rb.subarray(off + 5, off + 5 + len);
             off += 5 + len;
+
+            // ── Record-layer sanity, applied to every record ──
+            // RFC 8446 §5.1: the legacy_record_version is 0x0303 for every
+            // record after the first ClientHello, and 0x03xx before it. A
+            // record claiming anything else is malformed framing, not a
+            // version negotiation signal.
+            const recVer = (rb[off - len - 5 + 1] << 8) | rb[off - len - 5 + 2];
+            if ((recVer >>> 8) !== 0x03) {
+                try { session.sendAlert(2, TLS_ALERT.PROTOCOL_VERSION); } catch (e) {}
+                self.emit('error', new Error('Record with illegal legacy_record_version 0x' + recVer.toString(16)));
+                markTransportDead();
+                if (context.transport && !context.transport.destroyed) context.transport.destroy();
+                return;
+            }
+
+            // A peer may legally send an empty record, and a TLS 1.3 peer may
+            // legally send a compat CCS — but only finitely many. Unbounded
+            // streams of either make no progress and exist only to burn our
+            // CPU (BoGo: TooManyEmptyFragments / TooManyChangeCipherSpec).
+            if (len === 0) {
+                if (++context.consecutive_empty_records > 32) {
+                    try { session.sendAlert(2, TLS_ALERT.UNEXPECTED_MESSAGE); } catch (e) {}
+                    self.emit('error', new Error('Too many consecutive empty records'));
+                    markTransportDead();
+                    if (context.transport && !context.transport.destroyed) context.transport.destroy();
+                    return;
+                }
+            } else {
+                context.consecutive_empty_records = 0;
+            }
+
+            if (type === CT.CHANGE_CIPHER_SPEC) {
+                if (++context.consecutive_ccs_records > 8) {
+                    try { session.sendAlert(2, TLS_ALERT.UNEXPECTED_MESSAGE); } catch (e) {}
+                    self.emit('error', new Error('Too many consecutive ChangeCipherSpec records'));
+                    markTransportDead();
+                    if (context.transport && !context.transport.destroyed) context.transport.destroy();
+                    return;
+                }
+            } else {
+                context.consecutive_ccs_records = 0;
+            }
 
             if (type === CT.APPLICATION_DATA) {
                 processCiphertext(body, header);
@@ -547,12 +674,35 @@ function TLSSocket(duplex, options){
                     // those stashed views would point to overwritten bytes — causing
                     // bad key derivations and GCM tag failures much later. We must hand
                     // the session an owned Buffer so its transcript survives.
-                    session.message(Buffer.from(body));
+                    feedHandshakeBytes(body);
                 }
                 context.tls12_read_seq++;
             } else if (type === CT.CHANGE_CIPHER_SPEC) {
-                context.tls12_read_seq = 0;
-                context.remote_ccs_seen = true;
+                // Version-dependent meaning:
+                //  - TLS 1.2: a real protocol event — the peer's next records
+                //    are encrypted. Flip remote_ccs_seen so type-22 records are
+                //    routed to the decrypt path.
+                //  - TLS 1.3: a middlebox-compat artifact (RFC 8446 §D.4)
+                //    carrying no meaning; cipher state is driven by the key
+                //    schedule. It MUST be ignored and MUST NOT advance any
+                //    read sequence.
+                //
+                // The test is "do we POSITIVELY know this is TLS 1.2", not
+                // "is it not 1.3", and that is the correct test on its own
+                // merits: a CCS carries no meaning unless we have actually
+                // negotiated 1.2, so an unknown version must not be treated as
+                // a cipher change. (It also used to be load-bearing for a
+                // second reason — the HelloRetryRequest path did not record
+                // selected_version, so mid-HRR the version was simply unknown.
+                // That gap is fixed at its source now, but the rule stands.)
+                const ccsVersion = (context.isTls13 !== undefined)
+                    ? (context.isTls13 ? 0x0304 : 0x0303)
+                    : session.getVersion();
+                if (ccsVersion === 0x0303) {
+                    context.tls12_read_seq = 0;
+                    context.remote_ccs_seen = true;
+                }
+                // TLS 1.3, or version not yet negotiated: swallow silently.
             } else if (type === CT.ALERT) {
                 // Alert: 2 bytes — level (1=warning, 2=fatal), description
                 if (body.length >= 2) {
@@ -584,14 +734,71 @@ function TLSSocket(duplex, options){
     }
 
 
+    /**
+     * The single truth for "may we still write to the wire".
+     * `writable` (not just destroyed/writableEnded) matters: after the peer
+     * resets the connection, Node flips writable to false before 'close'
+     * fires — a write() in that window is the EPIPE the session's reactive
+     * loop used to trigger while continuing the handshake against a dead
+     * transport.
+     */
+    function canWrite() {
+        const t = context.transport;
+        return !!t && !context.destroyed && !t.destroyed && !t.writableEnded && t.writable !== false;
+    }
+
+    /**
+     * Transport is gone → make BOTH layers inert:
+     *  - context.destroyed short-circuits every write path here, and
+     *  - session.close() flips TLSSession into a terminal state, which stops
+     *    the reactive loop from producing further handshake messages at the
+     *    source (its close_notify emission is dropped by canWrite()).
+     */
+    /**
+     * Emit the TLS 1.3 middlebox-compatibility ChangeCipherSpec (RFC 8446 §D.4).
+     *
+     * ONE implementation for all three points at which it can legally appear,
+     * because "send the compat record, exactly once" is a single rule. It was
+     * previously written out three times — client-before-CH2,
+     * server-after-SH/HRR, and client-before-its-first-encrypted-record — each
+     * repeating the guard, the write and the flag. Three copies of a
+     * send-once rule is three chances for them to disagree.
+     *
+     * The record is meaningless to the protocol: it exists so middleboxes that
+     * expect a TLS 1.2-shaped flow do not drop the connection. It is plaintext,
+     * a single 0x01 byte, never enters the transcript, and never advances a
+     * sequence number.
+     *
+     * WHERE it goes differs by role, and the two are on opposite sides of the
+     * hello:
+     *   server — immediately AFTER ServerHello / HelloRetryRequest
+     *   client — immediately BEFORE its second flight (CH2, or failing that
+     *            the first encrypted record)
+     * Callers state their position; this function owns the once-only rule.
+     *
+     * @returns {boolean} true if a record was actually written
+     */
+    function sendCompatCCS() {
+        if (context.tls13_compat_ccs_sent) return false;
+        context.tls13_compat_ccs_sent = true;
+        writeRecord(CT.CHANGE_CIPHER_SPEC, Buffer.from([0x01]));
+        return true;
+    }
+
+    function markTransportDead() {
+        if (context.destroyed) return;
+        context.destroyed = true;
+        try { session.close(); } catch (e) {}
+    }
+
     function bindTransport(){
         if (!context.transport) return;
         context.transport.on('data', function(chunk){
             _appendChunk(chunk);
             parseRecordsAndDispatch();
         });
-        context.transport.on('error', function(err){ self.emit('error', err); });
-        context.transport.on('close', function(){ self.emit('close'); });
+        context.transport.on('error', function(err){ markTransportDead(); self.emit('error', err); });
+        context.transport.on('close', function(){ markTransportDead(); self.emit('close'); });
     }
 
     session.on('message', function(epoch, seq, type, data){
@@ -613,15 +820,87 @@ function TLSSocket(duplex, options){
 
             if (isTls13) {
                 // TLS 1.3: wrap alert as APPLICATION_DATA (inner type is ALERT)
+                //
+                // The app write key may not have been materialised yet: it is
+                // derived lazily on first application write, and an abort can
+                // happen before any application data flows. Derive it here the
+                // same way the data path does, rather than silently falling
+                // back to a cleartext alert — a peer that has switched to
+                // application keys cannot read a cleartext record and reports a
+                // record-header error instead of the reason we sent. This is
+                // exactly what turned "certificate_required" into an opaque
+                // decrypt failure.
+                // Materialise the write key for THIS epoch if it does not exist
+                // yet. Both epochs derive lazily on first write, and an abort
+                // can precede any write at either level:
+                //
+                //   epoch 2 — abort after our Finished, before app data.
+                //   epoch 1 — abort while the PEER's flight is still arriving,
+                //             before we have written anything at all. A client
+                //             rejecting the server's Certificate/Finished is
+                //             exactly here, and it was NOT covered: the code
+                //             fell through to the cleartext path below and sent
+                //             `15 03 03` where the peer required `17 03 03`.
+                //             The peer then reports a decrypt failure instead
+                //             of the reason we gave it — the same symptom the
+                //             epoch-2 case used to have, one level down.
+                if (epoch === 2 && context.app_write_key === null) {
+                    const ts = session.getTrafficSecrets();
+                    if (ts && ts.localAppSecret) {
+                        const d = tls_derive_from_tls_secrets(ts.localAppSecret, ts.cipher);
+                        context.app_write_key = d.key;
+                        context.app_write_iv  = d.iv;
+                    }
+                } else if (epoch === 1 && !context.handshake_write_key) {
+                    const ts = session.getTrafficSecrets();
+                    if (ts && ts.localHandshakeSecret) {
+                        const d = tls_derive_from_tls_secrets(ts.localHandshakeSecret, ts.cipher);
+                        context.handshake_write_key = d.key;
+                        context.handshake_write_iv  = d.iv;
+                        if (context.handshake_write_seq === undefined ||
+                            context.handshake_write_seq === null) {
+                            context.handshake_write_seq = 0;
+                        }
+                    }
+                }
+
                 const writeKey = (epoch === 2) ? context.app_write_key : context.handshake_write_key;
                 const writeIv  = (epoch === 2) ? context.app_write_iv  : context.handshake_write_iv;
                 const writeSeq = (epoch === 2) ? context.app_write_seq : context.handshake_write_seq;
 
                 if (!writeKey) {
-                    // Keys not ready — fall back to plaintext (defensive)
-                    writeRecord(CT.ALERT, buf);
+                    // We are past epoch 0, so the peer is reading ciphertext.
+                    // A cleartext alert here is NOT defensive: the peer cannot
+                    // read it, reports a decrypt failure, and the reason we
+                    // were conveying is lost behind that. This exact fallback
+                    // turned three separate correct validations into "bad
+                    // record MAC" — in DTLS, at epoch 2, and at epoch 1.
+                    //
+                    // If we cannot protect the record, say so loudly and send
+                    // nothing: a missing alert and an unreadable alert look the
+                    // same to the peer, but only one is diagnosable from our
+                    // side. Mirrors the DTLS record layer, which likewise
+                    // refuses to emit an unprotectable record.
+                    self.emit('error', new Error(
+                        'TLS 1.3: cannot protect an alert at epoch ' + epoch +
+                        ' — no write key available; alert not sent'));
                     return;
                 }
+
+                // Middlebox-compatibility CCS (RFC 8446 §D.4) before our FIRST
+                // encrypted record — not merely before the first encrypted
+                // HANDSHAKE record.
+                //
+                // The handshake path already does this a few lines below, but
+                // the alert path returns before reaching it. When a client
+                // rejects something in the server's flight it never writes a
+                // handshake record at all, so its whole output was
+                // ClientHello + encrypted alert with no CCS in between, and a
+                // peer enforcing compatibility mode rejects the stream before
+                // it ever reads the alert. The abort path is still a flight and
+                // carries the same obligation. sendCompatCCS owns the
+                // once-only rule, so calling it here cannot double-send.
+                if (!session.isServer) sendCompatCCS();
 
                 const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
                 const enc = encrypt_tls_record(CT.ALERT, buf, writeKey, get_nonce(writeIv, writeSeq), algo);
@@ -634,7 +913,12 @@ function TLSSocket(duplex, options){
                 // TLS 1.2: post-CCS alerts are encrypted with app keys (AES-GCM).
                 // Outer record type remains ALERT (21), body is encrypted.
                 if (!context.app_write_key) {
-                    writeRecord(CT.ALERT, buf);
+                    // Same rule as the 1.3 path above: past CCS the peer reads
+                    // encrypted records, so a cleartext alert is unreadable
+                    // rather than best-effort.
+                    self.emit('error', new Error(
+                        'TLS 1.2: cannot protect an alert after CCS — no ' +
+                        'application write key; alert not sent'));
                     return;
                 }
 
@@ -654,12 +938,57 @@ function TLSSocket(duplex, options){
                 context.pendingHandshake.push({ type: CT.HANDSHAKE, data: buf });
                 return;
             }
+            // ── Middlebox-compat CCS (RFC 8446 §D.4) ──
+            // The two roles place it on OPPOSITE sides of their hello, and the
+            // spec is explicit about both:
+            //
+            //   server — "immediately AFTER its first handshake message",
+            //            i.e. after ServerHello or HelloRetryRequest.
+            //   client — "immediately BEFORE its second flight", i.e. BEFORE
+            //            the second ClientHello.
+            //
+            // Getting the client side backwards is not cosmetic: a peer that
+            // requires the compat record reads the next thing on the wire and
+            // finds a handshake record where the CCS should be, and reports
+            // exactly that ("invalid TLS 1.3 ChangeCipherSpec: 160303...").
+            // So the client's CCS is emitted BEFORE writeRecord below, and the
+            // server's after.
+            //
+            // We cannot rely on context.isTls13 yet (it is set at
+            // secureConnect), so both gate on the session's negotiated
+            // version. For the client that is only known once a
+            // HelloRetryRequest has told us — which is precisely the CH2 case
+            // this branch exists for. In the no-HRR flow the version is still
+            // unknown at CH1 time, so the flag stays false and the CCS goes out
+            // just before the first encrypted record instead (epoch-1 path
+            // below); that is the same "before its second flight" placement.
+            if (!session.isServer && type === 'hello' && session.getVersion() === 0x0304) {
+                sendCompatCCS();
+            }
+
             writeRecord(CT.HANDSHAKE, buf);
+
+            if (session.isServer &&
+                (type === 'hello' || type === 'hello_retry_request') &&
+                session.getVersion() === 0x0304) {
+                sendCompatCCS();
+            }
             return;
         }
 
         if (epoch === 1) {
             if (isTls13) {
+                // Middlebox-compat CCS (RFC 8446 §D.4): a TLS 1.3 client sends
+                // the fake CCS after its ClientHello (or, under HRR, after CH2)
+                // and before its first encrypted handshake record — i.e. right
+                // here, the moment we're about to emit the first epoch-1 record.
+                // Plaintext, one 0x01 byte. Server side handled after the SH.
+                // Fallback placement: reached only when the CH2 path above did
+                // not fire (no HelloRetryRequest, so the version was still
+                // unknown at ClientHello time). Same "before the second
+                // flight" position §D.4 describes.
+                if (!session.isServer) sendCompatCCS();
+
                 // TLS 1.3: encrypt handshake messages with handshake traffic secret
                 if (context.handshake_write_key === null) {
                     const hs = session.getHandshakeSecrets();
@@ -684,7 +1013,7 @@ function TLSSocket(duplex, options){
                         context.rec_version
                     );
                     context.handshake_write_seq++;
-                    if (context.transport && !context.transport.destroyed && !context.transport.writableEnded) {
+                    if (canWrite()) {
                         context.transport.write(rec);
                     }
                 } catch(e) {
@@ -714,7 +1043,7 @@ function TLSSocket(duplex, options){
                         context.app_write_seq, CT.HANDSHAKE, context.rec_version
                     );
                     context.app_write_seq++;
-                    if (context.transport && !context.transport.destroyed && !context.transport.writableEnded) {
+                    if (canWrite()) {
                         context.transport.write(rec);
                     }
                 } catch(e) {
@@ -744,7 +1073,7 @@ function TLSSocket(duplex, options){
                         context.rec_version
                     );
                     context.app_write_seq++;
-                    if (context.transport && !context.transport.destroyed && !context.transport.writableEnded) {
+                    if (canWrite()) {
                         context.transport.write(rec);
                     }
                 } catch(e) {
@@ -772,35 +1101,17 @@ function TLSSocket(duplex, options){
         if (versions.length === 0) versions.push(0x0303); // fallback
 
         // Cipher suites based on supported versions
-        let ciphers = [];
-        if (versions.includes(0x0304)) {
-            ciphers.push(0x1301, 0x1302, 0x1303); // TLS_AES_128_GCM, TLS_AES_256_GCM, TLS_CHACHA20
-        }
-        if (versions.includes(0x0303)) {
-            ciphers.push(
-                0xC02F, // ECDHE_RSA_WITH_AES_128_GCM_SHA256
-                0xC030, // ECDHE_RSA_WITH_AES_256_GCM_SHA384
-                0xC02B, // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-                0xCCA8  // ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-            );
-        }
+        // crypto.js owns the default suite list (see default_cipher_suites).
+        let ciphers = default_cipher_suites(versions.includes(0x0304), versions.includes(0x0303));
 
         // Signature algorithms: override or default
-        let sigalgs = [];
-        if (options.signatureAlgorithms) {
-            sigalgs = options.signatureAlgorithms;
-        } else {
-            if (versions.includes(0x0304)) {
-                sigalgs.push(0x0804, 0x0805, 0x0806); // RSA-PSS
-                sigalgs.push(0x0403, 0x0503, 0x0603); // ECDSA
-            }
-            if (versions.includes(0x0303)) {
-                sigalgs.push(0x0401, 0x0501, 0x0601); // RSA-PKCS1
-            }
-        }
+        // signing.js owns the scheme list (see default_signature_schemes):
+        // the PKCS#1 set is only added when TLS 1.2 is actually in range.
+        let sigalgs = options.signatureAlgorithms
+            || default_signature_schemes();
 
         // Groups: override or default
-        let groups = options.groups || [0x001d, 0x0017]; // X25519, P-256
+        let groups = options.groups || ECDH_SUPPORTED_GROUPS.slice(); // whatever ecdh.js implements
 
         // prioritizeChaCha: move ChaCha20 to front of cipher list
         if (options.prioritizeChaCha) {
@@ -833,6 +1144,19 @@ function TLSSocket(duplex, options){
     });
 
     session.on('secureConnect', function(){
+        // RFC 8446 §5.1: handshake messages must not straddle a key change,
+        // and the flight ending in Finished must end EXACTLY there. Leftover
+        // bytes in the message stream at completion are trailing garbage the
+        // peer packed after its Finished — a framing violation, not padding.
+        if (context.hsBuf !== null && context.hsBuf.length > 0) {
+            context.hsBuf = null;
+            markTransportDead();
+            self.emit('error', new Error('Trailing data after handshake completion (decode_error)'));
+            const t = context.transport;
+            if (t && typeof t.destroy === 'function' && !t.destroyed) t.destroy();
+            return;
+        }
+
         context.using_app_keys=true;
         context.secureEstablished=true;
         context.aeadAlgo = getAeadAlgo(session.getCipher());
@@ -902,6 +1226,21 @@ function TLSSocket(duplex, options){
     session.on('session', function(ticketData) {
         _lastSessionBuffer = Buffer.isBuffer(ticketData) ? ticketData : Buffer.from(ticketData);
         self.emit('session', ticketData);
+    });
+
+    // Bridge fatal protocol errors from the session (malformed peer message,
+    // invalid key share, Finished mismatch, ...). The session has already
+    // emitted the fatal alert as an epoch-tagged 'message' — which the handler
+    // above framed and wrote — and flipped itself to a terminal state. Here we
+    // surface it to the owner and tear down the transport. Without this bridge
+    // the session's 'error' emit has no listener, and Node throws it as an
+    // uncaught exception out of the transport's data callback — the very DoS
+    // the validation was added to prevent.
+    session.on('error', function(err) {
+        markTransportDead();
+        self.emit('error', err);
+        const t = context.transport;
+        if (t && typeof t.destroy === 'function' && !t.destroyed) t.destroy();
     });
 
     // Forward handshakeMessage event (for debugging/inspection)

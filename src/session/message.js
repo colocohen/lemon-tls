@@ -193,6 +193,10 @@ function parse_tls_message(data, negotiatedVersion) {
     out.type = 'certificate';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE_VERIFY) {
+    // Decode scheme + signature so the session can actually VERIFY it.
+    // Previously only the raw body was handed up and no caller ever checked
+    // the signature — every peer signature was accepted unconditionally.
+    out = wire.parse_certificate_verify(message.body);
     out.type = 'certificate_verify';
     out.body = message.body;
 
@@ -218,6 +222,37 @@ function parse_tls_message(data, negotiatedVersion) {
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE_REQUEST) {
     out = wire.parse_certificate_request(message.body);
     out.type = 'certificate_request';
+
+    // Surface the requested signature algorithms as a plain field.
+    //
+    // In TLS 1.3 they arrive inside the extensions vector (RFC 8446 §4.3.2);
+    // in TLS 1.2 the decoder already returns them as `signature_algorithms`
+    // (RFC 5246 §7.4.4). The session asks for one name, so normalise here —
+    // exactly what normalize_hello does for the hello messages. Without this
+    // the 1.3 list was silently undefined and the client fell back to signing
+    // with its OWN preference, ignoring what the server actually asked for;
+    // a server that requested a specific algorithm then rejects the signature
+    // as an unsupported one.
+    if (out.signature_algorithms === undefined && Array.isArray(out.extensions)) {
+      for (let i = 0; i < out.extensions.length; i++) {
+        let e = out.extensions[i];
+        if (e && e.type === wire.TLS_EXT.SIGNATURE_ALGORITHMS && Array.isArray(e.value)) {
+          out.signature_algorithms = e.value;
+          break;
+        }
+      }
+    }
+
+  } else {
+    // No silent fall-through. Returning a typeless object here made every
+    // unrecognized handshake type vanish: the session's dispatch chain matched
+    // nothing and simply returned, so a peer could stream unknown (or
+    // version-illegal, e.g. HelloRequest in TLS 1.3) messages indefinitely with
+    // no alert and no state change. Name the message instead and let the
+    // session decide — which it can only do if it is told.
+    out.type = 'unknown_handshake';
+    out.handshake_type = message.type;
+    out.body = message.body;
   }
 
   return out;

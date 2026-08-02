@@ -49,6 +49,7 @@ const TLS_ALERT = {
   MISSING_EXTENSION: 109,
   UNSUPPORTED_EXTENSION: 110,
   UNRECOGNIZED_NAME: 112,
+  CERTIFICATE_REQUIRED: 116,
   NO_APPLICATION_PROTOCOL: 120
 };
 
@@ -151,21 +152,39 @@ function w_bytes(buf, off, b) {
 }
 
 /* ============================ Binary read helpers ============================ */
+
+/**
+ * Parse error carrying the TLS alert description to send.
+ * The session layer catches these at its single parse entry point and
+ * converts them into a fatal alert (default: decode_error, RFC 8446 §6.2).
+ * Keeping the alert code ON the error keeps wire.js policy-free — it only
+ * states WHAT is malformed; the session decides to abort.
+ */
+function parseError(msg, alertDesc) {
+  let e = new Error(msg);
+  e.alertDesc = (alertDesc === undefined) ? TLS_ALERT.DECODE_ERROR : alertDesc;
+  return e;
+}
+
 function r_u8(buf, off) {
+  if (off + 1 > buf.length) throw parseError('truncated u8 at ' + off);
   return [buf[off++] >>> 0, off];
 }
 
 function r_u16(buf, off) {
+  if (off + 2 > buf.length) throw parseError('truncated u16 at ' + off);
   let v = ((buf[off] << 8) | buf[off + 1]) >>> 0;
   return [v, off + 2];
 }
 
 function r_u24(buf, off) {
+  if (off + 3 > buf.length) throw parseError('truncated u24 at ' + off);
   let v = ((buf[off] << 16) | (buf[off + 1] << 8) | buf[off + 2]) >>> 0;
   return [v, off + 3];
 }
 
 function r_bytes(buf, off, n) {
+  if (off + n > buf.length) throw parseError('truncated field: need ' + n + ' bytes at ' + off + ', have ' + (buf.length - off));
   let slice;
   if (buf instanceof Uint8Array) {
     // real slice from Uint8Array
@@ -244,10 +263,94 @@ exts.COOKIE = { encode: null, decode: null };
 exts.RENEGOTIATION_INFO = { encode: null, decode: null };
 exts.SESSION_TICKET = { encode: null, decode: null };
 exts.EXTENDED_MASTER_SECRET = { encode: null, decode: null };
+exts.CERTIFICATE_AUTHORITIES = { encode: null, decode: null };
+
+/* ---------------------- CERTIFICATE_AUTHORITIES (47) ---------------------- */
+// RFC 8446 §4.2.4: DistinguishedName authorities<3..2^16-1> — the list is
+// declared non-empty by the grammar itself, so an empty list is a peer
+// encoding bug and must be rejected as decode_error (BoGo:
+// RejectEmptyCertificateAuthorities).
+exts.CERTIFICATE_AUTHORITIES.decode = function (data) {
+  let off = 0;
+  let list;
+  [list, off] = readVec(data, off, 2);
+  if (off !== data.length) throw parseError('trailing data after certificate_authorities');
+  if (list.length === 0) throw parseError('empty certificate_authorities list');
+
+  let out = [];
+  let o2 = 0;
+  while (o2 < list.length) {
+    let dn;
+    [dn, o2] = readVec(list, o2, 2);
+    if (dn.length === 0) throw parseError('empty DistinguishedName in certificate_authorities');
+    out.push(dn);
+  }
+  return out;
+};
+
+/* ------------------------------ USE_SRTP (14) ------------------------------ */
+/*
+ * RFC 5764 §4.1.1:
+ *   struct {
+ *     SRTPProtectionProfiles SRTPProtectionProfiles;   // uint16 list, vector<2>
+ *     opaque srtp_mki<0..255>;
+ *   } UseSRTPData;
+ *
+ * The ClientHello carries every profile it accepts; the ServerHello (TLS 1.2)
+ * or EncryptedExtensions (TLS 1.3) carries exactly one. The MKI is opaque to
+ * the handshake and is simply carried through.
+ */
+exts.USE_SRTP = { encode: null, decode: null };
+
+exts.USE_SRTP.encode = function (value) {
+  let profiles = (value && value.profiles) ? value.profiles : [];
+  let mki = toU8((value && value.mki) ? value.mki : new Uint8Array(0));
+  if (mki.length > 255) throw parseError('use_srtp MKI longer than 255 bytes');
+
+  let out = new Uint8Array(2 + profiles.length * 2 + 1 + mki.length);
+  let off = 0;
+  off = w_u16(out, off, profiles.length * 2);
+  for (let i = 0; i < profiles.length; i++) off = w_u16(out, off, profiles[i] & 0xFFFF);
+  off = w_u8(out, off, mki.length);
+  w_bytes(out, off, mki);
+  return out;
+};
+
+exts.USE_SRTP.decode = function (data) {
+  let off = 0;
+  let listLen;
+  [listLen, off] = r_u16(data, off);
+  // The list is a vector of uint16, so an odd length is malformed.
+  if (listLen % 2 !== 0) throw parseError('use_srtp profile list has odd length');
+  if (off + listLen > data.length) throw parseError('use_srtp profile list overruns the extension');
+
+  let profiles = [];
+  let end = off + listLen;
+  while (off < end) {
+    let p;
+    [p, off] = r_u16(data, off);
+    profiles.push(p);
+  }
+
+  let mkiLen;
+  [mkiLen, off] = r_u8(data, off);
+  if (off + mkiLen > data.length) throw parseError('use_srtp MKI overruns the extension');
+  let mki;
+  [mki, off] = r_bytes(data, off, mkiLen);
+
+  return { profiles: profiles, mki: mki };
+};
 
 /* ------------------------------ SERVER_NAME (0) ------------------------------ */
 exts.SERVER_NAME.encode = function (value) {
-  let host = toU8(value || "");
+  // Server-side acknowledgement: a zero-length body, no ServerNameList.
+  // Mirrors the decoder's asymmetry (RFC 6066 §3 / RFC 8446 §4.4.2) so the
+  // extension can round-trip in both directions through one implementation.
+  if (value === null || value === undefined || value === "") {
+    return new Uint8Array(0);
+  }
+
+  let host = toU8(value);
 
   // one name: type(1)=0, len(2), bytes
   const inner = new Uint8Array(1 + 2 + host.length);
@@ -262,6 +365,20 @@ exts.SERVER_NAME.encode = function (value) {
 };
 
 exts.SERVER_NAME.decode = function (data) {
+  // The extension is ASYMMETRIC (RFC 6066 §3, RFC 8446 §4.4.2):
+  //
+  //   client → server : a full ServerNameList (host_name entries)
+  //   server → client : a COMPLETELY EMPTY extension — zero-length body — sent
+  //                     in EncryptedExtensions purely to acknowledge that the
+  //                     name was understood. There is no ServerNameList in
+  //                     this direction at all.
+  //
+  // Decoding both directions with one reader meant the acknowledgement was
+  // parsed as a truncated list ("truncated u16 at 0") and a perfectly legal
+  // handshake was rejected. An empty body is not a malformed list; it is the
+  // other half of the grammar.
+  if (!data || data.length === 0) return null;
+
   let off = 0;
   let list;
   [list, off] = readVec(data, off, 2);
@@ -363,7 +480,15 @@ exts.SUPPORTED_GROUPS.decode = function (data) {
 
 /* -------------------------- SIGNATURE_ALGORITHMS (13) -------------------------- */
 exts.SIGNATURE_ALGORITHMS.encode = function (value) {
-  let algs = Array.isArray(value) && value.length>0 ? value : [0x0403, 0x0804, 0x0401];
+  // A codec encodes what it is handed; the set of signature schemes is policy
+  // and belongs to signing.js (default_signature_schemes), not here. The old
+  // hardcoded fallback silently replaced a caller's real list whenever the
+  // value arrived empty — the same class of bug as the cipher_suites fallback
+  // that was removed from build_hello. Fail loudly instead.
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('SIGNATURE_ALGORITHMS.encode requires a non-empty scheme list');
+  }
+  let algs = value;
 
   const body = new Uint8Array(2 + algs.length * 2);
   let off = 0;
@@ -628,11 +753,21 @@ exts.ALPN.decode = function (data) {
   [n, off] = r_u16(data, off);
 
   let end = off + n;
+  if (end > data.length) throw parseError('ALPN list length exceeds extension body');
+  if (end < data.length) throw parseError('trailing data after ALPN protocol list');
+
   let out = [];
 
   while (off < end) {
     let l;
     [l, off] = r_u8(data, off);
+
+    // RFC 7301 §3.1 declares ProtocolName<1..2^8-1>: the vector's lower bound
+    // is 1, so a zero-length name is a grammar violation rather than an empty
+    // string. Accepting it produced a phantom "" protocol that could then be
+    // negotiated, and left the list length inconsistent with its contents.
+    if (l === 0) throw parseError('ALPN protocol name of zero length');
+    if (off + l > end) throw parseError('ALPN protocol name overruns the list');
 
     let v;
     [v, off] = r_bytes(data, off, l);
@@ -752,23 +887,53 @@ function build_extensions(list) {
   return out;
 }
 
-function parse_extensions(buf) {
+/**
+ * Parse a bare extension LIST — the caller has already consumed the 2-byte
+ * vector length and hands us exactly the list bytes.
+ *
+ * Two conventions exist in this file and mixing them is a real bug source:
+ *   - Structures where the extensions vector ENDS the enclosing message
+ *     (hello, EncryptedExtensions, NewSessionTicket) pass the buffer WITH the
+ *     length prefix → use parse_extensions().
+ *   - Structures where the vector is an inner field followed by more data, or
+ *     where the caller already read the prefix (Certificate entries,
+ *     CertificateRequest) → use parse_extension_list().
+ * Both share this core so the duplicate/overflow rules apply identically.
+ */
+function parse_extension_list(buf) {
   let off = 0;
-  let n;
-  [n, off] = r_u16(buf, off);
-
-  let end = off + n;
   let out = [];
+  let seen = {};   // RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type"
 
-  while (off < end) {
+  while (off < buf.length) {
     let t;
     [t, off] = r_u16(buf, off);
 
     let l;
     [l, off] = r_u16(buf, off);
+    if (off + l > buf.length) throw parseError('extension body overflows extension list');
 
     let d;
     [d, off] = r_bytes(buf, off, l);
+
+    if (seen[t] === true) {
+      // decode_error (50), NOT illegal_parameter (47).
+      //
+      // RFC 8446 §4.2 says "There MUST NOT be more than one extension of the
+      // same type ... Receivers MUST check for this and abort with an
+      // 'illegal_parameter' alert", so 47 is a defensible reading and this
+      // code used to send it. BoringSSL — and therefore BoGo, and therefore
+      // most of the ecosystem that tests against it — treats a repeated
+      // extension as a malformed extensions VECTOR rather than a bad parameter
+      // value, and sends decode_error. Interoperating with deployed peers wins
+      // over the letter of the sentence here.
+      //
+      // Left as an explicit note because the RFC text genuinely reads the other
+      // way: without this comment the next person to check §4.2 will "fix" it
+      // back and silently break the same seven tests again.
+      throw parseError('duplicate extension type ' + t, TLS_ALERT.DECODE_ERROR);
+    }
+    seen[t] = true;
 
     let name = ext_name_by_code(t);
     let dec = exts[name] && exts[name].decode;
@@ -778,6 +943,25 @@ function parse_extensions(buf) {
   }
 
   return out;
+}
+
+/**
+ * Parse a length-prefixed extensions vector that ENDS the enclosing structure.
+ * `buf` must START with the 2-byte vector length and contain nothing after it.
+ */
+function parse_extensions(buf) {
+  let off = 0;
+  let n;
+  [n, off] = r_u16(buf, off);
+
+  let end = off + n;
+  // The declared vector length must fit the buffer, and the buffer must not
+  // carry trailing bytes past the vector — either way it's a framing error
+  // in the peer's encoder (decode_error, RFC 8446 §6.2).
+  if (end > buf.length) throw parseError('extensions vector length exceeds body');
+  if (end < buf.length) throw parseError('trailing data after extensions vector');
+
+  return parse_extension_list(buf.subarray(off, end));
 }
 
 
@@ -796,7 +980,15 @@ function build_hello(params) {
   let extsBuf = build_extensions(params.extensions || []);
 
   if (kind === 'client') {
-    let cs = params.cipher_suites || [0x1301, 0x1302, 0x1303, 0xC02F, 0xC02B];
+    // A codec encodes what it is handed; it must not invent policy. This
+    // used to fall back to a hardcoded suite list, which silently replaced the
+    // caller's configuration whenever the field name didn't line up — the
+    // exact failure the `cipher_suites` plural fix elsewhere was chasing. Fail
+    // loudly instead, so a wiring mistake surfaces at the call site.
+    let cs = params.cipher_suites;
+    if (!Array.isArray(cs) || cs.length === 0) {
+      throw new Error('build_hello: ClientHello requires a non-empty cipher_suites array');
+    }
 
     const csBlock = new Uint8Array(2 + cs.length * 2);
     let o = 0;
@@ -1037,7 +1229,10 @@ function parse_certificate(body) {
           let extLen;  [extLen,  off] = r_u16(body, off);   // extensions vec<2>
           let extRaw;  [extRaw,  off] = r_bytes(body, off, extLen);
 
-          const extensions = extLen ? parse_extensions(extRaw) : [];
+          // extRaw is the list body (prefix already consumed above), so use
+          // the list parser — parse_extensions() would misread the first two
+          // bytes of the first extension as a vector length.
+          const extensions = parse_extension_list(extRaw);
           entries.push({ cert, extensions });
         }
 
@@ -1105,6 +1300,10 @@ function parse_certificate_verify(body) {
   let sig;
   [sig, off] = r_bytes(body, off, slen);
 
+  // The signature vector ends the message; anything after it is framing junk.
+  if (off !== body.length) throw parseError('trailing data after CertificateVerify signature');
+  if (slen === 0) throw parseError('empty CertificateVerify signature');
+
   return { scheme: alg, signature: sig };
 }
 
@@ -1165,6 +1364,12 @@ function parse_new_session_ticket(body) {
   let ticket;
   [ticket, off] = r_bytes(body, off, tlen);
 
+  // RFC 8446 §4.6.1 declares ticket<1..2^16-1>: the vector's lower bound is 1,
+  // so a zero-length ticket is a grammar violation, not an empty-but-valid
+  // value. Enforced here in the codec because it is a property of the wire
+  // format; what a session then DOES with a ticket is policy and lives above.
+  if (tlen === 0) throw parseError('NewSessionTicket carries an empty ticket');
+
   let extBuf = body.subarray(off);
   let extensions = extBuf.length ? parse_extensions(extBuf) : [];
 
@@ -1197,9 +1402,44 @@ function build_certificate_request(params) {
 
   if (v === TLS_VERSION.TLS1_3) {
     let ctx = toU8((params && params.request_context) || new Uint8Array(0));
-    let extsBuf = Array.isArray(params && params.extensions)
-      ? build_extensions(params.extensions)
-      : (params && params.extensions) || veclen(2, new Uint8Array(0));
+
+    // RFC 8446 §4.3.2: "The 'signature_algorithms' extension MUST be specified"
+    // in a TLS 1.3 CertificateRequest.
+    //
+    // Extension assembly belongs here, next to build_hello's, so callers pass
+    // SEMANTICS (which algorithms) rather than pre-encoded extension records.
+    // Previously only a pre-built `extensions` array was honoured while the
+    // session passed `signature_algorithms` as a flat field — silently
+    // dropped, producing a CertificateRequest with an empty extensions vector
+    // that strict peers reject outright ("missing sigalgs extension").
+    let extsBuf;
+    if (params && params.extensions && !Array.isArray(params.extensions)) {
+      // Pre-encoded extensions vector supplied verbatim.
+      extsBuf = params.extensions;
+    } else {
+      let extList = Array.isArray(params && params.extensions)
+        ? params.extensions.slice()
+        : [];
+
+      let hasSigAlgs = false;
+      for (let i = 0; i < extList.length; i++) {
+        let t = extList[i] && extList[i].type;
+        if (t === 'SIGNATURE_ALGORITHMS' || t === TLS_EXT.SIGNATURE_ALGORITHMS) { hasSigAlgs = true; break; }
+      }
+
+      if (!hasSigAlgs) {
+        let sa = (params && params.signature_algorithms) || [];
+        if (sa.length === 0) {
+          throw new Error('build_certificate_request: TLS 1.3 requires a non-empty signature_algorithms list');
+        }
+        extList.unshift({ type: 'SIGNATURE_ALGORITHMS', value: sa });
+      }
+
+      // certificate_authorities is OPTIONAL and its DistinguishedName list is
+      // non-empty by grammar — an empty list means "no constraint", which is
+      // expressed by omitting the extension, not by sending an empty one.
+      extsBuf = build_extensions(extList);
+    }
 
     let ctxVec = veclen(1, ctx);
     return concatUint8Arrays([ctxVec, extsBuf]);
@@ -1240,10 +1480,27 @@ function parse_certificate_request(body) {
       if (1 + ctxLen + 2 + extLen === body.length) {
         let ctx = body.subarray(1, 1 + ctxLen);
         let extBuf = body.subarray(1 + ctxLen + 2);
+        let crExts = parse_extension_list(extBuf);
+
+        // RFC 8446 §4.3.2: "The 'signature_algorithms' extension MUST be
+        // specified". Mirrors the same rule already enforced when BUILDING a
+        // CertificateRequest — encoder and decoder agree on what the message
+        // must contain, so we can neither emit nor accept one without it.
+        let hasSigAlgs = false;
+        for (let ci = 0; ci < crExts.length; ci++) {
+          if (crExts[ci] && crExts[ci].type === TLS_EXT.SIGNATURE_ALGORITHMS) { hasSigAlgs = true; break; }
+        }
+        if (!hasSigAlgs) {
+          throw parseError('TLS 1.3 CertificateRequest without the mandatory signature_algorithms extension');
+        }
+
         return {
           version: TLS_VERSION.TLS1_3,
           request_context: ctx,
-          extensions: parse_extensions(extBuf)
+          // extBuf skips the 2-byte prefix (validated as extLen above), so it
+          // is a bare list — this was reading the prefix twice and breaking
+          // every CertificateRequest.
+          extensions: crExts
         };
       }
     }
@@ -1633,6 +1890,7 @@ export {
   exts,
   build_extensions,
   parse_extensions,
+  parse_extension_list,
 
   build_message,
   parse_message,

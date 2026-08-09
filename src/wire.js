@@ -17,6 +17,36 @@ const DTLS_VERSION = {
   DTLS1_3: 0xFEFC
 };
 
+/**
+ * Does `v` denote the TLS 1.3 *message* format?
+ *
+ * SINGLE SOURCE OF TRUTH for every "is this 1.3?" branch in this file.
+ * The reason it has to exist: DTLS 1.3 is TLS 1.3 at the message layer, but
+ * its version constant is 0xFEFC, not 0x0304. Every `v === TLS_VERSION.TLS1_3`
+ * comparison is therefore silently FALSE for DTLS 1.3, and silently selects
+ * the legacy TLS 1.2 encoding of whatever message is being built.
+ *
+ * That is not hypothetical: build_certificate below did exactly this, so a
+ * DTLS 1.3 server emitted a TLS 1.2 Certificate (no certificate_request_context,
+ * no per-entry extensions vector). The peer parsed byte 0 as the context length
+ * — which happened to be 0x00 and so passed — then read the next three bytes as
+ * certificate_list length and got a value far past the end of the message.
+ * BoringSSL answers that with decode_error(50).
+ *
+ * It only ever bit the server role, because the client-side Certificate call
+ * sites hardcode TLS_VERSION.TLS1_3 instead of passing the negotiated version.
+ * Two copies of this library also agree with each other, because
+ * parse_certificate sniffs both encodings — so only a conforming peer objects.
+ */
+function is_tls13_wire(v) {
+  return v === TLS_VERSION.TLS1_3 || v === DTLS_VERSION.DTLS1_3;
+}
+
+/** Companion to is_tls13_wire for the 1.2 message format. */
+function is_tls12_wire(v) {
+  return v === TLS_VERSION.TLS1_2 || v === DTLS_VERSION.DTLS1_2;
+}
+
 const TLS_CONTENT_TYPE = {
   CHANGE_CIPHER_SPEC: 20,
   ALERT: 21,
@@ -143,6 +173,25 @@ function w_u48(buf, off, v) {
   buf[off++] = (lo >>> 16) & 0xFF;
   buf[off++] = (lo >>> 8) & 0xFF;
   buf[off++] = lo & 0xFF;
+  return off;
+}
+
+/**
+ * 64-bit big-endian write. Split into two 32-bit halves rather than using
+ * BigInt: DTLS epochs and sequence numbers are both far below 2^53, so Number
+ * arithmetic is exact here and roughly an order of magnitude faster.
+ */
+function w_u64(buf, off, v) {
+  let hi = Math.floor(v / 0x100000000);
+  let lo = v >>> 0;
+  buf[off++] = (hi >>> 24) & 0xFF;
+  buf[off++] = (hi >>> 16) & 0xFF;
+  buf[off++] = (hi >>>  8) & 0xFF;
+  buf[off++] = (hi       ) & 0xFF;
+  buf[off++] = (lo >>> 24) & 0xFF;
+  buf[off++] = (lo >>> 16) & 0xFF;
+  buf[off++] = (lo >>>  8) & 0xFF;
+  buf[off++] = (lo       ) & 0xFF;
   return off;
 }
 
@@ -1151,6 +1200,14 @@ function build_certificate(params) {
   // TLS 1.3 → מחזיר:  request_context (vec<1>) || certificate_list (vec<3> של [ cert(vec<3>) || extensions(vec<2>) ]*)
   // TLS 1.2 → מחזיר:  certificate_list (vec<3> של cert(vec<3>)*), מתעלם מ-extensions/request_context
 
+  // NOTE the asymmetry with build_certificate_request, which defaults to
+  // TLS1_3. Both defaults are kept as they were, because callers outside this
+  // file may rely on them; every call site inside the library passes `version`
+  // explicitly, so the default is never actually exercised here. What matters
+  // is that the branch below asks is_tls13_wire(v), not v === TLS1_3 — the
+  // mismatched defaults are what made the two messages in the SAME server
+  // flight come out in two different encodings, which is why this stayed
+  // hidden for so long.
   let v = params.version || TLS_VERSION.TLS1_2;
 
   // Normalize to entries[] always
@@ -1161,8 +1218,14 @@ function build_certificate(params) {
   }
   if (!entries) entries = [];
 
-  if (v === TLS_VERSION.TLS1_3) {
-    let ctx = toU8(params.request_context || new Uint8Array(0));
+  if (is_tls13_wire(v)) {
+    // Accept either spelling of the context field. build_tls_message callers
+    // pass `certificate_request_context` (the RFC 8446 field name); this
+    // builder originally read only `request_context`, so the value was
+    // dropped without a word. Harmless during the initial handshake, where
+    // the context is always empty — but post-handshake client authentication
+    // is identified BY that context, so it would have failed silently.
+    let ctx = toU8(params.request_context || params.certificate_request_context || new Uint8Array(0));
 
     let entryParts = [];
     for (let i = 0; i < entries.length; i++) {
@@ -1400,8 +1463,10 @@ function parse_new_session_ticket(body) {
 function build_certificate_request(params) {
   let v = params && params.version || TLS_VERSION.TLS1_3;
 
-  if (v === TLS_VERSION.TLS1_3) {
-    let ctx = toU8((params && params.request_context) || new Uint8Array(0));
+  if (is_tls13_wire(v)) {
+    // Same dual-spelling accommodation as build_certificate above.
+    let ctx = toU8((params && (params.request_context || params.certificate_request_context)) ||
+                   new Uint8Array(0));
 
     // RFC 8446 §4.3.2: "The 'signature_algorithms' extension MUST be specified"
     // in a TLS 1.3 CertificateRequest.
@@ -1869,6 +1934,8 @@ function parse_hello_verify_request(body) {
 export {
   TLS_VERSION,
   DTLS_VERSION,
+  is_tls13_wire,
+  is_tls12_wire,
   TLS_CONTENT_TYPE,
   TLS_ALERT_LEVEL,
   TLS_ALERT,
@@ -1879,6 +1946,7 @@ export {
   w_u16,
   w_u24,
   w_u48,
+  w_u64,
   w_bytes,
   r_u8,
   r_u16,

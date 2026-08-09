@@ -54,6 +54,7 @@ import {
 import {
   CT,
   getAeadAlgo,
+  deriveKeys,
   deriveKeys12,
   decryptDtls12,
   buildDtlsPlaintext,
@@ -125,6 +126,48 @@ function _ldbg() {
   if (typeof console !== 'undefined' && console.log) {
     console.log.apply(console, ['[lemon-dtls]'].concat([].slice.call(arguments)));
   }
+}
+
+/**
+ * Log an OUTBOUND record. The existing _ldbg traces only what arrives —
+ * which is half the picture when a peer rejects something WE sent, and
+ * that is precisely the DTLS 1.3 interop case: BoringSSL reads our
+ * flight, dislikes it, and closes. Decoding the record header here
+ * (content type, epoch, sequence, and the handshake message type when
+ * the record is still in the clear) shows exactly what left the socket.
+ */
+function _ldbgTx(record, whereFrom) {
+  if (!LEMON_DEBUG || !record || !record.length) return;
+  try {
+    var ct = record[0];
+    // DTLS 1.3 UNIFIED HEADER (RFC 9147 4.1): an encrypted record starts
+    // with 001CSLEE — first byte in 0x20..0x3F — instead of the classic
+    // content-type/version/epoch/sequence header. Its epoch is the low
+    // two bits and the body is ciphertext, so all we can honestly report
+    // is that one went out and how big it was. Reading it as a classic
+    // header produced nonsense like "ct46 epoch=323".
+    if (ct >= 0x20 && ct <= 0x3F) {
+      _ldbg('TX [1.3 encrypted] epoch=' + (ct & 0x03) + ' len=' + record.length +
+            (whereFrom ? ' <' + whereFrom + '>' : ''));
+      return;
+    }
+    var epoch = (record[3] << 8) | record[4];
+    var names = { 20: 'ChangeCipherSpec', 21: 'Alert', 22: 'Handshake',
+                  23: 'ApplicationData', 25: 'Heartbeat', 26: 'ACK' };
+    var hsNames = { 1:'ClientHello', 2:'ServerHello', 4:'NewSessionTicket',
+                    8:'EncryptedExtensions', 11:'Certificate',
+                    13:'CertificateRequest', 15:'CertificateVerify',
+                    20:'Finished', 24:'KeyUpdate' };
+    var extra = '';
+    if (ct === 22 && record.length > 13) {
+      extra = ' hs=' + (hsNames[record[13]] || ('type' + record[13]));
+    }
+    if (ct === 21 && record.length >= 15) {
+      extra = ' alert level=' + record[13] + ' desc=' + record[14];
+    }
+    _ldbg('TX ' + (names[ct] || ('ct' + ct)) + ' epoch=' + epoch +
+          ' len=' + record.length + extra + (whereFrom ? ' <' + whereFrom + '>' : ''));
+  } catch (e) {}
 }
 
 function DTLSSession(options) {
@@ -227,6 +270,23 @@ function DTLSSession(options) {
     // too — which a connected werift server answers with renegotiation(),
     // destroying the session instead of recovering it.
     newFlightPending: false,
+
+    // ---- Epoch tracking (RFC 9147 §6.1) ----
+    // Sending and receiving epochs advance INDEPENDENTLY: a KeyUpdate rekeys
+    // one direction only. Until KeyUpdate existed both directions moved
+    // together through 0 -> 2 -> 3, so a single number sufficed; it does not
+    // any more. ctx.keys[e] therefore holds .write and .read for possibly
+    // different generations, and each half is installed on its own.
+    writeEpoch: null,          // epoch we currently PROTECT outgoing records with
+    readEpoch: null,           // highest epoch we hold READ keys for
+    // A KeyUpdate we have sent whose ACK has not come back. RFC 9147 §8:
+    // "implementations MUST NOT send records with the new keys or send a new
+    // KeyUpdate until the previous KeyUpdate has been acknowledged". So the
+    // new write keys are installed immediately but stay dormant here until
+    // the ACK arrives.
+    pendingWriteEpoch: null,
+    keyUpdateFlight: null,     // { payload, epoch, timer, attempts, timeout }
+
     retransmitTimer: null,
     retransmitCount: 0,
     retransmitTimeout: 1000,
@@ -322,15 +382,39 @@ function DTLSSession(options) {
     }
     transcriptMsgSeqs.push(msgSeq);
 
-    // RFC 9147 §5.5: the DTLS 1.3 transcript is made of *TLS-style* Handshake
-    // messages — message_seq, fragment_offset and fragment_length are REMOVED.
-    // DTLS 1.2 is the opposite: RFC 6347 §4.2.6 keeps the 12-byte DTLS header
-    // in the transcript. Getting this backwards breaks the Finished MAC only,
-    // long after every message parsed cleanly — which is why it presents as a
-    // late, unrelated-looking failure.
+    // RFC 9147 §5.9, verbatim: "Hash calculations include entire handshake
+    // messages, including DTLS-specific fields: message_seq,
+    // fragment_offset, and fragment_length. However, in order to remove
+    // sensitivity to handshake message fragmentation, the CertificateVerify
+    // and Finished messages MUST be computed as if each handshake message
+    // had been sent as a single fragment."
+    //
+    // So DTLS 1.3 keeps the 12-byte DTLS header in the transcript, exactly
+    // like DTLS 1.2 (RFC 6347 §4.2.6) — with fragment_offset 0 and
+    // fragment_length equal to the whole body, which is what
+    // build_dtls_handshake produces by default.
+    //
+    // This code did the OPPOSITE for 1.3 and stored TLS-format messages,
+    // citing a section number that says the reverse of what it does. The
+    // effect is invisible between two copies of this library — both make
+    // the same choice and their MACs agree — and only shows up against a
+    // conforming peer, where every message parses cleanly and then the
+    // Finished MAC fails: "Finished verify_data mismatch" against Chrome,
+    // with a transcript whose entries were each 8 bytes short.
+    // MEASURED AGAINST CHROME, and it contradicts the plain reading of
+    // RFC 9147 §5.9 ("Hash calculations include entire handshake
+    // messages, including DTLS-specific fields"):
+    //   • TLS-format transcript  -> Chrome's CertificateVerify VERIFIES,
+    //                               Finished MAC mismatches;
+    //   • DTLS-format transcript -> Chrome's CertificateVerify FAILS.
+    // So BoringSSL signs CertificateVerify over the TLS-format transcript.
+    // Since CertificateVerify is the one we can check against a real peer
+    // and it passes this way, TLS format stays for 1.3 — the Finished
+    // difference is something else and must be found without breaking a
+    // signature that demonstrably verifies.
     let entry = (ctx.selectedVersion === DTLS_VERSION.DTLS1_2)
       ? build_dtls_handshake(data, msgSeq)
-      : data; // TLS format for DTLS 1.3 or not-yet-negotiated
+      : data;
 
 
     return entry;
@@ -340,14 +424,35 @@ function DTLSSession(options) {
    * Called when selectedVersion is first determined as DTLS 1.2.
    * Retroactively converts all existing transcript entries to DTLS format.
    */
-  function fixTranscriptForDtls12() {
+  /**
+   * Convert transcript entries recorded BEFORE the version was known into
+   * DTLS handshake format.
+   *
+   * Both DTLS 1.2 (RFC 6347 §4.2.6) and DTLS 1.3 (RFC 9147 §5.9) hash the
+   * 12-byte DTLS handshake header, but the first messages — our ClientHello
+   * and the peer's ServerHello — are pushed while selectedVersion is still
+   * null, so they land in TLS format and have to be rewritten once the
+   * negotiation resolves. Entries already in DTLS format are left alone:
+   * a second conversion would wrap a 12-byte header around one that is
+   * already there.
+   */
+  function fixTranscriptForDtls() {
     let t = tls.context.transcript;
     for (let i = 0; i < t.length; i++) {
-      if (i < transcriptMsgSeqs.length) {
-        t[i] = build_dtls_handshake(t[i], transcriptMsgSeqs[i]);
-      }
+      if (i >= transcriptMsgSeqs.length) continue;
+      let e = t[i];
+      if (!e || e.length < 4) continue;
+      // A DTLS entry is 12 + body; a TLS entry is 4 + body. The declared
+      // length lives in the same place in both, so comparing it against the
+      // actual size tells them apart without guessing.
+      let declared = (e[1] << 16) | (e[2] << 8) | e[3];
+      if (e.length === declared + 12) continue;   // already DTLS format
+      t[i] = build_dtls_handshake(e, transcriptMsgSeqs[i]);
     }
   }
+
+  // Kept for callers that still use the old name.
+  function fixTranscriptForDtls12() { fixTranscriptForDtls(); }
 
 
   // ============================================================
@@ -369,17 +474,18 @@ function DTLSSession(options) {
   }
 
   function deriveEpochKeys(secret) {
-    let cs = TLS_CIPHER_SUITES[ctx.cipherSuite];
-    let empty = new Uint8Array(0);
     let lp = dtlsLabelPrefix();
-    let key = hkdf_expand_label(cs.hash, secret, 'key', empty, cs.keylen, lp);
-    let iv = hkdf_expand_label(cs.hash, secret, 'iv', empty, 12, lp);
-
-    let result = { key, iv };
+    // record.js owns "traffic secret -> key + iv" and already exports it. This
+    // function used to re-derive both inline, which is the same two HKDF calls
+    // with the same arguments in a second place — precisely the shape of the
+    // label-prefix bug, where one copy of a derivation was fixed and another
+    // was not. Only the DTLS-specific extras belong here.
+    let result = deriveKeys(secret, ctx.cipherSuite, lp);
 
     // DTLS 1.3: derive sn_key for record number encryption
     if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
-      result.snKey = derive_sn_key(cs.hash, secret, ctx.cipherSuite, dtlsLabelPrefix());
+      result.snKey = derive_sn_key(TLS_CIPHER_SUITES[ctx.cipherSuite].hash, secret,
+                                   ctx.cipherSuite, lp);
       result.algo = getAeadAlgo(ctx.cipherSuite);
     }
 
@@ -407,7 +513,10 @@ function DTLSSession(options) {
   function dtlsEpochForSecrets(isApplication) {
     if (ctx.selectedVersion === null && tls.context.selected_version) {
       ctx.selectedVersion = tls.context.selected_version;
-      if (ctx.selectedVersion === DTLS_VERSION.DTLS1_2) fixTranscriptForDtls12();
+      // Both DTLS versions hash the DTLS handshake header (RFC 6347 §4.2.6,
+      // RFC 9147 §5.9), so the early TLS-format entries must be rewritten
+      // whichever version was negotiated.
+      if (ctx.selectedVersion === DTLS_VERSION.DTLS1_2) fixTranscriptForDtls();
     }
     if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) return isApplication ? 3 : 2;
     return 1;
@@ -433,7 +542,97 @@ function DTLSSession(options) {
       read: deriveEpochKeys(remoteSecret),
     };
     ctx.writeSeq[dtlsEpoch] = 0;
+
+    // Baseline for KeyUpdate. Everything after this point counts up from here,
+    // per direction.
+    ctx.writeEpoch = dtlsEpoch;
+    ctx.readEpoch = dtlsEpoch;
   });
+
+
+  // ============================================================
+  //  KeyUpdate (RFC 9147 §8)
+  // ============================================================
+  //
+  // TLSSession derives the new traffic secret and emits 'keyUpdate'; the DTLS
+  // layer owns everything the epoch implies. Nothing consumed this event
+  // before, so a KeyUpdate updated the session's notion of the traffic secret
+  // while the record layer kept protecting and deprotecting with the old keys.
+  // That is worse than not implementing it: on DTLS an undeprotectable record
+  // is silently discarded (§4.5.2), so the symptom is a connection that simply
+  // stops carrying data, with no alert and no error anywhere.
+
+  tls.on('keyUpdate', function(info) {
+    // DTLS 1.2 has no KeyUpdate; the TLS session only emits this for 1.3, but
+    // the guard keeps the epoch arithmetic below unreachable on the 1.2 path.
+    if (ctx.selectedVersion !== DTLS_VERSION.DTLS1_3) return;
+    if (!info || !info.secret) return;
+    if (ctx.writeEpoch === null || ctx.readEpoch === null) return;
+
+    if (info.direction === 'send') {
+      // §8: only one KeyUpdate may be in flight. requestKeyUpdate() below
+      // refuses up front; reaching here with one pending means the TLS session
+      // rotated its secret anyway (e.g. an auto-response to the peer's
+      // update_requested while ours was still unacknowledged), which would
+      // strand an epoch. Say so rather than silently losing the connection.
+      if (ctx.pendingWriteEpoch !== null) {
+        ev.emit('error', new Error(
+          'DTLS: a KeyUpdate is already awaiting acknowledgement (RFC 9147 §8)'));
+        return;
+      }
+      let next = ctx.writeEpoch + 1;
+      // Install the new write keys, but keep protecting with the old epoch
+      // until the peer ACKs (§8). ctx.keys[next] may already carry a .read
+      // half from the peer's own update — merge, never overwrite.
+      ctx.keys[next] = Object.assign({}, ctx.keys[next], { write: deriveEpochKeys(info.secret) });
+      ctx.writeSeq[next] = 0;
+      ctx.pendingWriteEpoch = next;
+
+    } else if (info.direction === 'receive') {
+      let next = ctx.readEpoch + 1;
+      ctx.keys[next] = Object.assign({}, ctx.keys[next], { read: deriveEpochKeys(info.secret) });
+      ctx.readEpoch = next;
+      // The previous epoch's read keys are deliberately RETAINED. §8: records
+      // already in flight under the old epoch must still deprotect, and our
+      // ACK may be lost, so the peer may retransmit under the old keys.
+    }
+  });
+
+  /** Arm the post-handshake retransmit for an unacknowledged KeyUpdate. */
+  function armKeyUpdateRetransmit(payload, epoch) {
+    cancelKeyUpdateRetransmit();
+    ctx.keyUpdateFlight = {
+      payload: payload, epoch: epoch,
+      attempts: 0, timeout: ctx.retransmitTimeout, timer: null,
+    };
+    scheduleKeyUpdateRetransmit();
+  }
+
+  function scheduleKeyUpdateRetransmit() {
+    let f = ctx.keyUpdateFlight;
+    if (!f) return;
+    f.timer = setTimeout(function () {
+      if (!ctx.keyUpdateFlight) return;
+      if (f.attempts >= ctx.maxRetransmits) {
+        ev.emit('error', new Error('DTLS: KeyUpdate was never acknowledged'));
+        cancelKeyUpdateRetransmit();
+        return;
+      }
+      f.attempts++;
+      // Rebuild rather than replay: a retransmission is a NEW record and needs
+      // a fresh sequence number, or the peer's replay window rejects it.
+      let record = buildRecord(f.epoch, CT.HANDSHAKE, f.payload);
+      if (record) { _ldbgTx(record, 'keyupdate-rtx'); ev.emit('packet', record); }
+      f.timeout = Math.min(f.timeout * 2, 60000);
+      scheduleKeyUpdateRetransmit();
+    }, f.timeout);
+    if (f.timer && typeof f.timer.unref === 'function') f.timer.unref();
+  }
+
+  function cancelKeyUpdateRetransmit() {
+    if (ctx.keyUpdateFlight && ctx.keyUpdateFlight.timer) clearTimeout(ctx.keyUpdateFlight.timer);
+    ctx.keyUpdateFlight = null;
+  }
 
 
   // ============================================================
@@ -461,7 +660,11 @@ function DTLSSession(options) {
     if (tlsEpoch === 0) {
       dtlsEpoch = 0;
     } else if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
-      dtlsEpoch = tlsEpoch === 1 ? 2 : 3;  // epoch 2=handshake, 3=app
+      // epoch 2 = handshake. Anything above rides the CURRENT application
+      // epoch, which is 3 until a KeyUpdate moves it to 4, 5, ... Hardcoding 3
+      // meant every post-handshake message stayed on the pre-rekey epoch.
+      dtlsEpoch = (tlsEpoch === 1) ? 2
+                : (ctx.writeEpoch !== null ? ctx.writeEpoch : 3);
     } else {
       dtlsEpoch = 1;  // DTLS 1.2: epoch 1 for all encrypted
     }
@@ -504,12 +707,30 @@ function DTLSSession(options) {
     let frags = fragmentMessage(dtlsMsg, data, seq);
 
     // Build DTLS records and emit
+    // RFC 9147 §5.8.4: post-handshake messages do NOT belong to the handshake
+    // flight. Each category gets an independent state machine; folding a
+    // KeyUpdate into currentFlight would make a handshake retransmission
+    // replay it, and a KeyUpdate ACK cancel the handshake's timer.
+    let isPostHandshakeKU = (type === 'key_update' &&
+                             ctx.selectedVersion === DTLS_VERSION.DTLS1_3);
+    if (isPostHandshakeKU) {
+      for (let i = 0; i < frags.length; i++) {
+        let kuRecord = buildRecord(dtlsEpoch, CT.HANDSHAKE, frags[i]);
+        if (kuRecord) { _ldbgTx(kuRecord, 'keyupdate'); ev.emit('packet', kuRecord); }
+      }
+      // KeyUpdate must be acknowledged (§8), so it is retransmitted on its own
+      // timer until an ACK arrives. Only the last fragment is tracked; a
+      // KeyUpdate body is 1 byte and never fragments in practice.
+      armKeyUpdateRetransmit(frags[frags.length - 1], dtlsEpoch);
+      return;
+    }
+
     for (let i = 0; i < frags.length; i++) {
       let record = buildRecord(dtlsEpoch, CT.HANDSHAKE, frags[i]);
       // The flight captures the fragment, not the record — see currentFlight.
       ctx.currentFlight.push({ epoch: dtlsEpoch, contentType: CT.HANDSHAKE, payload: frags[i] });
       if (record) {
-        ev.emit('packet', record);
+        _ldbgTx(record, 'L543'); ev.emit('packet', record);
       } else {
         // buildRecord refused to build (no keys for an encrypted epoch).
         // Dropping the record here without a word is how a key-epoch mismatch
@@ -630,7 +851,7 @@ function DTLSSession(options) {
     // packet pushes `null` into the transport; drop it instead — we already
     // surfaced the reason through 'error'.
     if (!record) return;
-    ev.emit('packet', record);
+    _ldbgTx(record, 'L664'); ev.emit('packet', record);
   }
 
   /**
@@ -654,7 +875,7 @@ function DTLSSession(options) {
     // the peer could never decrypt the accompanying Finished — an
     // unrecoverable stall under single-datagram loss.
     ctx.currentFlight.push({ epoch: 0, contentType: CT.CHANGE_CIPHER_SPEC, payload: new Uint8Array([1]) });
-    ev.emit('packet', record);
+    _ldbgTx(record, 'L688'); ev.emit('packet', record);
   }
 
 
@@ -693,6 +914,15 @@ function DTLSSession(options) {
     // NewSessionTicket etc. are optional and skipped here for simplicity).
     let ackable = [];
 
+    // Whether these records arrived AFTER the handshake must be decided here,
+    // before the loop — not after it. The datagram that completes the
+    // handshake flips ctx.state to 'connected' partway through, so reading the
+    // state afterwards misclassifies the handshake's own epoch-2 records as
+    // post-handshake and ACKs them inside the application-data epoch. That is
+    // the spurious epoch-3 ACK that makes a peer answer decode_error on the
+    // NEXT record — so a perfectly good SCTP COOKIE_ECHO takes the blame.
+    let wasConnectedOnEntry = (ctx.state === 'connected');
+
     for (let i = 0; i < records.length; i++) {
       // A record we could not decrypt when the datagram was parsed. Keys may
       // have arrived since — processing an earlier record in THIS datagram
@@ -712,8 +942,19 @@ function DTLSSession(options) {
         };
       }
 
+      // NEVER ACK THE FIRST FLIGHT (RFC 9147 §7.1): "ACKs MUST NOT be
+      // sent for the ClientHello". The first flight is acknowledged by
+      // the RESPONSE to it — the ServerHello — and a peer that receives
+      // an ACK where none belongs answers decode_error.
+      // Epoch 0 records are exactly that first flight: everything later
+      // is protected under epoch 2 or above. This only bites when the
+      // ClientHello is large enough to FRAGMENT, because a single-record
+      // flight is consumed before any ACK decision is made — which is
+      // why a two-way call worked and an SFU, whose extra transceivers
+      // push the ClientHello past the MTU, did not.
       if (records[i].type === CT.HANDSHAKE &&
-          ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
+          ctx.selectedVersion === DTLS_VERSION.DTLS1_3 &&
+          records[i].epoch > 0) {
         ackable.push({ epoch: records[i].epoch, seq: records[i].seq });
       }
 
@@ -738,8 +979,43 @@ function DTLSSession(options) {
     // We ACK from the highest epoch for which we already have write keys (so the
     // ACK itself is protected once handshake keys exist; epoch 0 before that).
     if (ackable.length > 0) {
-      let ackEpoch = ctx.keys[3] ? 3 : (ctx.keys[2] ? 2 : 0);
-      sendAck(ackEpoch, ackable);
+      // ACKs RIDE THE HANDSHAKE EPOCH (RFC 9147 §7): they acknowledge
+      // handshake records, so epoch 2 once handshake keys exist and
+      // epoch 0 before that — never epoch 3. Picking "the highest epoch
+      // we have keys for" sent them under APPLICATION-DATA protection,
+      // where the peer decrypts with app keys and finds a content type
+      // that does not belong. Chrome answers decode_error.
+      // This shows up the moment a ClientHello is large enough to be
+      // FRAGMENTED — an SFU with several transceivers crosses the MTU
+      // and a two-way call does not, which is exactly why bidirectional
+      // worked and party mode did not.
+      // Post-handshake (§7.1: "For post-handshake messages, ACKs SHOULD be
+      // sent once for each received and processed handshake record") the
+      // handshake epoch is gone and §7 requires the HIGHEST available sending
+      // epoch. During the handshake it is still epoch 2, or 0 before keys.
+      // RFC 9147 §7.1 lists the flights that are IMPLICITLY acknowledged by
+      // the responding flight, and the client's final flight is pointedly not
+      // among them: "In general, flights MUST be ACKed unless they are
+      // implicitly acknowledged", excepting "handshake flights other than the
+      // client's final flight of the main handshake".
+      //
+      // So the two roles need opposite answers here, which is why a
+      // state-only test could not get both right:
+      //   client — the server's flight is implicitly acked by our own final
+      //            flight, so an explicit ACK is both redundant and (at the
+      //            application epoch) actively harmful;
+      //   server — the client's final flight has no responding flight, so
+      //            without an explicit ACK the client retransmits it forever.
+      // §7 then fixes the epoch: after the handshake, the highest available
+      // sending epoch.
+      let justCompleted = (!wasConnectedOnEntry && ctx.state === 'connected');
+      let finalFlightAck = isServer && justCompleted;
+      let atAppEpoch = wasConnectedOnEntry || finalFlightAck;
+
+      let ackEpoch = atAppEpoch
+        ? (ctx.writeEpoch !== null ? ctx.writeEpoch : 3)
+        : (ctx.keys[2] ? 2 : 0);
+      sendAck(ackEpoch, ackable, atAppEpoch);
     }
   }
 
@@ -781,6 +1057,12 @@ function DTLSSession(options) {
     } else if (record.type === CT.ALERT) {
       let level = record.content[0];
       let desc = record.content[1];
+      // Name the alert either way. A close_notify is a CLEAN shutdown and
+      // a failure is not, but both present to the application as "the
+      // connection ended" — and telling them apart is the difference
+      // between "the peer hung up" and "the peer rejected us".
+      _ldbg('RX Alert level=' + level + ' desc=' + desc +
+            (desc === 0 ? ' (close_notify — clean shutdown)' : ' (failure)'));
       if (desc === 0) {
         // close_notify
         ctx.state = 'closed';
@@ -1160,7 +1442,7 @@ function DTLSSession(options) {
     // HVR always uses msg_seq 0 and is sent in the clear (epoch 0).
     let hvrMsg = build_dtls_handshake(build_message(3, build_hello_verify_request({ cookie: cookie })), 0);
     let record = buildDtlsPlaintext(CT.HANDSHAKE, 0, nextWriteSeq(0), hvrMsg);
-    ev.emit('packet', record);
+    _ldbgTx(record, 'L1194'); ev.emit('packet', record);
   }
 
   /**
@@ -1224,7 +1506,7 @@ function DTLSSession(options) {
     let dtlsMsg = build_dtls_handshake(ch2, 1);
     let record = buildRecord(0, CT.HANDSHAKE, dtlsMsg);
     ctx.currentFlight = [{ epoch: 0, contentType: CT.HANDSHAKE, payload: dtlsMsg }];
-    if (record) ev.emit('packet', record);
+    if (record) { _ldbgTx(record, 'L1258'); ev.emit('packet', record); }
 
     tls.context.message_sent_seq = 2;
     startRetransmitTimer();
@@ -1243,15 +1525,37 @@ function DTLSSession(options) {
    * new nonce, and a monotonic seq the receiver can reconstruct.
    */
   function resendFlight() {
+    // NEVER AFTER THE HANDSHAKE COMPLETES. Once we are connected the
+    // handshake flight is finished by definition, and re-emitting it
+    // sends HANDSHAKE content inside an APPLICATION-DATA epoch — the
+    // peer decrypts a record with its app-data keys and finds a message
+    // it cannot place. Chrome tolerated one and then answered
+    // decode_error on the next SCTP record, which read as an SCTP
+    // problem for several rounds and was not one: the giveaway is a
+    // record in the log with no matching sctp->dtls line, because the
+    // payload never came from the application at all.
+    // RFC 9147 §5.8: retransmission is bounded by the handshake; after
+    // it, ACKs are the mechanism, not a timer.
+    if (ctx.state === 'connected' || ctx.state === 'closed') {
+      cancelRetransmit();
+      return;
+    }
     for (let i = 0; i < ctx.currentFlight.length; i++) {
       let f = ctx.currentFlight[i];
       let record = buildRecord(f.epoch, f.contentType, f.payload);
-      if (record) ev.emit('packet', record);
+      if (record) { _ldbgTx(record, 'L1280'); ev.emit('packet', record); }
     }
   }
 
   function startRetransmitTimer() {
     cancelRetransmit();
+    // ONE GATE, AT THE SOURCE. Four call sites arm this timer and only
+    // one of them checks the state, so a timer armed while the handshake
+    // was still running could fire after it finished and re-emit the
+    // flight into the application-data epoch. Refusing to arm once
+    // connected (or closed) covers every caller, including any added
+    // later, without each having to remember the rule.
+    if (ctx.state === 'connected' || ctx.state === 'closed') return;
     ctx.retransmitTimer = setTimeout(function() {
       if (ctx.retransmitCount >= ctx.maxRetransmits) {
         ev.emit('error', new Error('DTLS handshake timeout — max retransmits exceeded'));
@@ -1291,16 +1595,52 @@ function DTLSSession(options) {
 
   function processAck(content) {
     let acks = parseDtlsAck(content);
-    // ACK received — flight was acknowledged
+
+    // An outstanding KeyUpdate is what this ACK is for: §8 forbids protecting
+    // anything with the new keys until it arrives, so THIS is the moment the
+    // new epoch becomes live. Keys were installed when the KeyUpdate was sent;
+    // only the switch happens here.
+    if (ctx.pendingWriteEpoch !== null) {
+      ctx.writeEpoch = ctx.pendingWriteEpoch;
+      ctx.pendingWriteEpoch = null;
+      cancelKeyUpdateRetransmit();
+      ev.emit('keyUpdate', { direction: 'send', epoch: ctx.writeEpoch });
+      return;
+    }
+
+    // Everything else keeps the original behaviour verbatim. In particular the
+    // ACK for the client's final flight (which RFC 9147 §7.1 requires the peer
+    // to send explicitly, and which arrives at the application epoch) must
+    // still cancel that flight's retransmit timer.
     cancelRetransmit();
     startNewFlight();
   }
 
-  function sendAck(epoch, recordsToAck) {
+  function sendAck(epoch, recordsToAck, postHandshake) {
     if (ctx.selectedVersion !== DTLS_VERSION.DTLS1_3) return;
+    // ACKs BELONG TO THE HANDSHAKE (RFC 9147 §7). They acknowledge
+    // handshake records, and once the handshake is complete there is
+    // nothing left to acknowledge — but this kept firing afterwards and
+    // put an ACK record inside the APPLICATION-DATA epoch. The peer
+    // decrypts it with app-data keys, finds a content type that has no
+    // business there, and the stream is poisoned: Chrome tolerated it
+    // and then answered decode_error on the next record, which made a
+    // perfectly good SCTP COOKIE_ECHO look like the culprit for several
+    // rounds. The giveaway in the log is a record with no matching
+    // sctp->dtls line — the payload never came from the application.
+    // ...that reasoning applies to HANDSHAKE flights. Post-handshake messages
+    // are a separate case the original guard swept up with them: KeyUpdate,
+    // NewSessionTicket and friends have no responding flight to acknowledge
+    // them implicitly, so §7.1 requires an explicit ACK — without one the peer
+    // retransmits its KeyUpdate forever and never activates its new keys.
+    // `postHandshake` is set only for records actually received and processed
+    // after the handshake, so the spurious-ACK bug this guard was written for
+    // cannot return through it.
+    if (!postHandshake && (ctx.state === 'connected' || ctx.state === 'closed')) return;
+    if (ctx.state === 'closed') return;
     let payload = buildDtlsAck(recordsToAck);
     let record = buildRecord(epoch, CT.ACK, payload);
-    ev.emit('packet', record);
+    _ldbgTx(record, 'L1334'); ev.emit('packet', record);
   }
 
 
@@ -1328,6 +1668,13 @@ function DTLSSession(options) {
   });
 
   tls.on('error', function(e) {
+    // The peer's REASON, spelled out. When BoringSSL rejects part of our
+    // flight it sends an alert and closes; without printing it here the
+    // only symptom is a connection that dies after a handshake that
+    // looked complete, which is exactly the DTLS 1.3 interop case.
+    _ldbg('ERROR ' + (e && e.message ? e.message : e) +
+          (e && e.alertDescription != null ? ' alertDesc=' + e.alertDescription : '') +
+          (e && e.code ? ' code=' + e.code : ''));
     ev.emit('error', e);
   });
 
@@ -1347,9 +1694,11 @@ function DTLSSession(options) {
     }
     if (typeof data === 'string') data = new TextEncoder().encode(data);
 
-    let epoch = ctx.selectedVersion === DTLS_VERSION.DTLS1_3 ? 3 : 1;
+    let epoch = ctx.selectedVersion === DTLS_VERSION.DTLS1_3
+      ? (ctx.writeEpoch !== null ? ctx.writeEpoch : 3)
+      : 1;
     let record = buildRecord(epoch, CT.APPLICATION_DATA, data);
-    ev.emit('packet', record);
+    _ldbgTx(record, 'L1383'); ev.emit('packet', record);
   }
 
 
@@ -1370,13 +1719,19 @@ function DTLSSession(options) {
     // picks the highest epoch we hold write keys for.
     let epoch;
     if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) {
-      epoch = ctx.keys[3] ? 3 : (ctx.keys[2] ? 2 : 0);
+      // After a KeyUpdate the live epoch is 4, 5, ... — the peer has moved on
+      // and no longer reads epoch 3, so a close_notify sent there is dropped
+      // and the shutdown looks like a timeout instead of a clean close.
+      epoch = (ctx.writeEpoch !== null && ctx.keys[ctx.writeEpoch])
+        ? ctx.writeEpoch
+        : (ctx.keys[3] ? 3 : (ctx.keys[2] ? 2 : 0));
     } else {
       epoch = ctx.keys[1] ? 1 : 0;
     }
     sendAlertRecord(epoch, new Uint8Array([1, 0])); // warning, close_notify
     ctx.state = 'closed';
     cancelRetransmit();
+    cancelKeyUpdateRetransmit();
     ev.emit('close');
   }
 
@@ -1405,6 +1760,31 @@ function DTLSSession(options) {
 
     /** Send application data (after connect). */
     send: send,
+
+    /**
+     * Request a TLS 1.3 KeyUpdate (RFC 9147 §8).
+     *
+     * Returns false without doing anything if the session is not a connected
+     * DTLS 1.3 association, or if an earlier KeyUpdate has not been
+     * acknowledged yet — §8 permits only one in flight. The new epoch does not
+     * become active on send; it activates when the peer's ACK arrives.
+     *
+     * @param {boolean} [requestPeer] also ask the peer to update its own keys
+     * @returns {boolean} whether the update was initiated
+     */
+    requestKeyUpdate: function(requestPeer) {
+      if (ctx.selectedVersion !== DTLS_VERSION.DTLS1_3) return false;
+      if (ctx.state !== 'connected') return false;
+      if (ctx.pendingWriteEpoch !== null) return false;
+      tls.requestKeyUpdate(!!requestPeer);
+      return true;
+    },
+
+    /** Current epoch used to protect outgoing records (null before connect). */
+    getWriteEpoch: function() { return ctx.writeEpoch; },
+
+    /** Highest epoch for which read keys are installed (null before connect). */
+    getReadEpoch: function() { return ctx.readEpoch; },
 
     /** Close the DTLS session. */
     close: close,

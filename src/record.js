@@ -16,6 +16,7 @@ import {
   w_u8,
   w_u16,
   w_u48,
+  w_u64,
 } from './wire.js';
 
 // ===================== AEAD algorithm resolution =====================
@@ -589,6 +590,11 @@ function writeRecord(transport, type, payload, version) {
 // readU16, readU48 return value only (no offset tracking), unlike wire.js r_u16 which returns [value, offset]
 
 function readU16(buf, off) { return ((buf[off] << 8) | buf[off+1]) >>> 0; }
+function readU64(buf, off) {
+  let hi = ((buf[off] << 24) | (buf[off+1] << 16) | (buf[off+2] << 8) | buf[off+3]) >>> 0;
+  let lo = ((buf[off+4] << 24) | (buf[off+5] << 16) | (buf[off+6] << 8) | buf[off+7]) >>> 0;
+  return hi * 0x100000000 + lo;
+}
 function readU48(buf, off) {
   let hi = ((buf[off] << 8) | buf[off+1]) >>> 0;
   let lo = ((buf[off+2] << 24) | (buf[off+3] << 16) | (buf[off+4] << 8) | buf[off+5]) >>> 0;
@@ -800,10 +806,35 @@ function isUnifiedHdr(b) { return (b & 0xE0) === UNIFIED_HDR_FIXED; }
  * mask = AES-ECB(snKey, ciphertext[0..15])
  * result = rnBytes XOR mask[0..len-1]
  */
-function maskRecordNumber(snKey, rnBytes, ciphertext) {
-  let sample = new Uint8Array(16);
-  sample.set(ciphertext.subarray(0, Math.min(16, ciphertext.length)), 0);
-  let mask = aesEcbEncrypt(snKey, sample);
+function maskRecordNumber(snKey, rnBytes, ciphertext, algo) {
+  // RFC 9147 §4.2.3: "This procedure requires the ciphertext length to be at
+  // least 16 bytes. Receivers MUST reject shorter records as if they had
+  // failed deprotection." Zero-padding a short sample instead (the previous
+  // behaviour) both diverges from the spec and yields a predictable mask.
+  // Senders must pad short plaintexts; with a 16-byte tag that never happens
+  // for the AEADs we support, so this is a guard, not a code path.
+  if (!ciphertext || ciphertext.length < 16) return null;
+
+  let mask;
+  if (algo === 'chacha20-poly1305') {
+    // Mask = ChaCha20(sn_key, Ciphertext[0..3], Ciphertext[4..15])
+    // — first 4 bytes are the block counter, next 12 the nonce. Node's
+    // 'chacha20' cipher takes exactly that as a 16-byte IV, so the sample is
+    // passed through unchanged and we encrypt a zero block to read off the
+    // keystream.
+    //
+    // The AES branch below is well covered by the DTLS 1.3 suites we
+    // negotiate in practice; this branch is not, so cross-check it against a
+    // BoringSSL peer before trusting it — in particular the counter's byte
+    // order, which the RFC states as a byte range and OpenSSL interprets as a
+    // little-endian u32.
+    let iv = Buffer.from(ciphertext.subarray(0, 16));
+    let c = crypto.createCipheriv('chacha20', snKey, iv);
+    mask = new Uint8Array(c.update(Buffer.alloc(16)));
+  } else {
+    mask = aesEcbEncrypt(snKey, ciphertext.subarray(0, 16));
+  }
+
   let out = new Uint8Array(rnBytes.length);
   for (let i = 0; i < rnBytes.length; i++) out[i] = rnBytes[i] ^ mask[i];
   return out;
@@ -864,7 +895,32 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
   ciphertext.set(new Uint8Array(tag), ct.length);
 
   // Encrypt record number
-  let encRn = maskRecordNumber(keys.snKey, rn, ciphertext);
+  let encRn = maskRecordNumber(keys.snKey, rn, ciphertext, algo);
+
+  // ── DIAGNOSTIC (LEMON_DEBUG=1 / WEBRTC_DEBUG=1) ──────────────────────
+  // Everything a peer needs to PARSE this record, printed as we build it.
+  // A decode_error alert means the peer could not make structural sense of
+  // what arrived, so the fields to compare are the info byte (which
+  // declares whether a CID, a length and a 16-bit sequence number are
+  // present), the sequence number before and after masking, and the
+  // declared length against the actual ciphertext size. If two records
+  // are accepted and the third is not, the difference between them shows
+  // up here.
+  try {
+    if (typeof process !== 'undefined' && process.env &&
+        (process.env.LEMON_DEBUG === '1' || process.env.WEBRTC_DEBUG === '1')) {
+      var _h = function (b) { return ('0' + (b & 0xFF).toString(16)).slice(-2); };
+      console.log('[lemon-rec] TX info=0x' + _h(info) +
+        ' [C=' + ((info >> 4) & 1) + ' S=' + ((info >> 3) & 1) +
+        ' L=' + ((info >> 2) & 1) + ' epoch=' + (info & 0x03) + ']' +
+        ' seqPlain=' + _h(rn[0]) + _h(rn[1]) +
+        ' seqMasked=' + _h(encRn[0]) + _h(encRn[1]) +
+        ' declaredLen=' + ciphertext.length +
+        ' aadLen=' + (aad ? aad.length : 'null') +
+        ' snKey=' + (keys.snKey ? 'set' : 'MISSING'));
+    }
+  } catch (_e) {}
+  // ─────────────────────────────────────────────────────────────────────
 
   // Assemble: info(1) + encrypted_rn(2) + length(2) + ciphertext
   let record = new Uint8Array(5 + ciphertext.length);
@@ -910,12 +966,45 @@ function reconstructDtlsSeq(truncated, bits, maxSeq) {
 
 
 /**
+ * Resolve the full epoch from the 2 bits carried in the unified header.
+ *
+ * RFC 9147 §4.2.2: the header holds only the low 2 bits of the epoch, so
+ * epoch 4 is indistinguishable from epoch 0 on the wire, 5 from 1, and so on.
+ * The spec's rule is to use "the most recent past epoch which has matching
+ * bits" — i.e. among the epochs we actually hold read keys for, the highest
+ * one whose low 2 bits match.
+ *
+ * Until KeyUpdate existed, only epochs 0/2/3 were ever in play and each had a
+ * unique bit pattern, so indexing the key table directly by the 2 bits worked
+ * by accident. The first KeyUpdate moves a sender to epoch 4, whose bits are
+ * 00 — and a lookup by bits then hands back the epoch-0 (plaintext) entry.
+ *
+ * @param epochBits    the 2-bit value from the header
+ * @param keysByEpoch  object keyed by FULL epoch number
+ * @returns the full epoch number, or null if we hold no matching keys
+ */
+function resolveReadEpoch(epochBits, keysByEpoch) {
+  if (!keysByEpoch) return null;
+  let best = null;
+  for (let k in keysByEpoch) {
+    if (!Object.prototype.hasOwnProperty.call(keysByEpoch, k)) continue;
+    let e = Number(k);
+    if (!Number.isFinite(e)) continue;
+    if ((e & 0x03) !== (epochBits & 0x03)) continue;
+    if (keysByEpoch[k] == null) continue;
+    if (best === null || e > best) best = e;
+  }
+  return best;
+}
+
+
+/**
  * Decrypt a DTLS 1.3 encrypted record.
  * data: full record bytes (starting with unified header byte)
  * keys: { key, iv, snKey, algo?, maxReadSeq? }
  * Returns { epoch, seq, type, content } or null on failure.
  */
-function decryptEncryptedDtls13(data, keys) {
+function decryptEncryptedDtls13(data, keys, fullEpoch) {
   if (data.length < 1) return null;
 
   let hdr = parseUnifiedHdr(data[0]);
@@ -940,8 +1029,16 @@ function decryptEncryptedDtls13(data, keys) {
   if (off + ctLen > data.length) return null;
   let ciphertext = data.slice(off, off + ctLen);
 
-  // Decrypt record number
-  let rn = maskRecordNumber(keys.snKey, encRn, ciphertext);
+  // Resolve the AEAD before unmasking: the record-number mask is built with
+  // the same primitive as the AEAD (AES-ECB vs ChaCha20), so `algo` is needed
+  // here, not just at deprotection time further down.
+  let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
+  let isChaCha = algo === 'chacha20-poly1305';
+
+  // Decrypt record number. Returns null for a ciphertext under 16 bytes, which
+  // RFC 9147 §4.2.3 requires us to reject as a deprotection failure.
+  let rn = maskRecordNumber(keys.snKey, encRn, ciphertext, algo);
+  if (rn === null) return null;
   let truncated = hdr.seqLen2 ? ((rn[0] << 8) | rn[1]) : rn[0];
 
   // RFC 9147 §4.2.2: the wire carries only the low 8 or 16 bits of the record
@@ -968,10 +1065,6 @@ function decryptEncryptedDtls13(data, keys) {
     aad[1 + rnLen + 1] = ctLen & 0xFF;
   }
 
-  let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
-  let isChaCha = algo === 'chacha20-poly1305';
-
-  if (ciphertext.length < 16) return null;
   let ct = ciphertext.subarray(0, ciphertext.length - 16);
   let tag = ciphertext.subarray(ciphertext.length - 16);
 
@@ -1038,7 +1131,9 @@ function decryptEncryptedDtls13(data, keys) {
     }
 
     return {
-      epoch: hdr.epoch,
+      // The caller resolves the full epoch (resolveReadEpoch); hdr.epoch is
+      // only its low 2 bits and must never escape this function as an epoch.
+      epoch: (fullEpoch === undefined || fullEpoch === null) ? hdr.epoch : fullEpoch,
       seq: seq,
       type: inner.type,
       content: inner.content,
@@ -1066,7 +1161,9 @@ function parseDtlsDatagram(data, keysByEpoch) {
 
     if (isUnifiedHdr(first)) {
       let hdr = parseUnifiedHdr(first);
-      let keys = keysByEpoch ? keysByEpoch[hdr.epoch] : null;
+      // Header carries 2 epoch bits; map them back to a real epoch first.
+      let fullEpoch = resolveReadEpoch(hdr.epoch, keysByEpoch);
+      let keys = (fullEpoch === null) ? null : keysByEpoch[fullEpoch];
 
       if (!keys) {
         // No keys for this epoch YET. Do not discard the record: a DTLS peer
@@ -1090,8 +1187,11 @@ function parseDtlsDatagram(data, keysByEpoch) {
         if (total <= 0 || off + total > data.length) total = data.length - off;
 
         records.push({
+          // Unresolvable epoch: keep the raw bits so the deferred retry can
+          // resolve again once keys for that generation are installed.
           type: null,
           epoch: hdr.epoch,
+          epochBits: hdr.epoch,
           seq: null,
           content: null,
           encrypted: false,
@@ -1102,7 +1202,7 @@ function parseDtlsDatagram(data, keysByEpoch) {
         continue;
       }
 
-      let result = decryptEncryptedDtls13(data.subarray(off), keys);
+      let result = decryptEncryptedDtls13(data.subarray(off), keys, fullEpoch);
       if (result) {
         records.push({
           type: result.type,
@@ -1167,13 +1267,25 @@ function parseDtlsDatagram(data, keysByEpoch) {
 
 /** Build ACK payload. acks: [{ epoch, seq }, ...] */
 function buildDtlsAck(acks) {
-  let bodyLen = acks.length * 8;
+  // RFC 9147 §7:
+  //     struct { uint64 epoch; uint64 sequence_number; } RecordNumber;
+  //     struct { RecordNumber record_numbers<0..2^16-1>; } ACK;
+  // SIXTEEN bytes per entry. This wrote eight — a uint16 epoch and a uint48
+  // sequence number, which is the DTLS *1.2* record-number layout carried over
+  // by mistake. A conforming peer reads a record_numbers vector whose length is
+  // not a multiple of 16 and answers decode_error.
+  //
+  // It stayed hidden because the only ACKs this stack sent were during the
+  // handshake, where they are usually redundant, and because parseDtlsAck made
+  // the identical mistake — so two copies of this library agreed with each
+  // other and the peer's own well-formed ACKs were quietly misread.
+  let bodyLen = acks.length * 16;
   let out = new Uint8Array(2 + bodyLen);
   let off = 0;
   off = w_u16(out, off, bodyLen);
   for (let i = 0; i < acks.length; i++) {
-    off = w_u16(out, off, acks[i].epoch);
-    off = w_u48(out, off, acks[i].seq);
+    off = w_u64(out, off, acks[i].epoch);
+    off = w_u64(out, off, acks[i].seq);
   }
   return out;
 }
@@ -1184,9 +1296,10 @@ function parseDtlsAck(data) {
   let off = 2;
   let end = off + bodyLen;
   let acks = [];
-  while (off + 8 <= end) {
-    let epoch = readU16(data, off); off += 2;
-    let seq   = readU48(data, off); off += 6;
+  // 16 bytes per RecordNumber — see buildDtlsAck.
+  while (off + 16 <= end && off + 16 <= data.length) {
+    let epoch = readU64(data, off); off += 8;
+    let seq   = readU64(data, off); off += 8;
     acks.push({ epoch, seq });
   }
   return acks;
@@ -1198,6 +1311,9 @@ function parseDtlsAck(data) {
 export {
   // AEAD
   getAeadAlgo,
+
+  // DTLS 1.3 epoch resolution
+  resolveReadEpoch,
 
   // TLS 1.3
   deriveKeys,

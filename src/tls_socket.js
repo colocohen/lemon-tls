@@ -53,7 +53,6 @@ function sigalgCodeToName(code) {
 
 // ==== עזרי המרה ====
 function toBuf(u8){ return Buffer.isBuffer(u8) ? u8 : Buffer.from(u8 || []); }
-function toU8(buf){ return (buf instanceof Uint8Array) ? buf : new Uint8Array(buf || []); }
 
 function parseVersion(v) {
   if (typeof v === 'number') return v;

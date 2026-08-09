@@ -54,7 +54,13 @@ function arraysEqual(a, b) {
         return false;
       }
     }else{
-      if(typeof a[i]=='string' && typeof b[i]=='string'){
+      // Either element may be null/undefined here: the branch above requires
+      // BOTH to be non-null typed arrays, so a null slips through to this
+      // side and the `.constructor` reads below threw a TypeError. Settle
+      // those cases by identity before anything is dereferenced.
+      if(a[i]==null || b[i]==null){
+        if(a[i]!==b[i]) return false;
+      }else if(typeof a[i]=='string' && typeof b[i]=='string'){
         if (a[i] !== b[i]){
           return false;
         }

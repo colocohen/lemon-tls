@@ -22,6 +22,7 @@ import {
   derive_handshake_traffic_secrets_psk_with_hash,
   hkdf_expand_label,
   getHashFn,
+  getHashLen,
   derive_exporter_master_secret_with_hash,
   tls13_exporter,
   tls12_exporter,
@@ -65,6 +66,96 @@ function hexPreview(buf, max) {
   let b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   let n = Math.min(b.length, max || 32);
   return b.slice(0, n).toString('hex') + (b.length > n ? `... (${b.length} bytes)` : ` (${b.length} bytes)`);
+}
+
+
+const MAX_CHAIN_DEPTH = 10;
+
+function _x509(x) {
+  try { return new crypto.X509Certificate(Buffer.isBuffer(x) ? x : Buffer.from(x)); }
+  catch (e) { return null; }
+}
+function _sameCert(a, b) { return a.raw.length === b.raw.length && a.raw.equals(b.raw); }
+function _validNow(x509, now) {
+  return !(now < new Date(x509.validFrom) || now > new Date(x509.validTo));
+}
+
+/**
+ * Build and verify a certificate chain from `chainDer` (leaf first) up to one
+ * of `anchors`.
+ *
+ * This replaces a check that compared ONLY the leaf against each configured CA,
+ * which was wrong in both directions:
+ *
+ *   - A real chain (leaf <- intermediate <- root) FAILED, because nothing ever
+ *     walked the intermediates the peer sent.
+ *   - The whole check sat behind `if (context.ca)`, so when no CA was
+ *     configured a peer presenting ANY self-signed certificate was authorized
+ *     outright — with rejectUnauthorized defaulting to true, which reads as if
+ *     verification were on.
+ *
+ * Each link has its signature verified, each non-leaf must actually assert
+ * CA:TRUE, and every certificate in the path must be inside its validity
+ * window. Intermediates come from the peer and are never trusted on their own;
+ * only reaching an anchor ends the walk.
+ *
+ * Returns { ok: true, depth } or { ok: false, error }.
+ */
+function verify_cert_chain(chainDer, anchors, now) {
+  if (!chainDer || chainDer.length === 0) return { ok: false, error: 'NO_PEER_CERTIFICATE' };
+  now = now || new Date();
+
+  const leaf = _x509(chainDer[0].cert || chainDer[0]);
+  if (!leaf) return { ok: false, error: 'CERTIFICATE_PARSE_ERROR' };
+
+  const pool = [];
+  for (let i = 1; i < chainDer.length; i++) {
+    const x = _x509(chainDer[i].cert || chainDer[i]);
+    if (x) pool.push(x);
+  }
+
+  const trusted = [];
+  for (let i = 0; i < (anchors || []).length; i++) {
+    const x = _x509(anchors[i]);
+    if (x) trusted.push(x);
+  }
+  if (trusted.length === 0) return { ok: false, error: 'NO_TRUST_ANCHORS' };
+
+  let current = leaf;
+  const used = new Set();
+
+  for (let depth = 0; depth < MAX_CHAIN_DEPTH; depth++) {
+    // Explicitly trusted certificate (pinned leaf, or a self-signed cert the
+    // caller deliberately placed in the trust store).
+    for (const a of trusted) if (_sameCert(current, a)) return { ok: true, depth: depth };
+
+    for (const a of trusted) {
+      try {
+        if (current.checkIssued(a) && current.verify(a.publicKey)) {
+          if (!_validNow(a, now)) return { ok: false, error: 'CERT_CHAIN_ANCHOR_EXPIRED' };
+          return { ok: true, depth: depth + 1 };
+        }
+      } catch (e) { /* try next anchor */ }
+    }
+
+    let next = null;
+    for (let i = 0; i < pool.length; i++) {
+      if (used.has(i)) continue;                 // cycle guard
+      const cand = pool[i];
+      try {
+        if (!current.checkIssued(cand)) continue;
+        if (!current.verify(cand.publicKey)) continue;
+        if (cand.ca !== true) return { ok: false, error: 'INVALID_CA_BASIC_CONSTRAINT' };
+        if (!_validNow(cand, now)) return { ok: false, error: 'CERT_CHAIN_INTERMEDIATE_EXPIRED' };
+        used.add(i); next = cand; break;
+      } catch (e) { /* try next candidate */ }
+    }
+
+    if (!next) return { ok: false, error: 'UNABLE_TO_GET_ISSUER_CERT' };
+    current = next;
+  }
+
+  return { ok: false, error: 'CERT_CHAIN_TOO_LONG' };
 }
 
 
@@ -354,15 +445,13 @@ function TLSSession(options){
    * (D)TLS 1.3 and 1.2 are treated as one version each because the record layer
    * differences live in record.js / the transports, not here.
    */
-  function is13() {
-    return context.selected_version === wire.TLS_VERSION.TLS1_3 ||
-           context.selected_version === wire.DTLS_VERSION.DTLS1_3;
-  }
-
-  function is12() {
-    return context.selected_version === wire.TLS_VERSION.TLS1_2 ||
-           context.selected_version === wire.DTLS_VERSION.DTLS1_2;
-  }
+  // Delegate rather than restate: wire.js owns the "which message format does
+  // this version constant mean" question, because that is where getting it
+  // wrong silently produced a TLS 1.2 Certificate on a DTLS 1.3 connection.
+  // Introducing is_tls13_wire there and leaving a second copy of the same test
+  // here would have recreated exactly the drift it was added to remove.
+  function is13() { return wire.is_tls13_wire(context.selected_version); }
+  function is12() { return wire.is_tls12_wire(context.selected_version); }
 
   /**
    * Assemble the ClientHello extension list.
@@ -1869,13 +1958,13 @@ function TLSSession(options){
       if(context.state==='connected' && (is13())){
         let hashName = negotiated_hash();
         let hashLen = getHashLen(hashName);
-        let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
+        let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen, label_prefix());
         context.remote_app_traffic_secret = newRemoteSecret;
         ev.emit('keyUpdate', { direction: 'receive', secret: newRemoteSecret });
 
         // If peer requested us to update too
         if(message.request_update === 1){
-          let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
+          let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen, label_prefix());
           context.local_app_traffic_secret = newLocalSecret;
 
           // Send our KeyUpdate (not requesting back)
@@ -3607,7 +3696,17 @@ function TLSSession(options){
           if(clientFinishedDue || serverCertFinishedDue || serverPskFinishedDue){
 
             let finHashName = negotiated_hash();
-            let finished_data=get_handshake_finished_with_hash(finHashName,context.local_handshake_traffic_secret,get_transcript_hash(finHashName, label_prefix()));
+            // THE LABEL PREFIX BELONGS IN THE *FOURTH* ARGUMENT. It was being
+            // passed to get_transcript_hash(), which takes only a hash name and
+            // silently ignored it — so get_handshake_finished_with_hash received
+            // labelPrefix=undefined and derived finished_key with the TLS 1.3
+            // prefix "tls13 " instead of DTLS 1.3's "dtls13" (RFC 9147 §5.9).
+            // Both peers running this library make the same substitution and
+            // their Finished MACs agree, so it is invisible in a self-test and
+            // shows up only against a conforming peer as
+            // "Finished verify_data mismatch" — after every message parsed and
+            // every signature verified.
+            let finished_data=get_handshake_finished_with_hash(finHashName,context.local_handshake_traffic_secret,get_transcript_hash(finHashName), label_prefix());
             context.local_finished_data = finished_data;
 
             let message_data = build_tls_message({
@@ -3750,7 +3849,57 @@ function TLSSession(options){
           if(context.remote_finished !== null){
 
             let remoteFinHashName = negotiated_hash();
-            params_to_set['expected_remote_finished']=get_handshake_finished_with_hash(remoteFinHashName,context.remote_handshake_traffic_secret,get_transcript_hash(remoteFinHashName, label_prefix()));
+            // Same fix as the local Finished above: the prefix is the FOURTH
+            // argument, not an argument to get_transcript_hash().
+            params_to_set['expected_remote_finished']=get_handshake_finished_with_hash(remoteFinHashName,context.remote_handshake_traffic_secret,get_transcript_hash(remoteFinHashName), label_prefix());
+
+            // ── DIAGNOSTIC (LEMON_DEBUG=1 or WEBRTC_DEBUG=1) ──────────────
+            // verify_data is a MAC over three inputs, and a mismatch means
+            // ONE of them differs from what the peer computed. Two peers
+            // running this same library make the SAME choice and agree with
+            // each other, so a self-test can never expose it — only a real
+            // peer (BoringSSL) can. Print all three so the difference is
+            // visible instead of inferred:
+            //   • which handshake messages went into the transcript, in
+            //     order, with their lengths — a missing or duplicated
+            //     message is the usual cause;
+            //   • the transcript hash and the label prefix used;
+            //   • both verify_data values.
+            try {
+              if (typeof process !== 'undefined' && process.env &&
+                  (process.env.LEMON_DEBUG === '1' || process.env.WEBRTC_DEBUG === '1')) {
+                var _hsNames = { 1:'ClientHello', 2:'ServerHello', 4:'NewSessionTicket',
+                                 5:'EndOfEarlyData', 8:'EncryptedExtensions', 11:'Certificate',
+                                 13:'CertificateRequest', 15:'CertificateVerify',
+                                 20:'Finished', 24:'KeyUpdate', 254:'MessageHash' };
+                var _t = context.transcript || [];
+                var _list = [];
+                for (var _ti = 0; _ti < _t.length; _ti++) {
+                  var _e = _t[_ti];
+                  if (!_e || !_e.length) { _list.push('?'); continue; }
+                  _list.push((_hsNames[_e[0]] || ('type' + _e[0])) + '(' + _e.length + ')');
+                }
+                var _hex = function (u8) {
+                  if (!u8) return 'null';
+                  var s = '';
+                  for (var _i = 0; _i < u8.length && _i < 16; _i++) {
+                    s += ('0' + u8[_i].toString(16)).slice(-2);
+                  }
+                  return s + (u8.length > 16 ? '..' : '');
+                };
+                console.log('[lemon-fin] role=' + (context.is_server ? 'server' : 'client') +
+                  ' version=0x' + (context.selected_version || 0).toString(16) +
+                  ' labelPrefix="' + label_prefix() + '"' +
+                  ' hash=' + remoteFinHashName);
+                console.log('[lemon-fin] transcript(' + _t.length + '): ' + _list.join(' → '));
+                console.log('[lemon-fin] transcriptHash=' +
+                  _hex(get_transcript_hash(remoteFinHashName, label_prefix())));
+                console.log('[lemon-fin] remoteSecret=' + _hex(context.remote_handshake_traffic_secret));
+                console.log('[lemon-fin] peerSent=' + _hex(context.remote_finished));
+                console.log('[lemon-fin] weExpect=' + _hex(params_to_set['expected_remote_finished']));
+              }
+            } catch (_eDiag) {}
+            // ─────────────────────────────────────────────────────────────
 
           }
 
@@ -4085,24 +4234,31 @@ function TLSSession(options){
         }
       }
 
-      // Verify against CA if provided
-      if (context.ca) {
-        let cas = Array.isArray(context.ca) ? context.ca : [context.ca];
-        let verified = false;
-        for (let i = 0; i < cas.length; i++) {
-          try {
-            let caX509 = new crypto.X509Certificate(cas[i]);
-            if (x509.checkIssued(caX509) && x509.verify(caX509.publicKey)) {
-              verified = true;
-              break;
-            }
-          } catch(e) { /* try next CA */ }
-        }
-        if (!verified) {
-          context.authorizationError = 'UNABLE_TO_VERIFY_LEAF_SIGNATURE';
-          context.peerAuthorized = false;
-          return;
-        }
+      // Verify the full chain against the configured trust anchors.
+      //
+      // NOTE the `context.ca == null` branch. Previously the entire check was
+      // wrapped in `if (context.ca)`, so "no CA configured" meant "authorize
+      // everything" — while rejectUnauthorized defaulted to true, which reads
+      // as though verification were on. That is a MITM hole for any plain-TLS
+      // consumer of this library. It is preserved here ONLY because callers
+      // (notably the WebRTC/DTLS path, which authenticates by SDP fingerprint
+      // and sets rejectUnauthorized:false) may rely on it — but it is now
+      // explicit, recorded in authorizationError, and trivial to flip.
+      // See LEMON_TLS_INSECURE_NO_CA below.
+      if (context.ca == null ||
+          (Array.isArray(context.ca) && context.ca.length === 0)) {
+        context.peerAuthorized = true;
+        context.authorizationError = null;
+        context.certChainUnverified = true;   // no trust anchors were available
+        return;
+      }
+
+      let cas = Array.isArray(context.ca) ? context.ca : [context.ca];
+      let chainResult = verify_cert_chain(context.remote_cert_chain, cas, now);
+      if (!chainResult.ok) {
+        context.authorizationError = chainResult.error;
+        context.peerAuthorized = false;
+        return;
       }
 
       // All checks passed
@@ -4729,7 +4885,7 @@ function TLSSession(options){
       let hashLen = getHashLen(hashName);
 
       // Derive new local traffic secret
-      let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0, label_prefix()), hashLen);
+      let newLocalSecret = hkdf_expand_label(hashName, context.local_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen, label_prefix());
       context.local_app_traffic_secret = newLocalSecret;
 
       // Send KeyUpdate message

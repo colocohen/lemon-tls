@@ -208,7 +208,11 @@ function parse_tls_message(data, negotiatedVersion) {
     // TLS 1.2 and 1.3 have different wire formats for this message.
     // TLS 1.3: ticket_lifetime | ticket_age_add | ticket_nonce | ticket | extensions
     // TLS 1.2: ticket_lifetime_hint | ticket                     (RFC 5077)
-    if (negotiatedVersion === 0x0303) {
+    // 0xFEFD is DTLS 1.2, which uses the RFC 5077 wire format exactly as TLS
+    // 1.2 does. Testing only for 0x0303 sent a DTLS 1.2 ticket through the
+    // TLS 1.3 parser — the same class of bug as the Certificate encoding one:
+    // a version comparison that does not know DTLS exists.
+    if (negotiatedVersion === 0x0303 || negotiatedVersion === 0xFEFD) {
       out = wire.parse_new_session_ticket_tls12(message.body);
     } else {
       out = wire.parse_new_session_ticket(message.body);

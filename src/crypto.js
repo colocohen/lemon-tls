@@ -1,4 +1,3 @@
-
 import {
   concatUint8Arrays
 } from './utils.js';
@@ -735,7 +734,19 @@ function tls13_exporter(hashName, exporter_master_secret, label, context_value, 
   let h_empty = hashFn(new Uint8Array(0));
   let derived = hkdf_expand_label(hashName, exporter_master_secret, label, h_empty, hashLen, labelPrefix);
   let h_ctx   = hashFn(context_value || new Uint8Array(0));
-  return hkdf_expand(hashName, derived, build_hkdf_label('exporter', h_ctx, length), length);
+  // BOTH expansions carry the prefix. RFC 8446 §7.5 defines the exporter
+  // as two HKDF-Expand-Label steps, and in DTLS 1.3 both use "dtls13"
+  // (RFC 9147 §5.9) — this second one was omitting it and falling back
+  // to "tls13 ", so the exported key differed from a conforming peer's.
+  // For WebRTC that key IS the DTLS-SRTP keying material: the handshake
+  // completes, SRTP reports ready, packets flow in both directions, and
+  // NOTHING decrypts. Two peers running this library derive the same
+  // wrong key and interoperate perfectly with each other, which is why
+  // it only appears against Chrome — and appears as "media does not
+  // flow" rather than as a crypto error, since a failed unprotect is
+  // just a dropped packet.
+  return hkdf_expand(hashName, derived,
+    build_hkdf_label('exporter', h_ctx, length, labelPrefix), length);
 }
 
 /**

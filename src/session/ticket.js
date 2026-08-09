@@ -16,7 +16,7 @@
  */
 
 import * as crypto from 'node:crypto';
-import { uint8Equal } from '../utils.js';
+import { timingSafeEqualU8 } from '../utils.js';
 
 /* =========================================================================
  *                      SERVER-SIDE ENCRYPTED BLOB
@@ -82,8 +82,11 @@ function decrypt_session_blob(blob, ticketKeys) {
 
         let { key_name, aes_key } = split_ticket_keys(ticketKeys);
 
-        // Verify key_name matches (allows rotation — caller may try multiple keys)
-        if (!uint8Equal(blob_key_name, key_name)) return null;
+        // Verify key_name matches (allows rotation — caller may try multiple keys).
+        // Constant-time: utils.js names "ticket key_name" explicitly in the list
+        // of comparisons that must not short-circuit, but this call site was
+        // still using uint8Equal, which returns on the first differing byte.
+        if (!timingSafeEqualU8(blob_key_name, key_name)) return null;
 
         let decipher = crypto.createDecipheriv('aes-256-gcm', aes_key, iv);
         decipher.setAuthTag(tag);

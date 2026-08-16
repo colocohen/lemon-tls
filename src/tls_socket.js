@@ -8,6 +8,7 @@ import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT } from './wire.js';
 import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS } from './session/ecdh.js';
 import { default_signature_schemes } from './session/signing.js';
 import { decrypt_session_blob } from './session/ticket.js';
+import { parseDN } from './utils.js';
 
 import {
   getAeadAlgo,
@@ -75,11 +76,19 @@ function parseVersion(v) {
 
 
 // ==== TLSSocket ====
+
 function TLSSocket(duplex, options){
   if (!(this instanceof TLSSocket)) return new TLSSocket(duplex, options);
   options = options || {};
 
-  // Inherit from Duplex stream
+  // allowHalfOpen follows Node: false unless the caller asks otherwise, so
+  // that when the peer stops writing our writable side ends too. This was
+  // hardcoded true, which is the OPPOSITE of the documented default — code
+  // written against Node's semantics waits for a close that never arrives and
+  // the connection just sits there, looking like a leak with no clue as to
+  // why. Node also notes the option has no effect when `socket` is supplied,
+  // since the underlying stream's own setting governs.
+  //
   // highWaterMark: raised to 256KB from the Node default of 16KB. TLS records max
   // at 16KB of plaintext, so the default meant "pause after one record" — terrible
   // for bulk transfers where we want many records in flight. 256KB keeps ~16 records
@@ -87,14 +96,36 @@ function TLSSocket(duplex, options){
   // small bursts interrupted by drain events. Most impactful on the Download path
   // where the sender is aggressive (tight-loop sock.write).
   Duplex.call(this, {
-    allowHalfOpen: true,
+    allowHalfOpen: options.allowHalfOpen === true,
     readableObjectMode: false,
     writableObjectMode: false,
-    highWaterMark: 256 * 1024,
+    highWaterMark: options.highWaterMark || 256 * 1024,
   });
   const self = this;
 
     let _ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+
+    /**
+     * Read a credential out of a caller-supplied `secureContext` (Node parity).
+     *
+     * tls.connect() accepts a context built once by createSecureContext() and
+     * reused across connections, so the same PEM is not re-parsed per socket.
+     * Ours returns { certificateChain, privateKey, ca }, so map those onto the
+     * cert/key/ca the session expects. Direct options always win, matching
+     * Node's precedence.
+     */
+    let _sc = function(what){
+      let sc = options.secureContext;
+      if (!sc) return null;
+      if (what === 'ca')   return sc.ca && sc.ca.length ? sc.ca : null;
+      if (what === 'key')  return sc.privateKey || null;
+      if (what === 'cert') {
+        if (!sc.certificateChain || sc.certificateChain.length === 0) return null;
+        // The session takes a single cert/PEM here; hand it the leaf.
+        return sc.certificateChain[0].cert || sc.certificateChain[0];
+      }
+      return null;
+    };
 
     let context = {
 
@@ -114,13 +145,18 @@ function TLSSocket(duplex, options){
         session: options.session || null,
         psk: options.psk || null,
         rejectUnauthorized: options.rejectUnauthorized,
-        ca: options.ca || null,
+        checkServerIdentity: options.checkServerIdentity,
+        ALPNCallback: options.ALPNCallback || null,
+        ca: options.ca || _sc('ca') || null,
         sessionTickets: options.sessionTickets,
         maxHandshakeSize: options.maxHandshakeSize || 0,
         customExtensions: options.customExtensions || [],
+        permuteExtensions: !!options.permuteExtensions,
+        grease: !!options.grease,
         requestCert: !!options.requestCert,
-        cert: options.cert || null,
-        key: options.key || null,
+        cert: options.cert || _sc('cert') || null,
+        key: options.key || _sc('key') || null,
+        passphrase: options.passphrase,
     }),
     
     // Handshake write
@@ -1216,6 +1252,14 @@ function TLSSocket(duplex, options){
             }
         }
 
+        // 'secure' fires on BOTH sides and on sockets built with
+        // `new TLSSocket()`, which is precisely where 'secureConnect' does
+        // NOT fire (Node documents that exclusion). It is therefore the only
+        // completion signal a STARTTLS caller — who wraps an existing socket
+        // rather than going through connect() — can rely on. Emitted first so
+        // a listener on both sees the handshake-complete event before the
+        // client-only one.
+        self.emit('secure');
         self.emit('secureConnect');
     });
 
@@ -1583,8 +1627,13 @@ function TLSSocket(duplex, options){
             let certDer = chain[0].cert;
             let x509 = new crypto.X509Certificate(certDer);
             return {
-                subject: x509.subject,
-                issuer: x509.issuer,
+                // Node documents subject/issuer as objects keyed by RDN type
+                // ({ C, ST, L, O, OU, CN }), not as the newline-separated text
+                // X509Certificate hands back. Returning the raw string here is
+                // what stopped tls.checkServerIdentity() — which reads
+                // cert.subject.CN — from working against this very method.
+                subject: parseDN(x509.subject),
+                issuer: parseDN(x509.issuer),
                 subjectaltname: x509.subjectAltName,
                 valid_from: x509.validFrom,
                 valid_to: x509.validTo,
@@ -1775,11 +1824,81 @@ function TLSSocket(duplex, options){
         enumerable: true
     });
 
-    /** JA3 fingerprint from ClientHello (server-side only). Returns { hash, raw } or null. */
+    /** Every fingerprint of this connection: { ja3, ja4, ja3s, ja4s, ja4x }.
+     *  Both the client and the server values are populated in either role.
+     *  `opts.protocol` overrides the transport character (e.g. 'q' for QUIC). */
+    self.getFingerprints = function(opts){
+      return session.getFingerprints ? session.getFingerprints(opts)
+        : { ja3: null, ja4: null, ja3s: null, ja4s: null, ja4x: null };
+    };
+
+    /** JA3 of the connection's ClientHello. Shorthand for getFingerprints().ja3. */
     self.getJA3 = function(){ return session.getJA3 ? session.getJA3() : null; };
+
+    /** Node-compat: set the key and certificate for THIS connection. Accepts a
+     *  context from createSecureContext() or a plain { key, cert }. Mainly for
+     *  picking a server certificate from inside ALPNCallback, once the
+     *  negotiated protocol is known. */
+    self.setKeyCert = function(ctxOrOpts){
+      if (session.setKeyCert) session.setKeyCert(ctxOrOpts);
+    };
 
     /** ECDHE shared secret (Buffer), or null. For research/advanced use. */
     self.getSharedSecret = function(){ return session.getSharedSecret ? session.getSharedSecret() : null; };
+
+    /** Node-compat: the Finished verify_data we sent, or undefined.
+     *  The session has kept this all along (context.local_finished_data); only
+     *  the proxy was missing, so the documented method did not exist on the
+     *  socket. Used for the tls-unique channel binding of RFC 5929. */
+    self.getFinished = function(){
+      let v = session.getFinished ? session.getFinished() : null;
+      return v == null ? undefined : v;   // Node returns undefined, not null
+    };
+
+    /** Node-compat: the peer's Finished verify_data, or undefined. */
+    self.getPeerFinished = function(){
+      let v = session.getPeerFinished ? session.getPeerFinished() : null;
+      return v == null ? undefined : v;
+    };
+
+    /** Node-compat: whether this connection resumed an earlier session.
+     *  Same value as the `isResumed` property; Node spells it as a method. */
+    self.isSessionReused = function(){ return !!session.isResumed; };
+
+    /** Node-compat: bound address of the underlying transport,
+     *  `{ port, family, address }`. Empty object when not connected. */
+    self.address = function(){
+      let t = context.transport;
+      if (t && typeof t.address === 'function') {
+        try { return t.address() || {}; } catch(e) { return {}; }
+      }
+      return {};
+    };
+
+    /** Node-compat: describes the ephemeral key agreement.
+     *
+     *  Node returns {} when the agreement is not ephemeral, and null when
+     *  asked on a server socket — it only reports the peer's temporary key,
+     *  which a server does not receive. TLS 1.3 is always (EC)DHE, so on 1.3
+     *  there is always a group to report. */
+    self.getEphemeralKeyInfo = function(){
+      if (session.context && session.context.isServer) return null;
+      let g = session.context ? session.context.selected_group : null;
+      if (g == null) return {};
+      let known = {
+        0x0017: { name: 'prime256v1', size: 256 },
+        0x0018: { name: 'secp384r1',  size: 384 },
+        0x0019: { name: 'secp521r1',  size: 521 },
+        0x001d: { name: 'x25519',     size: 253 },
+        0x001e: { name: 'x448',       size: 448 }
+      };
+      let k = known[g];
+      // Anything outside that table is still a negotiated TLS group — report
+      // it as such rather than as an ECDH curve we cannot name, which is what
+      // Node's 'TLSGroup' type is for.
+      if (!k) return { type: 'TLSGroup', name: '0x' + g.toString(16) };
+      return { type: 'ECDH', name: k.name, size: k.size };
+    };
 
     /** Full negotiation result — all selected parameters in one object. */
     self.getNegotiationResult = function(){ return session.getNegotiationResult ? session.getNegotiationResult() : null; };

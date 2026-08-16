@@ -44,6 +44,7 @@ function DTLSSocket(udpSocket, options) {
     cert: options.cert,
     key: options.key,
     rejectUnauthorized: options.rejectUnauthorized,
+    checkServerIdentity: options.checkServerIdentity,
     requestCert: options.requestCert,
     ca: options.ca,
     alpnProtocols: options.alpnProtocols,
@@ -129,6 +130,37 @@ function DTLSSocket(udpSocket, options) {
   self.getNegotiationResult = function() { return session.getNegotiationResult(); };
   self.getALPN = function() { return session.getALPN(); };
   self.getPeerCertificate = function() { return session.getPeerCertificate(); };
+
+  /** Every fingerprint of this connection: { ja3, ja4, ja3s, ja4s, ja4x }.
+   *  Both the client and the server values are populated in either role. */
+  self.getFingerprints = function(opts) {
+    return session.getFingerprints ? session.getFingerprints(opts)
+      : { ja3: null, ja4: null, ja3s: null, ja4s: null, ja4x: null };
+  };
+
+  /** JA3 of the connection's ClientHello. Shorthand for getFingerprints().ja3. */
+  self.getJA3 = function() { return session.getJA3 ? session.getJA3() : null; };
+
+  /** Set the key and certificate for this connection (Node parity). */
+  self.setKeyCert = function(ctxOrOpts) {
+    if (session.setKeyCert) session.setKeyCert(ctxOrOpts);
+  };
+
+  /** Finished verify_data — the tls-unique channel binding of RFC 5929.
+   *  DTLS-SRTP callers use this alongside exportKeyingMaterial(). */
+  self.getFinished = function() {
+    let v = session.getFinished ? session.getFinished() : null;
+    return v == null ? undefined : v;
+  };
+  self.getPeerFinished = function() {
+    let v = session.getPeerFinished ? session.getPeerFinished() : null;
+    return v == null ? undefined : v;
+  };
+
+  /** Whether this connection resumed an earlier session. */
+  self.isSessionReused = function() {
+    return session.isSessionReused ? session.isSessionReused() : false;
+  };
 
   /** RFC 5705 / RFC 8446 §7.5 exporter (Node tls.TLSSocket parity).
    *  DTLS-SRTP: exportKeyingMaterial(len, 'EXTRACTOR-dtls_srtp') — no context.
@@ -270,6 +302,7 @@ function connectDTLS(options, callback) {
     remotePort: port,
     servername: options.servername || host,
     rejectUnauthorized: options.rejectUnauthorized,
+    checkServerIdentity: options.checkServerIdentity,
     requestCert: options.requestCert,
     ca: options.ca,
     alpnProtocols: options.alpnProtocols,

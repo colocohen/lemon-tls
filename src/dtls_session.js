@@ -194,6 +194,7 @@ function DTLSSession(options) {
     servername: options.servername,
     SNICallback: options.SNICallback,
     rejectUnauthorized: options.rejectUnauthorized,
+    checkServerIdentity: options.checkServerIdentity,
     ca: options.ca,
     noTickets: options.noTickets,
     requestCert: options.requestCert,
@@ -347,9 +348,15 @@ function DTLSSession(options) {
     tlsSetup.local_supported_signature_algorithms = default_signature_schemes();
   }
 
-  // Server cert/key
+  // Server cert/key.
+  //
+  // The whole options object goes in, not just key+cert: createSecureContext
+  // also reads passphrase, ca, ciphers, sigalgs, ecdhCurve, honorCipherOrder,
+  // pfx and ocsp, and picking out two fields silently dropped all of them —
+  // an encrypted private key could never be decrypted here no matter what the
+  // caller passed. Same defect the TLS paths carried.
   if (options.cert && options.key) {
-    let sctx = createSecureContext({ key: options.key, cert: options.cert });
+    let sctx = createSecureContext(options);
     tlsSetup.local_cert_chain = sctx.certificateChain;
     tlsSetup.cert_private_key = sctx.privateKey;
   }
@@ -1841,6 +1848,25 @@ function DTLSSession(options) {
 
     /** Peer certificate. */
     getPeerCertificate: function() { return tls.getPeerCertificate(); },
+
+    /** Every fingerprint of this connection: { ja3, ja4, ja3s, ja4s, ja4x }.
+     *  The transport character resolves to 'd' on its own — the inner
+     *  TLSSession reads the 0xFE high byte off the hello's legacy_version —
+     *  so no `protocol` override is needed for plain DTLS. */
+    getFingerprints: function(opts) { return tls.getFingerprints(opts); },
+
+    /** JA3 of the connection's ClientHello. Shorthand for getFingerprints().ja3. */
+    getJA3: function() { return tls.getJA3(); },
+
+    /** Set the key and certificate for this connection (Node parity). */
+    setKeyCert: function(ctxOrOpts) { return tls.setKeyCert(ctxOrOpts); },
+
+    /** Finished verify_data, ours and the peer's (RFC 5929 channel binding). */
+    getFinished: function() { return tls.getFinished(); },
+    getPeerFinished: function() { return tls.getPeerFinished(); },
+
+    /** Whether this connection resumed an earlier session. */
+    isSessionReused: function() { return !!tls.isResumed; },
   };
 
   for (let k in api) {

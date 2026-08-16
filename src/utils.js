@@ -125,10 +125,50 @@ function timingSafeEqualU8(a, b) {
 }
 
 
+/**
+ * Parse an X509Certificate DN string into the object shape Node's certificate
+ * objects use.
+ *
+ * crypto.X509Certificate gives `subject`/`issuer` as newline-separated
+ * "KEY=value" text, but Node documents them on a certificate object as objects
+ * keyed by RDN type: { C, ST, L, O, OU, CN }. Passing the raw string through
+ * meant tls.checkServerIdentity() — which reads cert.subject.CN — could never
+ * find a Common Name, so any certificate without a SAN was rejected outright
+ * even when its CN matched. The exported identity check did not work against
+ * this library's own getPeerCertificate() output, which is exactly the pairing
+ * Node documents.
+ *
+ * A type may legitimately repeat (OU is the common case); Node represents a
+ * repeat as an array and a single occurrence as a plain string.
+ *
+ * Idempotent: an already-parsed object is returned unchanged, so callers can
+ * pass either form.
+ */
+function parseDN(dn) {
+  if (dn == null) return {};
+  if (typeof dn === 'object') return dn;
+  let out = {};
+  let lines = String(dn).split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    if (!line) continue;
+    let eq = line.indexOf('=');
+    if (eq < 1) continue;
+    let k = line.slice(0, eq).trim();
+    let v = line.slice(eq + 1);
+    if (!Object.prototype.hasOwnProperty.call(out, k)) out[k] = v;
+    else if (Array.isArray(out[k])) out[k].push(v);
+    else out[k] = [out[k], v];
+  }
+  return out;
+}
+
+
 export {
   concatUint8Arrays,
   arraybufferEqual,
   arraysEqual,
   uint8Equal,
-  timingSafeEqualU8
+  timingSafeEqualU8,
+  parseDN
 };

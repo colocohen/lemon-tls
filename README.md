@@ -25,15 +25,18 @@
 
 * 🔒 **Pure JavaScript** – no OpenSSL, no native bindings. Zero dependencies.
 * ⚡ **TLS 1.3 (RFC 8446)** + **TLS 1.2** – both server and client.
+* 📡 **DTLS 1.3 (RFC 9147)** + **DTLS 1.2** – server and client, with cookie exchange, retransmission, and **DTLS-SRTP** (RFC 5764) for WebRTC. Not a shim over TLS: the record layer, epochs, and sequence-number handling are implemented for datagrams.
 * 🌐 **Browser-tested** – verified interop with Chrome, curl, Node.js, openssl s_client, and msquic.
 * 🔑 **Key Access** – read handshake secrets, traffic keys, ECDHE shared secret, and resumption data at any point.
 * 🔁 **Session Resumption** – session tickets + PSK with binder validation.
 * 🔄 **Key Update** – refresh traffic keys on long-lived TLS 1.3 connections.
 * 🔃 **HelloRetryRequest** – automatic group negotiation fallback (X25519, P-256, P-384).
 * 📜 **Client Certificate Auth** – mutual TLS (mTLS) with `requestCert` / `cert` / `key` options.
-* 🛡 **Designed for extensibility** – exposes cryptographic keys and record-layer primitives for QUIC, DTLS, or custom transports.
+* 🛡 **Designed for extensibility** – exposes cryptographic keys and record-layer primitives for QUIC or custom transports (DTLS ships implemented, see above).
 * 🧩 **Two API levels** – high-level `TLSSocket` (drop-in Node.js Duplex stream) and low-level `TLSSession` (state machine only, you handle the transport).
-* 🔧 **Beyond Node.js** – per-connection cipher/sigalg/group selection, JA3 fingerprinting, certificate pinning, and more options that are impossible or require `openssl.cnf` hacks in Node.js.
+* 🔍 **TLS fingerprinting, built in** – `getFingerprints()` returns **JA4**, **JA3**, **JA4S** and **JA3S** for the connection. Both the client and the server values are populated **in either role**, because both hellos are visible to both peers. Verified byte-for-byte against independent implementations. Node cannot do this at all: OpenSSL parses the ClientHello and discards the offer, so other libraries re-read the raw bytes off the socket in parallel — here the data is already in hand.
+* 🎭 **Handshake shaping** – `permuteExtensions` (Chrome 110+ extension-order randomisation) and `grease` (RFC 8701, across all seven insertion points). Both opt-in, both collision-safe against anything you configured by hand.
+* 🔧 **Beyond Node.js** – per-connection cipher/sigalg/group selection, certificate pinning, `ALPNCallback`, `setKeyCert`, and more options that are impossible or require `openssl.cnf` hacks in Node.js.
 * 📘 **TypeScript support** – full `.d.ts` bundled, type-checked in strict mode.
 
 ## 📦 Installation
@@ -201,6 +204,57 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `maxHandshakeSize` | number | Max handshake bytes - DoS protection |
 | `certificateCallback` | function | Dynamic cert selection: `(info, cb) => cb(null, ctx)` |
 
+### Supported cipher suites
+
+Sixteen suites are implemented; three are offered by default. Anything else has
+to be asked for explicitly via `local_supported_cipher_suites` or narrowed with
+`allowedCipherSuites` — the default list stays small on purpose, because every
+extra suite widens the offer and changes your JA3/JA4.
+
+**TLS 1.3** — offered by default
+
+| Code | Suite | AEAD | Hash |
+|---|---|---|---|
+| `0x1301` | `TLS_AES_128_GCM_SHA256` | AES-128-GCM | SHA-256 |
+| `0x1302` | `TLS_AES_256_GCM_SHA384` | AES-256-GCM | SHA-384 |
+| `0x1303` | `TLS_CHACHA20_POLY1305_SHA256` | ChaCha20-Poly1305 | SHA-256 |
+
+**TLS 1.2 — AEAD** (opt in)
+
+| Code | Suite | Key exchange | AEAD |
+|---|---|---|---|
+| `0xC02B` | `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` | ECDHE_ECDSA | AES-128-GCM |
+| `0xC02C` | `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` | ECDHE_ECDSA | AES-256-GCM |
+| `0xC02F` | `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` | ECDHE_RSA | AES-128-GCM |
+| `0xC030` | `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` | ECDHE_RSA | AES-256-GCM |
+| `0xCCA8` | `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | ECDHE_RSA | ChaCha20-Poly1305 |
+| `0xCCA9` | `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` | ECDHE_ECDSA | ChaCha20-Poly1305 |
+| `0xCCAA` | `TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | DHE_RSA | ChaCha20-Poly1305 |
+| `0x009C` | `TLS_RSA_WITH_AES_128_GCM_SHA256` | RSA | AES-128-GCM |
+| `0x009D` | `TLS_RSA_WITH_AES_256_GCM_SHA384` | RSA | AES-256-GCM |
+
+**TLS 1.2 — CBC** (opt in; legacy, no forward secrecy on the RSA ones)
+
+| Code | Suite | Key exchange | Cipher | MAC |
+|---|---|---|---|---|
+| `0xC013` | `TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA` | ECDHE_RSA | AES-128-CBC | SHA-1 |
+| `0xC014` | `TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA` | ECDHE_RSA | AES-256-CBC | SHA-1 |
+| `0x003C` | `TLS_RSA_WITH_AES_128_CBC_SHA256` | RSA | AES-128-CBC | SHA-256 |
+| `0x003D` | `TLS_RSA_WITH_AES_256_CBC_SHA256` | RSA | AES-256-CBC | SHA-256 |
+
+The `0xCCAA` / `0x009C` / `0x009D` suites and the CBC block carry no forward
+secrecy with an RSA key exchange; they exist for interoperability with older
+peers, not as a recommendation.
+
+ChaCha20-Poly1305 uses a full 12-byte IV with no explicit nonce (RFC 7905),
+unlike GCM — the registry records that per suite.
+
+`prioritizeChaCha: true` moves the ChaCha suites ahead of AES. Note this
+changes your **JA3** but not your **JA4**: JA4 sorts the cipher list before
+hashing, so only *which* suites you offer matters there, never their order.
+
+
+
 #### Events
 
 | Event | Callback | Description |
@@ -210,7 +264,8 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `session` | `(Buffer)` | **Opaque session blob** — pass back to `connect({ session })` to resume |
 | `keyUpdate` | `(direction)` | Traffic keys refreshed: `'send'` or `'receive'` |
 | `keylog` | `(Buffer)` | SSLKEYLOGFILE-format line (for Wireshark) |
-| `clienthello` | `(raw, parsed)` | ClientHello received (server side). Fires **synchronously before the ServerHello is built** — use it for JA3 fingerprinting, or to inspect the client's offered extensions (`parsed.extensions` / `getRemoteExtension`) and answer them via `set_context({ local_extensions })` (e.g. DTLS-SRTP `use_srtp`) |
+| `secure` | `()` | Handshake complete. Fires on **both** sides and on sockets built with `new TLSSocket()` — unlike `secureConnect`, which Node does not emit there. The signal to use when wrapping an existing socket for STARTTLS |
+| `clienthello` | `(raw, parsed)` | ClientHello received (server side). Fires **synchronously before the ServerHello is built** — use it for JA3/JA4 fingerprinting, or to inspect the client's offered extensions (`parsed.extensions` / `getRemoteExtension`) and answer them via `set_context({ local_extensions })` (e.g. DTLS-SRTP `use_srtp`) |
 | `handshakeMessage` | `(type, raw, parsed)` | Every handshake message (debugging) |
 | `certificateRequest` | `(msg)` | Server requested a client certificate |
 | `error` | `(Error)` | TLS or transport error |
@@ -257,7 +312,20 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `socket.session` | Access the underlying `TLSSession` (low-level state machine) |
 | `socket.isResumed` | Alias for `isSessionReused()` |
 | `socket.handshakeDuration` | Handshake time in ms |
-| `socket.getJA3()` | `{ hash, raw }` - JA3 fingerprint (server-side) |
+| `allowHalfOpen` | When `false` (the Node default, and now ours) the writable side ends automatically once the peer stops writing. This was hardcoded `true`, the opposite of Node — code expecting the documented behaviour was left holding connections open |
+| `checkServerIdentity(hostname, cert)` | Replaces the built-in RFC 6125 identity check. Return `undefined` to accept, an `Error` to reject. Runs **after** chain verification, as Node documents — a hook that only checks a pin cannot rescue a chain that failed |
+| `socket` | Run the handshake over an existing `Duplex` instead of dialling out. `host`/`port` are then ignored and nothing is connected for you, so the caller can speak cleartext first and upgrade — STARTTLS for SMTP, IMAP, PostgreSQL |
+| `secureContext` | A context from `createSecureContext()`, reused across connections instead of re-parsing the same PEM each time. Explicit `secureContext` wins over `key`/`cert` |
+| `ALPNCallback` | `({ servername, protocols }) => protocol \| undefined`. Server-side, synchronous. Returning `undefined` refuses with `no_application_protocol`. Mutually exclusive with `ALPNProtocols` |
+| `grease` | Insert GREASE (RFC 8701) reserved values into the ClientHello, as browsers do (default `false`). Covers cipher suites, extension types, supported groups, signature algorithms, supported versions, ALPN, `psk_key_exchange_modes` and a dummy `key_share` entry. **Changes no fingerprint** — JA3 and JA4 both strip GREASE — but its *absence* reads as "not a browser". Any list you already GREASE'd by hand is left alone, so `grease: true` never collides with manual configuration. Safe against public HTTPS servers; leave off for DTLS/WebRTC peers until tested |
+| `permuteExtensions` | Shuffle ClientHello extension order per connection, as Chrome 110+ does (default `false`). Changes your **JA3** on every handshake; leaves your **JA4** byte-for-byte identical, since JA4 sorts before hashing. Order is chosen once and replayed on a post-HRR retry, per RFC 8446 §4.1.2 |
+| `socket.getFingerprints()` | `{ ja3, ja4, ja3s, ja4s, ja4x }` - every fingerprint of the connection. Client values (`ja3`/`ja4`) **and** server values (`ja3s`/`ja4s`) are populated in either role, since both hellos are visible to both peers. Each is `{ hash, raw }`, or `null` before its hello has been seen. `ja4x` is reserved and always `null` for now. Pass `{ protocol: 'q' }` when driving the session from QUIC |
+| `socket.getFinished()` / `getPeerFinished()` | The Finished verify_data, ours and the peer's — the `tls-unique` channel binding of RFC 5929. `undefined` before the handshake |
+| `socket.isSessionReused()` | Whether this connection resumed an earlier session (same value as the `isResumed` property; Node spells it as a method) |
+| `socket.address()` | `{ port, family, address }` of the underlying transport, `{}` when not connected |
+| `socket.getEphemeralKeyInfo()` | `{ type, name, size }` for the negotiated key agreement. `null` on a server socket, as in Node |
+| `socket.setKeyCert(context)` | Swap the certificate and key for this one connection. Takes a `createSecureContext()` result or a plain `{ key, cert }`. Pairs with `ALPNCallback`, where the protocol is known but `SNICallback` has already run |
+| `socket.getJA3()` | `{ hash, raw }` - shorthand for `getFingerprints().ja3` |
 | `socket.getSharedSecret()` | ECDHE shared secret (Buffer) |
 | `socket.getNegotiationResult()` | `{ version, cipher, group, sni, alpn, resumed, helloRetried, ... }` |
 | `socket.rekeySend()` | Refresh outgoing encryption keys (TLS 1.3) |
@@ -312,9 +380,13 @@ session.on('psk', (identity, callback) => {
   callback(psk ? { psk, cipher: 0x1301 } : null);
 });
 
-// JA3 fingerprinting (server)
+// Fingerprinting (server) — fires before the ServerHello is built, so this is
+// where you drop a connection without spending a full handshake on it.
 session.on('clienthello', (raw, parsed) => {
-  console.log(session.getJA3()); // { hash: 'abc...', raw: '769,47-53,...' }
+  const { ja4 } = session.getFingerprints();
+  console.log(ja4.hash);  // 't13d521100_b262b3658495_8e6e362c5eac'
+  // ja3s/ja4s are still null here — no ServerHello exists yet. Ask again
+  // later in the session and they will be populated.
 });
 ```
 
@@ -469,10 +541,21 @@ tls.createServer({
 socket.on('keylog', (line) => fs.appendFileSync('keys.log', line));
 // Wireshark: Edit → Preferences → TLS → Pre-Master-Secret log filename → keys.log
 
-// JA3 fingerprinting (server-side bot detection)
+// Fingerprinting — server-side bot detection
 server.on('secureConnection', (socket) => {
-  const ja3 = socket.getJA3();
-  console.log(ja3.hash); // 'e7d705a3286e19ea42f587b344ee6865'
+  const { ja3, ja4, ja4s } = socket.getFingerprints();
+  console.log(ja4.hash);   // 't13d1516h2_8daaf6152771_e5627ece308c' — the client
+  console.log(ja4.raw);    // unhashed form: shows which ciphers actually differ
+  console.log(ja4s.hash);  // 't130200_1301_a56c5b993250' — how WE look to them
+  console.log(ja3.hash);   // 2017 format, for anything already keyed on it
+});
+
+// Client side: the same call, and the same four values
+const socket = connect({ host: 'example.com', port: 443 });
+socket.on('secureConnect', () => {
+  const { ja4, ja4s } = socket.getFingerprints();
+  console.log(ja4.hash);   // how this library looks to the server
+  console.log(ja4s.hash);  // which server stack answered
 });
 
 // Full negotiation result

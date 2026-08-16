@@ -177,6 +177,13 @@ function connect(/* ...args */) {
     isServer: false,
     servername: options.servername || host,
     rejectUnauthorized: options.rejectUnauthorized,
+    checkServerIdentity: options.checkServerIdentity,
+    // Stream-shape options Node forwards to the socket. Both were dropped
+    // here, so allowHalfOpen could not be set through connect() at all.
+    allowHalfOpen: options.allowHalfOpen,
+    highWaterMark: options.highWaterMark,
+    secureContext: options.secureContext,
+    passphrase: options.passphrase,
     ca: options.ca,
     session: options.session,
     ALPNProtocols: options.ALPNProtocols,
@@ -199,9 +206,26 @@ function connect(/* ...args */) {
     socket.on('secureConnect', connectListener);
   }
 
-  let tcp = net.connect(port, host, function() {
+  let tcp = null;
+
+  if (options.socket) {
+    // Node: "Establish secure connection on a given socket rather than
+    // creating a new socket... If this option is specified, path, host, and
+    // port are ignored, except for certificate validation." Crucially it also
+    // says connection and teardown of that socket remain the caller's job and
+    // that tls.connect() will not call net.connect() at all — so we attach and
+    // nothing else. This is what STARTTLS needs: the caller speaks cleartext
+    // first (SMTP, IMAP, PostgreSQL), then upgrades the same connection.
+    //
+    // The socket is usually already connected, but it need not be; the
+    // handshake simply starts once it is writable.
+    tcp = options.socket;
     socket.setSocket(tcp);
-  });
+  } else {
+    tcp = net.connect(port, host, function() {
+      socket.setSocket(tcp);
+    });
+  }
 
   tcp.on('error', function(e) {
     socket.emit('error', e);
@@ -232,6 +256,14 @@ function Server(options, connectionListener) {
   let self = this;
   options = options || {};
 
+  // Node throws on this combination rather than picking one, and so do we: the
+  // two answer the same question by different means, and silently preferring
+  // either would leave a server running a policy its author did not write.
+  if (options.ALPNProtocols && options.ALPNCallback) {
+    throw new TypeError(
+      'The ALPNProtocols and ALPNCallback options are mutually exclusive');
+  }
+
   // Shared ticketKeys across all connections
   self._ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
 
@@ -251,10 +283,17 @@ function Server(options, connectionListener) {
     sessionIdContextHex = sidCtxBuf.toString('hex');
   }
 
-  // Pre-compiled default SecureContext if key+cert provided directly (no SNICallback)
+  // Pre-compiled default SecureContext.
+  //
+  // Node parity: a caller may hand us a context they built once with
+  // tls.createSecureContext() and reuse across servers, instead of paying to
+  // re-parse the same PEM on every construction. An explicit `secureContext`
+  // wins over key/cert — same precedence Node uses.
   let defaultCtx = null;
-  if (options.key && options.cert) {
-    defaultCtx = createSecureContext({ key: options.key, cert: options.cert });
+  if (options.secureContext) {
+    defaultCtx = options.secureContext;
+  } else if (options.key && options.cert) {
+    defaultCtx = createSecureContext(options);
   }
 
   // In-memory fallback session store for TLS 1.2 Session IDs.
@@ -273,6 +312,7 @@ function Server(options, connectionListener) {
       ticketKeys: self._ticketKeys,
       ticketLifetime: options.ticketLifetime,
       ALPNProtocols: options.ALPNProtocols,
+      ALPNCallback: options.ALPNCallback,
       minVersion: options.minVersion || DEFAULT_MIN_VERSION,
       maxVersion: options.maxVersion || DEFAULT_MAX_VERSION,
       signatureAlgorithms: options.signatureAlgorithms,
@@ -404,9 +444,9 @@ function Server(options, connectionListener) {
 
   // setSecureContext — replace cert/key without restart (Node.js compat)
   self.setSecureContext = function(opts) {
-    if (opts && opts.key && opts.cert) {
-      defaultCtx = createSecureContext({ key: opts.key, cert: opts.cert });
-    }
+    if (!opts) return;
+    if (opts.secureContext) { defaultCtx = opts.secureContext; return; }
+    if (opts.key && opts.cert) defaultCtx = createSecureContext(opts);
   };
 
   return self;
@@ -453,20 +493,14 @@ function addCompatMethods(socket) {
     if (typeof socket[name] !== 'function') socket[name] = fn;
   }
 
-  /** Node.js compat: isSessionReused() — method form (same as isResumed getter) */
-  def('isSessionReused', function() {
-    return socket.isResumed;
-  });
-
-  /** Node.js compat: getFinished() */
-  def('getFinished', function() {
-    return session.getFinished ? session.getFinished() : null;
-  });
-
-  /** Node.js compat: getPeerFinished() */
-  def('getPeerFinished', function() {
-    return session.getPeerFinished ? session.getPeerFinished() : null;
-  });
+  // isSessionReused, getFinished, getPeerFinished, getEphemeralKeyInfo and
+  // address now ship natively on TLSSocket, so their shims here were dead code
+  // that def() would never install — and they had drifted from Node in ways
+  // the native versions fix: getFinished returned null where Node documents
+  // undefined, and getEphemeralKeyInfo reported type 'X25519', which is not
+  // one of the three types Node defines ('DH', 'ECDH', 'TLSGroup'), and never
+  // returned null on a server socket. Two divergent implementations of one
+  // method is the duplication this layer exists to avoid, so they are gone.
 
   /** Node.js compat: exportKeyingMaterial(length, label, context).
    *  TLSSocket now ships this natively (RFC 5705 / RFC 8446 §7.5 via the
@@ -474,15 +508,6 @@ function addCompatMethods(socket) {
    *  null-until-ready convention as the native method. */
   def('exportKeyingMaterial', function(length, label, context) {
     return session.exportKeyingMaterial ? session.exportKeyingMaterial(length, label, context) : null;
-  });
-
-  /** Node.js compat: getEphemeralKeyInfo() */
-  def('getEphemeralKeyInfo', function() {
-    let group = session.context.selected_group;
-    if (group === 0x001d) return { type: 'X25519', size: 253 };
-    if (group === 0x0017) return { type: 'ECDH', name: 'prime256v1', size: 256 };
-    if (group === 0x0018) return { type: 'ECDH', name: 'secp384r1', size: 384 };
-    return {};
   });
 
   /** Node.js compat: setServername(name) */
@@ -493,11 +518,6 @@ function addCompatMethods(socket) {
   /** Node.js compat: disableRenegotiation() — no-op (renegotiation not supported) */
   def('disableRenegotiation', function() {});
 
-  /** Node.js compat: address() — delegates to underlying transport */
-  def('address', function() {
-    try { return session.context && session.context.transport ? session.context.transport.address() : {}; }
-    catch(e) { return {}; }
-  });
 }
 
 // ===================== Exports =====================

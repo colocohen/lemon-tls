@@ -129,6 +129,7 @@ const TLS_CIPHER_SUITES = {
     hash:         'sha256'
   },
   0xCCAA: { // TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    name: 'DHE-RSA-CHACHA20-POLY1305', standardName: 'TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
     tls:          12,
     kex:          'DHE_RSA',
     sig:          'RSA',
@@ -171,6 +172,7 @@ const TLS_CIPHER_SUITES = {
   // TLS 1.2 CBC (Legacy)
   // ----------------------
   0xC013: { // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+    name: 'ECDHE-RSA-AES128-SHA', standardName: 'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA',
     tls:    12,
     kex:    'ECDHE_RSA',
     sig:    'RSA',
@@ -183,6 +185,7 @@ const TLS_CIPHER_SUITES = {
     hash:   'sha256'
   },
   0xC014: { // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+    name: 'ECDHE-RSA-AES256-SHA', standardName: 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA',
     tls:    12,
     kex:    'ECDHE_RSA',
     sig:    'RSA',
@@ -195,6 +198,7 @@ const TLS_CIPHER_SUITES = {
     hash:   'sha256'
   },
   0x003C: { // TLS_RSA_WITH_AES_128_CBC_SHA256
+    name: 'AES128-SHA256', standardName: 'TLS_RSA_WITH_AES_128_CBC_SHA256',
     tls:    12,
     kex:    'RSA',
     sig:    'RSA',
@@ -207,6 +211,7 @@ const TLS_CIPHER_SUITES = {
     hash:   'sha256'
   },
   0x003D: { // TLS_RSA_WITH_AES_256_CBC_SHA256
+    name: 'AES256-SHA256', standardName: 'TLS_RSA_WITH_AES_256_CBC_SHA256',
     tls:    12,
     kex:    'RSA',
     sig:    'RSA',

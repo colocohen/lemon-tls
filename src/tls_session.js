@@ -36,7 +36,8 @@ import {
   concatUint8Arrays,
   arraysEqual,
   uint8Equal,
-  timingSafeEqualU8
+  timingSafeEqualU8,
+  parseDN,
 } from './utils.js';
 
 import * as wire from './wire.js';
@@ -169,6 +170,15 @@ function TLSSession(options){
     state: 'new', //new | negotiating | ...
     isServer: !!options.isServer,
     rejectUnauthorized: options.rejectUnauthorized !== false, // default true
+    // Node parity: replaces the default RFC 6125 identity check. Returns
+    // undefined to accept, an Error to reject. See validatePeerCertificate().
+    checkServerIdentity: typeof options.checkServerIdentity === 'function'
+      ? options.checkServerIdentity : null,
+    // Node parity: synchronous ALPN selector, server side. Receives
+    // { servername, protocols } and returns the chosen protocol, or undefined
+    // to refuse with no_application_protocol. Mutually exclusive with
+    // ALPNProtocols — compat.js rejects passing both, as Node does.
+    ALPNCallback: typeof options.ALPNCallback === 'function' ? options.ALPNCallback : null,
     ca: options.ca || null, // CA certificates (PEM strings or Buffers)
 
     SNICallback: options.SNICallback || null,
@@ -179,10 +189,46 @@ function TLSSession(options){
     // Advanced options
     maxHandshakeSize: options.maxHandshakeSize || 0, // 0 = no limit
     customExtensions: options.customExtensions || [], // [{type:0xNN, data:Uint8Array}]
+
+    // Shuffle ClientHello extension order (Chrome 110+ behaviour). Off by
+    // default: a fixed order keeps handshakes diffable against each other and
+    // avoids waking up middleboxes that ossified on one. See
+    // permute_extensions() for what this does and does not buy.
+    permuteExtensions: !!options.permuteExtensions,
+    // The order chosen for CH1, replayed on a post-HRR CH2.
+    extension_order: null,
+
+    // Insert GREASE (RFC 8701) reserved values into the ClientHello. Off by
+    // default: a peer that mishandles an unknown value fails the handshake
+    // with no clue as to why, and GREASE changes no fingerprint (both JA3 and
+    // JA4 strip it), so the cost of being wrong outweighs the benefit of being
+    // right. Safe and worth enabling against public HTTPS servers; leave off
+    // for DTLS/WebRTC peers until tested. See apply_grease().
+    grease: !!options.grease,
+    // The cipher-list GREASE value picked for CH1, reused on a post-HRR CH2.
+    grease_cipher: null,
     handshakeBytes: 0,
     handshakeStartTime: null,
     handshakeEndTime: null,
-    rawClientHello: null,  // saved for JA3/JA4 and 'clienthello' event
+    // Raw hello messages, stored regardless of role: whichever side sent it,
+    // both are visible to both peers, and every fingerprint below is computed
+    // from one of them. rawClientHello also backs the 'clienthello' event.
+    //
+    // ClientHello keeps the FIRST one seen — after a HelloRetryRequest the
+    // client sends a second, amended ClientHello, and the original offer is
+    // what a passive observer fingerprints. ServerHello keeps the LAST one,
+    // because HRR is itself encoded as a ServerHello and would otherwise
+    // shadow the real one.
+    rawClientHello: null,
+    rawServerHello: null,
+
+    // One cache slot per fingerprint rather than one for the whole set.
+    // getFingerprints() is legitimately called from the 'clienthello' handler,
+    // which fires before the ServerHello exists; caching the set as a unit
+    // there would freeze ja3s/ja4s at null for the life of the session.
+    parsedClientHello: null,   // null = not tried, false = threw, object = parsed
+    parsedServerHello: null,
+    fpCache: {},
 
     //local stuff...
     local_sni: options.servername || null,
@@ -320,6 +366,10 @@ function TLSSession(options){
     requestCert: !!options.requestCert,       // server: send CertificateRequest?
     clientCert: options.cert || null,          // client: cert to send if requested
     clientKey: options.key || null,            // client: private key for CertificateVerify
+    // Needed to decrypt an encrypted PEM key. createSecureContext() has always
+    // accepted this, but nothing forwarded it here, so an encrypted client key
+    // threw on parse no matter what the caller passed.
+    clientKeyPassphrase: options.passphrase || null,
     certificateRequested: false,              // client: server sent CertificateRequest?
     certificateRequestSent: false,            // server: we sent CertificateRequest?
     certificateRequestContext: null,
@@ -574,8 +624,205 @@ function TLSSession(options){
       extensions.push(context.local_extensions[i]);
     }
 
+    if (context.grease) apply_grease(extensions);
+    if (context.permuteExtensions) extensions = permute_extensions(extensions);
+
     note_offered_extensions(extensions);
     return extensions;
+  }
+
+  /* --------------------------------- GREASE -------------------------------- */
+
+  /** RFC 8701 §2: the sixteen two-byte reserved values. */
+  const GREASE_U16 = [
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
+    0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA
+  ];
+  /** RFC 8701 §2: psk_key_exchange_modes is a vector of SINGLE bytes and
+   *  therefore has its own, entirely separate reserved table. Reusing the u16
+   *  values here would emit a mode the registry does not reserve. */
+  const GREASE_U8 = [0x0B, 0x2A, 0x49, 0x68, 0x87, 0xA6, 0xC5, 0xE4];
+
+  function is_grease_u16(v) {
+    return typeof v === 'number' && (v & 0x0f0f) === 0x0a0a && ((v >>> 8) & 0xff) === (v & 0xff);
+  }
+  function is_grease_u8(v) { return GREASE_U8.indexOf(v) >= 0; }
+
+  function pick_from(table) {
+    return table[crypto.randomBytes(4).readUInt32BE(0) % table.length];
+  }
+
+  /**
+   * Insert GREASE (RFC 8701) into the ClientHello — opt-in via `grease`.
+   *
+   * The point is anti-ossification: a peer that cannot tolerate an unknown
+   * value in a list breaks immediately and visibly, instead of quietly
+   * calcifying the protocol until a real value is deployed years later.
+   *
+   * Note that this does NOT hide you. Both JA3 and JA4 strip GREASE before
+   * hashing, so every fingerprint is identical with this on or off. What
+   * changes is only that a ClientHello carrying zero GREASE reads as
+   * "not a browser" to anyone looking.
+   *
+   * COLLISION HANDLING — the reason this is not a blind push. A caller can
+   * already inject GREASE by hand through customExtensions, local_extensions,
+   * or the local_supported_* lists. Adding a second value on top of that would
+   * at best be redundant and at worst fatal: RFC 8446 §4.2 forbids two
+   * extensions of the same type outright, and this library's own parser
+   * rejects that with decode_error. So every list is inspected first, and a
+   * list that already carries a GREASE value is left exactly as it is. Manual
+   * configuration always wins.
+   */
+  function apply_grease(extensions) {
+    let byType = {};
+    for (let i = 0; i < extensions.length; i++) {
+      let t = extensions[i] && extensions[i].type;
+      if (t != null) byType[String(t)] = extensions[i];
+    }
+    let find = function (name, code) { return byType[name] || byType[String(code)] || null; };
+
+    // --- a GREASE extension type of its own ---
+    let hasGreaseExt = false;
+    for (let i = 0; i < extensions.length; i++) {
+      if (is_grease_u16(extensions[i] && extensions[i].type)) { hasGreaseExt = true; break; }
+    }
+    if (!hasGreaseExt) {
+      // Body length is deliberately varied: a peer that tolerates an unknown
+      // extension only when it is empty is still ossified.
+      let n = crypto.randomBytes(1)[0] % 3;
+      extensions.push({ type: pick_from(GREASE_U16), value: new Uint8Array(n) });
+    }
+
+    // --- value lists that take u16 entries ---
+    let u16Lists = [
+      ['SUPPORTED_GROUPS', 10], ['SIGNATURE_ALGORITHMS', 13], ['SUPPORTED_VERSIONS', 43]
+    ];
+    for (let i = 0; i < u16Lists.length; i++) {
+      let e = find(u16Lists[i][0], u16Lists[i][1]);
+      if (!e || !Array.isArray(e.value) || e.value.length === 0) continue;
+      if (e.value.some(is_grease_u16)) continue;              // caller already did it
+      e.value = [pick_from(GREASE_U16)].concat(e.value);
+    }
+
+    // --- psk_key_exchange_modes: single bytes, separate table ---
+    let pk = find('PSK_KEY_EXCHANGE_MODES', 45);
+    if (pk && Array.isArray(pk.value) && !pk.value.some(is_grease_u8)) {
+      pk.value = [pick_from(GREASE_U8)].concat(pk.value);
+    }
+
+    // --- ALPN: a two-BYTE protocol name, not a u16 ---
+    let alpn = find('ALPN', 16);
+    if (alpn && Array.isArray(alpn.value) && alpn.value.length > 0) {
+      let already = alpn.value.some(function (p) {
+        if (typeof p !== 'string' || p.length !== 2) return false;
+        return is_grease_u16((p.charCodeAt(0) << 8) | p.charCodeAt(1));
+      });
+      if (!already) {
+        let g = pick_from(GREASE_U16);
+        alpn.value = [String.fromCharCode((g >>> 8) & 0xff) + String.fromCharCode(g & 0xff)]
+                       .concat(alpn.value);
+      }
+    }
+
+    // --- key_share: a GREASE group carrying an arbitrary key ---
+    // This is the one that actually exercises a server: it must skip an entry
+    // whose group it does not recognise rather than try to parse the key.
+    let ks = find('KEY_SHARE', 51);
+    if (ks && Array.isArray(ks.value) && ks.value.length > 0) {
+      let already = ks.value.some(function (k) { return is_grease_u16(k && k.group); });
+      if (!already) {
+        // Prefer the group we just advertised, so the offer stays self-consistent.
+        let sg = find('SUPPORTED_GROUPS', 10);
+        let g = null;
+        if (sg && Array.isArray(sg.value)) {
+          for (let i = 0; i < sg.value.length; i++) {
+            if (is_grease_u16(sg.value[i])) { g = sg.value[i]; break; }
+          }
+        }
+        if (g === null) g = pick_from(GREASE_U16);
+        ks.value = [{ group: g, key_exchange: new Uint8Array(1) }].concat(ks.value);
+      }
+    }
+  }
+
+  /** GREASE for the cipher_suites list, applied at the build site because the
+   *  list is not part of the extension array. Same rule as everywhere else: a
+   *  caller-supplied GREASE value is left alone.
+   *
+   *  The chosen value is remembered, because CH1 and CH2 must be identical
+   *  across a HelloRetryRequest (RFC 8446 §4.1.2) — re-rolling on the retry
+   *  would change the offered cipher list and could be rejected. */
+  function grease_cipher_suites(list) {
+    if (!context.grease || !Array.isArray(list) || list.length === 0) return list;
+    if (list.some(is_grease_u16)) return list;
+    if (context.grease_cipher === null) context.grease_cipher = pick_from(GREASE_U16);
+    return [context.grease_cipher].concat(list);
+  }
+
+  /**
+   * Shuffle ClientHello extension order (opt-in via `permuteExtensions`).
+   *
+   * Chrome has done this since 110 as an anti-ossification measure: middleboxes
+   * that hardcode a fixed extension order break loudly rather than silently
+   * calcifying the protocol. It is a separate mechanism from GREASE (RFC 8701),
+   * which inserts reserved dummy VALUES; this reorders real extensions.
+   *
+   * What it actually changes, for anyone reaching for it as evasion: JA3 only.
+   * JA4 sorts extensions before hashing, so the JA4 fingerprint is byte-for-byte
+   * identical with this on or off. It defeats a 2017 fingerprint and nothing
+   * newer, and a client whose JA3 differs on every connection is itself a
+   * distinctive pattern — this is not a way to disappear.
+   *
+   * Two ordering rules are preserved:
+   *
+   *  - pre_shared_key MUST come last (RFC 8446 §4.2.11) — its binders are
+   *    computed over everything before it. It is appended after assembly, so it
+   *    is not in this array yet and cannot be displaced.
+   *
+   *  - CH1 and CH2 must stay identical across a HelloRetryRequest
+   *    (RFC 8446 §4.1.2), which lists the permitted changes and does not
+   *    include reordering. The permutation is therefore computed once per
+   *    session and replayed by type on the retry, rather than re-rolled — a
+   *    fresh shuffle on CH2 would be a spec violation that strict servers
+   *    could reject.
+   */
+  function permute_extensions(list) {
+    let key = function (e) { return String(e && e.type); };
+
+    // Replay the order chosen for CH1 rather than re-rolling.
+    if (context.extension_order !== null) {
+      let byType = {};
+      for (let i = 0; i < list.length; i++) {
+        let k = key(list[i]);
+        if (!byType[k]) byType[k] = [];
+        byType[k].push(list[i]);
+      }
+      let out = [];
+      for (let i = 0; i < context.extension_order.length; i++) {
+        let bucket = byType[context.extension_order[i]];
+        if (bucket && bucket.length > 0) out.push(bucket.shift());
+      }
+      // Anything CH2 added that CH1 never had (the HRR cookie) keeps its
+      // position at the end; dropping it would corrupt the retry.
+      for (let k in byType) {
+        if (Object.prototype.hasOwnProperty.call(byType, k)) {
+          for (let j = 0; j < byType[k].length; j++) out.push(byType[k][j]);
+        }
+      }
+      return out;
+    }
+
+    // Fisher-Yates over a copy, with a CSPRNG rather than Math.random: the
+    // order is observable on the wire, and a predictable shuffle would be a
+    // weaker signal than no shuffle at all.
+    let out = list.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+      let j = crypto.randomBytes(4).readUInt32BE(0) % (i + 1);
+      let tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+    }
+
+    context.extension_order = out.map(key);
+    return out;
   }
 
   /**
@@ -622,6 +869,16 @@ function TLSSession(options){
     for (let i = 0; i < message.extensions.length; i++) {
       let et = message.extensions[i] && message.extensions[i].type;
       if (typeof et !== 'number') continue;
+
+      // RFC 8701 §3.3 lets a SERVER advertise GREASE extensions of its own in
+      // EncryptedExtensions, CertificateRequest, Certificate and
+      // NewSessionTicket — the whole point being that we could not have asked
+      // for them. Testing those against offered_extension_types therefore
+      // rejects a peer that is behaving exactly as specified, which is the
+      // same class of over-strictness as the 1.2 regression noted above, only
+      // with us on the rejecting side this time.
+      if (is_grease_u16(et)) continue;
+
       if (context.offered_extension_types.indexOf(et) < 0) {
         fatalAlert(wire.TLS_ALERT.UNSUPPORTED_EXTENSION,
           where + ' carried extension ' + et + ' which we did not offer');
@@ -709,7 +966,7 @@ function TLSSession(options){
       random: context.local_random,
       session_id: context.local_session_id,
       cookie: context.dtls_cookie,
-      cipher_suites: context.local_supported_cipher_suites,
+      cipher_suites: grease_cipher_suites(context.local_supported_cipher_suites),
       cipher_suite: context.local_supported_cipher_suites,
       extensions: extensions,
     });
@@ -985,9 +1242,19 @@ function TLSSession(options){
 
       pushTranscript(data);
 
+      // Record the peer's hello for fingerprinting, whichever side we are.
+      // A client sees the ServerHello here; a server sees the ClientHello.
+      if (message.type === 'client_hello') {
+        if (context.rawClientHello === null) context.rawClientHello = data;
+      } else if (message.type === 'server_hello') {
+        context.rawServerHello = data;
+        context.parsedServerHello = null;   // HRR then real SH: re-parse
+        context.fpCache.ja3s = undefined;
+        context.fpCache.ja4s = undefined;
+      }
+
       // Save raw ClientHello + emit event (server side)
       if (context.isServer && message.type === 'client_hello') {
-        context.rawClientHello = data;
         // Make the peer's extensions readable INSIDE the 'clienthello'
         // handler (getRemoteExtension/getRemoteExtensions) — the main
         // set_context that stores them runs after this emit, and the
@@ -2666,17 +2933,68 @@ function TLSSession(options){
       }
 
       //select alpn...
-      if (context.selected_alpn == null && context.local_supported_alpns && context.remote_supported_alpns) {
-        // iterate local list by preference order
-        for (let a = 0; a < context.local_supported_alpns.length; a++) {
-          let cand = context.local_supported_alpns[a];
-          for (let b = 0; b < context.remote_supported_alpns.length; b++) {
-            if (context.remote_supported_alpns[b] === cand) {
-              params_to_set['selected_alpn'] = cand;
-              break;
+      //
+      // Two ways to choose, matching Node:
+      //
+      //   ALPNCallback  — synchronous, gets { servername, protocols } and
+      //                   returns the chosen protocol, or undefined to refuse.
+      //                   Lets the choice depend on SNI or anything else known
+      //                   at this point, which a fixed list cannot do.
+      //   ALPNProtocols — the static list; server preference order wins.
+      //
+      // RFC 7301 §3.2: if the client offered ALPN and no protocol is agreed,
+      // the server MUST abort with no_application_protocol(120). Falling
+      // through silently — which is what this did before — leaves the client
+      // believing ALPN was simply not supported, and it then speaks whatever
+      // it would have defaulted to. For a server that only serves h2 that is a
+      // protocol confusion, not a graceful degradation.
+      if (context.isServer && context.selected_alpn == null &&
+          Array.isArray(context.remote_supported_alpns) &&
+          context.remote_supported_alpns.length > 0) {
+
+        let chosen = null;
+        let refused = false;
+
+        if (typeof context.ALPNCallback === 'function') {
+          let picked;
+          try {
+            picked = context.ALPNCallback({
+              servername: context.remote_sni || null,
+              protocols: context.remote_supported_alpns.slice()
+            });
+          } catch (e) {
+            // A throwing selector refuses. Treating it as "no preference"
+            // would hand the peer a protocol the application rejected.
+            picked = undefined;
+          }
+          if (typeof picked === 'string' && picked.length > 0) {
+            // Only a protocol the client actually offered may be selected
+            // (RFC 7301 §3.2) — echoing anything else is unnegotiable.
+            if (context.remote_supported_alpns.indexOf(picked) >= 0) chosen = picked;
+            else refused = true;
+          } else {
+            refused = true;
+          }
+
+        } else if (context.local_supported_alpns && context.local_supported_alpns.length > 0) {
+          for (let a = 0; a < context.local_supported_alpns.length && chosen === null; a++) {
+            let cand = context.local_supported_alpns[a];
+            for (let b = 0; b < context.remote_supported_alpns.length; b++) {
+              if (context.remote_supported_alpns[b] === cand) { chosen = cand; break; }
             }
           }
-          if ('selected_alpn' in params_to_set==true && params_to_set.selected_alpn !== null) break;
+          if (chosen === null) refused = true;
+        }
+        // No callback and no configured list at all means this server does not
+        // do ALPN. That is not a failed negotiation, so no alert: stay silent
+        // and let the client fall back, as a pre-ALPN server would.
+
+        if (chosen !== null) {
+          params_to_set['selected_alpn'] = chosen;
+        } else if (refused) {
+          fatalAlert(wire.TLS_ALERT.NO_APPLICATION_PROTOCOL,
+            'no overlap between offered ALPN protocols and this server');
+          return;
         }
       }
 
@@ -3084,6 +3402,18 @@ function TLSSession(options){
 
 
             let message_data = build_tls_message(build_message_params);
+
+            // Our own hello counts too: on a server this is the ServerHello a
+            // client would fingerprint us by, so getFingerprints() reports the
+            // same four values in both roles.
+            if (build_message_params.type === 'server_hello') {
+              context.rawServerHello = message_data;
+              context.parsedServerHello = null;
+              context.fpCache.ja3s = undefined;
+              context.fpCache.ja4s = undefined;
+            } else if (build_message_params.type === 'client_hello' && context.rawClientHello === null) {
+              context.rawClientHello = message_data;
+            }
 
             pushTranscript(message_data);
 
@@ -3605,7 +3935,8 @@ function TLSSession(options){
 
         if(context.clientCert && context.clientKey){
           // Send client certificate
-          let certCtx = createSecureContext({ key: context.clientKey, cert: context.clientCert });
+          let certCtx = createSecureContext({ key: context.clientKey, cert: context.clientCert,
+                                              passphrase: context.clientKeyPassphrase });
           let cert_data = build_tls_message({
             type: 'certificate',
             version: wire.TLS_VERSION.TLS1_3,
@@ -4199,6 +4530,90 @@ function TLSSession(options){
     }
   }
 
+  /**
+   * The peer's leaf certificate shaped the way Node's checkServerIdentity
+   * expects: `subject` / `subjectaltname` as OpenSSL-formatted strings, plus
+   * the fingerprints an app needs to pin against.
+   *
+   * Deliberately the same shape TLSSocket#getPeerCertificate() returns, so a
+   * check written against one works against the other.
+   */
+  function peer_cert_for_identity() {
+    let chain = context.remote_cert_chain;
+    if (!chain || chain.length === 0) return null;
+    let der = chain[0].cert || chain[0];
+    try {
+      let x = new crypto.X509Certificate(der);
+      return {
+        subject: parseDN(x.subject),
+        issuer: parseDN(x.issuer),
+        subjectaltname: x.subjectAltName,
+        valid_from: x.validFrom,
+        valid_to: x.validTo,
+        fingerprint: x.fingerprint,
+        fingerprint256: x.fingerprint256,
+        serialNumber: x.serialNumber,
+        raw: der
+      };
+    } catch (e) {
+      return { raw: der };
+    }
+  }
+
+  /**
+   * RFC 6125 identity check, or the caller's replacement for it.
+   *
+   * Node semantics: `checkServerIdentity` REPLACES the built-in check rather
+   * than adding to it — returning undefined accepts, returning an Error
+   * rejects. That is what lets an app pin a fingerprint, or deliberately
+   * accept a name the default rules would refuse.
+   *
+   * The option was documented and exported but never read, so a caller who
+   * passed one got no error and no call: their check silently never ran while
+   * the connection reported itself verified.
+   *
+   * Returns true to continue, false when the caller should stop — the failure
+   * state is already recorded on context by then.
+   */
+  function checkIdentity(x509) {
+    if (context.isServer || !context.local_sni) return true;
+
+    if (typeof context.checkServerIdentity === 'function') {
+      let err;
+      try {
+        err = context.checkServerIdentity(context.local_sni, peer_cert_for_identity());
+      } catch (e) {
+        // A throwing check is a failed check. Swallowing it would authorize
+        // the peer on a bug in the caller's code.
+        err = e instanceof Error ? e : new Error(String(e));
+      }
+      if (err) {
+        context.authorizationError = err.message || 'ERR_TLS_CERT_ALTNAME_INVALID';
+        context.peerAuthorized = false;
+        return false;
+      }
+      return true;
+    }
+
+    // checkHost matches DNS names and ignores IP SANs entirely, so a
+    // connection to a literal address whose certificate carries the matching
+    // IP SAN was rejected. RFC 6066 says SNI carries host names only, but this
+    // field is populated from whatever the caller connected to, so an address
+    // does land here. X509Certificate exposes checkIP for exactly this.
+    let host = String(context.local_sni);
+    let isIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ||
+               (host.indexOf(':') >= 0 && /^[0-9a-fA-F:.\[\]]+$/.test(host));
+    let ok = isIp
+      ? !!x509.checkIP(host.replace(/^\[|\]$/g, ''))
+      : !!x509.checkHost(host);
+
+    if (!ok) {
+      context.authorizationError = 'ERR_TLS_CERT_ALTNAME_INVALID';
+      context.peerAuthorized = false;
+      return false;
+    }
+    return true;
+  }
 
   function validatePeerCertificate() {
     if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) {
@@ -4225,14 +4640,6 @@ function TLSSession(options){
         return;
       }
 
-      // Check hostname (client-side only, when SNI is set)
-      if (!context.isServer && context.local_sni) {
-        if (!x509.checkHost(context.local_sni)) {
-          context.authorizationError = 'ERR_TLS_CERT_ALTNAME_INVALID';
-          context.peerAuthorized = false;
-          return;
-        }
-      }
 
       // Verify the full chain against the configured trust anchors.
       //
@@ -4247,6 +4654,11 @@ function TLSSession(options){
       // See LEMON_TLS_INSECURE_NO_CA below.
       if (context.ca == null ||
           (Array.isArray(context.ca) && context.ca.length === 0)) {
+        // The identity check still runs here. It is the only check left, and
+        // skipping it would make "no CA configured" mean "no verification at
+        // all" — including any fingerprint pin the caller installed precisely
+        // because there is no CA to chain to.
+        if (!checkIdentity(x509)) return;
         context.peerAuthorized = true;
         context.authorizationError = null;
         context.certChainUnverified = true;   // no trust anchors were available
@@ -4260,6 +4672,17 @@ function TLSSession(options){
         context.peerAuthorized = false;
         return;
       }
+
+      // Identity comes LAST, after the chain verifies.
+      //
+      // Node documents checkServerIdentity as "only called if the certificate
+      // passed all other checks, such as being issued by a trusted CA". The
+      // order is not cosmetic: a hook that only compares a fingerprint and
+      // returns undefined would, if run first, authorize a peer whose chain
+      // never verified — the hook author reasonably assumes the CA check
+      // already happened. Running identity before the chain quietly turns
+      // every such pin into the ONLY check.
+      if (!checkIdentity(x509)) return;
 
       // All checks passed
       context.peerAuthorized = true;
@@ -4507,7 +4930,7 @@ function TLSSession(options){
           // builder actually reads; the singular key was silently ignored and
           // wire.js substituted its own hardcoded fallback list — the
           // configured cipher suites never reached the wire. Both names passed.
-          cipher_suites: context.local_supported_cipher_suites,
+          cipher_suites: grease_cipher_suites(context.local_supported_cipher_suites),
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -4577,7 +5000,7 @@ function TLSSession(options){
           // builder actually reads; the singular key was silently ignored and
           // wire.js substituted its own hardcoded fallback list — the
           // configured cipher suites never reached the wire. Both names passed.
-          cipher_suites: context.local_supported_cipher_suites,
+          cipher_suites: grease_cipher_suites(context.local_supported_cipher_suites),
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
@@ -4598,12 +5021,16 @@ function TLSSession(options){
           // builder actually reads; the singular key was silently ignored and
           // wire.js substituted its own hardcoded fallback list — the
           // configured cipher suites never reached the wire. Both names passed.
-          cipher_suites: context.local_supported_cipher_suites,
+          cipher_suites: grease_cipher_suites(context.local_supported_cipher_suites),
           cipher_suite: context.local_supported_cipher_suites,
           extensions: extensions
         };
         message_data = build_tls_message(build_message_params);
       }
+
+      // Client side: our own ClientHello is what a server fingerprints us by.
+      // First one wins — a post-HRR retry must not replace the original offer.
+      if (context.rawClientHello === null) context.rawClientHello = message_data;
 
       pushTranscript(message_data);
 
@@ -4617,6 +5044,358 @@ function TLSSession(options){
   }
 
   
+
+  /* ======================= ClientHello fingerprinting ======================= */
+
+  /**
+   * GREASE (RFC 8701) reserved values: both bytes equal, low nibble of each
+   * is 0xA — 0x0A0A, 0x1A1A ... 0xFAFA. Clients sprinkle these into ciphers,
+   * extensions, groups and signature schemes specifically so that peers who
+   * hardcode value lists break loudly. Every fingerprint below drops them:
+   * they are random per connection, so leaving one in makes the fingerprint
+   * change on every handshake from the same client.
+   *
+   * The narrower `(v & 0x0f0f) === 0x0a0a` test used before also matched
+   * non-GREASE values such as 0x1a2a, so it is not a safe stand-in.
+   */
+  function fp_is_grease(v) {
+    return (v & 0x0f0f) === 0x0a0a && ((v >>> 8) & 0xff) === (v & 0xff);
+  }
+
+  function fp_no_grease(list) {
+    let out = [];
+    if (!list) return out;
+    for (let i = 0; i < list.length; i++) {
+      if (!fp_is_grease(list[i])) out.push(list[i]);
+    }
+    return out;
+  }
+
+  function fp_hex4(v) {
+    let s = (v >>> 0).toString(16);
+    while (s.length < 4) s = '0' + s;
+    return s;
+  }
+
+  /**
+   * Parse a stored hello at most once. Failure is cached as `false` so a
+   * malformed message does not re-throw through the parser on every call.
+   * `which` is 'client' or 'server'.
+   */
+  function fp_parse(which) {
+    let rawKey = which === 'server' ? 'rawServerHello' : 'rawClientHello';
+    let cacheKey = which === 'server' ? 'parsedServerHello' : 'parsedClientHello';
+    if (context[cacheKey] === false) return null;
+    if (context[cacheKey] !== null) return context[cacheKey];
+    if (!context[rawKey]) return null;
+    try {
+      context[cacheKey] = parse_tls_message(context[rawKey]);
+    } catch (e) {
+      context[cacheKey] = false;
+      return null;
+    }
+    return context[cacheKey];
+  }
+
+  function fp_hello() { return fp_parse('client'); }
+  function fp_shello() { return fp_parse('server'); }
+
+  /**
+   * ec_point_formats (extension 11) — JA3's fifth field.
+   *
+   * parse_tls_message does not surface this one as a flat field (nothing in the
+   * handshake needs it), so read it off the raw extension body:
+   *   opaque ec_point_format_list<1..2^8-1>   — one length byte, then that many
+   *                                             one-byte format identifiers.
+   * Returns null when the extension is absent, which JA3 encodes as an empty
+   * field — NOT as "0". Substituting a default here silently produced a
+   * different hash from every other JA3 implementation for any client that
+   * omits the extension, which is most TLS 1.3-only clients.
+   */
+  function fp_ec_point_formats(hello) {
+    let exts = hello.extensions || [];
+    for (let i = 0; i < exts.length; i++) {
+      if (exts[i].type !== 11) continue;
+      let d = exts[i].data;
+      if (!d || d.length < 1) return [];
+      let n = d[0];
+      if (1 + n > d.length) return [];
+      let out = [];
+      for (let j = 0; j < n; j++) out.push(d[1 + j]);
+      return out;
+    }
+    return null;
+  }
+
+  /** Signature schemes in WIRE ORDER (JA4 deliberately does not sort these). */
+  function fp_sig_algs(hello) {
+    return fp_no_grease(hello.signature_algorithms || []);
+  }
+
+  /**
+   * JA4 version character pair. Read from supported_versions when the peer
+   * offered it, else from the ClientHello's legacy_version.
+   *
+   * DTLS versions are 1's complement (DTLS 1.0 = 0xFEFF, 1.2 = 0xFEFD,
+   * 1.3 = 0xFEFC), so "newest" is the numerically SMALLEST value — taking a
+   * max over a DTLS supported_versions list picks the oldest version offered.
+   */
+  function fp_version_string(hello, isDTLS) {
+    let ver = hello.legacy_version || 0x0303;
+    let offered = fp_no_grease(hello.supported_versions || []);
+    if (offered.length > 0) {
+      ver = offered[0];
+      for (let i = 1; i < offered.length; i++) {
+        if (isDTLS ? offered[i] < ver : offered[i] > ver) ver = offered[i];
+      }
+    }
+    let map = {
+      0x0304: '13', 0x0303: '12', 0x0302: '11', 0x0301: '10',
+      0x0300: 's3', 0x0200: 's2', 0x0100: 's1',
+      0xFEFF: 'd1', 0xFEFD: 'd2', 0xFEFC: 'd3'
+    };
+    return map[ver] || '00';
+  }
+
+  /**
+   * Raw bytes of the FIRST offered ALPN protocol, or null.
+   *
+   * Read off the wire rather than from hello.alpn, which the extension decoder
+   * produced with a UTF-8 TextDecoder: any protocol name carrying a byte >=0x80
+   * comes back with U+FFFD replacement characters, and the byte values JA4
+   * needs are gone by then.
+   *
+   *   ProtocolNameList: uint16 list_len, then { uint8 name_len, name bytes }*
+   */
+  function fp_first_alpn_bytes(hello) {
+    let exts = hello.extensions || [];
+    for (let i = 0; i < exts.length; i++) {
+      if (exts[i].type !== 0x0010) continue;
+      let d = exts[i].data;
+      if (!d || d.length < 3) return null;
+      let listLen = (d[0] << 8) | d[1];
+      if (listLen < 1 || 2 + listLen > d.length) return null;
+      let n = d[2];
+      if (n < 1 || 3 + n > d.length) return null;
+      return d.subarray(3, 3 + n);
+    }
+    return null;
+  }
+
+  /**
+   * JA4 ALPN pair: first and last byte of the first offered protocol.
+   *
+   * The FoxIO prose says an end byte outside ASCII alphanumeric falls back to
+   * the first and last characters of the value's HEX form. Both reference
+   * implementations — and the published test vectors — instead emit "99", and
+   * accept the whole printable ASCII range (0x20-0x7E) rather than just
+   * alphanumerics. Interop is the entire point of this fingerprint, so the
+   * behaviour below follows the implementations, not the prose.
+   *
+   * A one-byte protocol repeats that byte when it is alphanumeric, else "99".
+   * Absent or empty ALPN is "00".
+   */
+  function fp_alpn_pair(hello) {
+    let bytes = fp_first_alpn_bytes(hello);
+
+    if (!bytes || bytes.length === 0) {
+      // No ALPN extension on the wire — but a caller may have handed us a
+      // pre-parsed hello with only the decoded strings. Fall back to those.
+      let list = hello.alpn || [];
+      if (list.length === 0 || typeof list[0] !== 'string' || list[0].length === 0) return '00';
+      bytes = Buffer.from(list[0], 'latin1');
+    }
+
+    let isAlnum = function (b) {
+      return (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
+    };
+    let isPrintable = function (b) { return b >= 0x20 && b <= 0x7e; };
+
+    let f = bytes[0];
+    let l = bytes[bytes.length - 1];
+
+    if (bytes.length === 1) {
+      return isAlnum(f) ? (String.fromCharCode(f) + String.fromCharCode(f)) : '99';
+    }
+    if (isPrintable(f) && isPrintable(l)) {
+      return String.fromCharCode(f) + String.fromCharCode(l);
+    }
+    return '99';
+  }
+
+  /** Truncated SHA-256 over a comma-joined list. An empty list hashes to zeros
+   *  by convention rather than to the digest of the empty string. */
+  function fp_trunc_sha256(input) {
+    if (input === '') return '000000000000';
+    return crypto.createHash('sha256').update(input).digest('hex').substring(0, 12);
+  }
+
+  /* --------------------------- the four computations ---------------------- */
+
+  /** JA3 = md5(Version,Ciphers,Extensions,EllipticCurves,ECPointFormats) */
+  function fp_compute_ja3() {
+    let hello = fp_hello();
+    if (!hello) return null;
+    try {
+      let version = hello.legacy_version || 0x0303;
+      let ciphers = fp_no_grease(hello.cipher_suites || []).join('-');
+      let extensions = fp_no_grease((hello.extensions || []).map(function(e){ return e.type; })).join('-');
+      let curves = fp_no_grease(hello.supported_groups || []).join('-');
+      let pf = fp_ec_point_formats(hello);
+      let raw = [version, ciphers, extensions, curves, pf === null ? '' : pf.join('-')].join(',');
+      return { hash: crypto.createHash('md5').update(raw).digest('hex'), raw: raw };
+    } catch (e) { return null; }
+  }
+
+  /**
+   * JA3S = md5(Version,Cipher,Extensions)
+   *
+   * Three fields, not five: a ServerHello names ONE cipher rather than a list,
+   * and carries neither supported_groups nor ec_point_formats. Extensions stay
+   * in wire order, as in JA3.
+   */
+  function fp_compute_ja3s() {
+    let hello = fp_shello();
+    if (!hello) return null;
+    try {
+      let version = hello.legacy_version || 0x0303;
+      let cs = hello.cipher_suites || [];
+      let cipher = cs.length > 0 ? cs[0] : '';
+      let extensions = fp_no_grease((hello.extensions || []).map(function(e){ return e.type; })).join('-');
+      let raw = [version, cipher, extensions].join(',');
+      return { hash: crypto.createHash('md5').update(raw).digest('hex'), raw: raw };
+    } catch (e) { return null; }
+  }
+
+  /**
+   * JA4 — the client fingerprint:
+   *
+   *   t13d1516h2_8daaf6152771_e5627ece308c
+   *   │ │ │ │ │ │  │            └ sha256(sorted extensions [_ sigalgs])[:12]
+   *   │ │ │ │ │ │  └────────────── sha256(sorted ciphers)[:12]
+   *   │ │ │ │ │ └───────────────── first+last char of first ALPN ("00" if none)
+   *   │ │ │ │ └─────────────────── extension count (GREASE excluded, cap 99)
+   *   │ │ │ └───────────────────── cipher count (GREASE excluded, cap 99)
+   *   │ │ └─────────────────────── "d" if SNI present, "i" if not
+   *   │ └───────────────────────── TLS version (13/12/11/10/s3, d1/d2/d3)
+   *   └─────────────────────────── transport: t=TCP, d=DTLS, q=QUIC
+   *
+   * Ciphers and extensions are sorted before hashing, so a client that
+   * shuffles extension order per connection still produces a stable
+   * fingerprint — the main reason to prefer this over JA3. Signature
+   * algorithms are appended in WIRE ORDER, unsorted, which is what preserves
+   * uniqueness after that sort.
+   *
+   * SNI and ALPN are counted in the extension count but excluded from the
+   * hash, so the same client hitting different hostnames fingerprints alike.
+   */
+  function fp_compute_ja4(opts) {
+    let hello = fp_hello();
+    if (!hello) return null;
+    try {
+        let isDTLS = ((hello.legacy_version & 0xFF00) === 0xFE00) ||
+                     ((context.selected_version & 0xFF00) === 0xFE00);
+
+        let proto = (opts && opts.protocol) ? String(opts.protocol).charAt(0)
+                                            : (isDTLS ? 'd' : 't');
+
+        let verStr = fp_version_string(hello, isDTLS);
+
+        let allExts = (hello.extensions || []).map(function(e){ return e.type; });
+        let hasSNI  = allExts.indexOf(0x0000) >= 0;
+
+        let ciphers = fp_no_grease(hello.cipher_suites || []);
+        let exts    = fp_no_grease(allExts);
+
+        let pad2 = function(n){ n = Math.min(n, 99); return (n < 10 ? '0' : '') + n; };
+
+        let ja4_a = proto + verStr + (hasSNI ? 'd' : 'i') +
+                    pad2(ciphers.length) + pad2(exts.length) + fp_alpn_pair(hello);
+
+        // --- b: ciphers, sorted ---
+        let cipherList = ciphers.map(fp_hex4).sort().join(',');
+
+        // --- c: extensions minus SNI(0) and ALPN(16), sorted, then sigalgs ---
+        let extList = exts
+          .filter(function(t){ return t !== 0x0000 && t !== 0x0010; })
+          .map(fp_hex4).sort().join(',');
+
+        let sigList = fp_sig_algs(hello).map(fp_hex4).join(',');
+        let cInput  = sigList ? (extList + '_' + sigList) : extList;
+
+        return {
+          hash: ja4_a + '_' + fp_trunc_sha256(cipherList) + '_' + fp_trunc_sha256(cInput),
+          raw:  ja4_a + '_' + cipherList + '_' + extList + '_' + sigList
+        };
+      } catch (e) { return null; }
+  }
+
+  /**
+   * JA4S — the server-side counterpart of JA4:
+   *
+   *   t130200_1301_a56c5b993250
+   *   │ │ │ │  │    └ sha256(extensions in WIRE ORDER)[:12]
+   *   │ │ │ │  └────── the chosen cipher, printed raw — one value, nothing to hash
+   *   │ │ │ └───────── ALPN pair of the selected protocol
+   *   │ │ └─────────── extension count
+   *   │ └───────────── TLS version
+   *   └─────────────── transport
+   *
+   * Two deliberate differences from JA4. There is no SNI character, because a
+   * server never sends one. And extensions are NOT sorted: sorting exists in
+   * JA4 to defeat clients that shuffle extension order per connection, which
+   * servers do not do — so here the order is signal worth keeping rather than
+   * noise worth removing.
+   */
+  function fp_compute_ja4s(opts) {
+    let hello = fp_shello();
+    if (!hello) return null;
+    try {
+      let isDTLS = ((hello.legacy_version & 0xFF00) === 0xFE00) ||
+                   ((context.selected_version & 0xFF00) === 0xFE00);
+      let proto = (opts && opts.protocol) ? String(opts.protocol).charAt(0)
+                                          : (isDTLS ? 'd' : 't');
+
+      // Extensions here are NOT GREASE-filtered, unlike every list in JA4.
+      // The reference implementations filter GREASE only out of the server's
+      // supported_versions, and pass the extension list through untouched;
+      // filtering it produced a different hash from every other tool on the
+      // one vector where a server echoed a GREASE extension. Servers do not
+      // normally emit GREASE at all, so this is a rare path — but a wrong
+      // fingerprint on a rare path is exactly what breaks a threat hunt.
+      let exts = (hello.extensions || []).map(function(e){ return e.type; });
+      let pad2 = function(n){ n = Math.min(n, 99); return (n < 10 ? '0' : '') + n; };
+
+      let cs = hello.cipher_suites || [];
+      let cipher = cs.length > 0 ? fp_hex4(cs[0]) : '0000';
+
+      let a = proto + fp_version_string(hello, isDTLS) + pad2(exts.length) + fp_alpn_pair(hello);
+      let extList = exts.map(fp_hex4).join(',');
+
+      return {
+        hash: a + '_' + cipher + '_' + fp_trunc_sha256(extList),
+        raw:  a + '_' + cipher + '_' + extList
+      };
+    } catch (e) { return null; }
+  }
+
+  /**
+   * Cached fingerprint accessor. Each value is computed the first time it is
+   * asked for AND its underlying hello exists; until then the slot stays
+   * `undefined` and is retried on the next call. That is what lets
+   * getFingerprints() be called from the 'clienthello' handler — before any
+   * ServerHello exists — without freezing ja3s/ja4s at null forever.
+   */
+  function fp_get(name, opts) {
+    if (context.fpCache[name] !== undefined) return context.fpCache[name];
+    let v = null;
+    if (name === 'ja3')  v = fp_compute_ja3();
+    else if (name === 'ja3s') v = fp_compute_ja3s();
+    else if (name === 'ja4')  v = fp_compute_ja4(opts);
+    else if (name === 'ja4s') v = fp_compute_ja4s(opts);
+    if (v !== null) context.fpCache[name] = v;
+    return v;
+  }
 
   let api = {
     /**
@@ -4689,6 +5468,36 @@ function TLSSession(options){
     /** Returns the remote certificate chain, or null. */
     getPeerCertificate: function(){
       return context.remote_cert_chain || null;
+    },
+
+    /**
+     * Replace the certificate and private key this connection will present.
+     *
+     * Node parity with tlsSocket.setKeyCert(context), whose stated purpose is
+     * selecting a server certificate from inside ALPNCallback: the chosen
+     * protocol is known there, but SNICallback has already run, so this is the
+     * only place left to swap credentials for that one connection.
+     *
+     * Accepts either a context from createSecureContext() or a plain
+     * { key, cert, passphrase } that will be compiled here.
+     *
+     * Assigns directly rather than through set_context, matching the
+     * SNICallback path above: both seed inputs ahead of the single set_context
+     * that actually runs the reactive loop, and routing through it here would
+     * run that loop a second time on a half-populated hello.
+     *
+     * Only meaningful before our Certificate message goes out; afterwards the
+     * peer already has the old chain and swapping is a no-op on the wire.
+     */
+    setKeyCert: function(ctxOrOpts){
+      if (!ctxOrOpts) return;
+      let sc = ctxOrOpts;
+      if (!sc.certificateChain || !sc.privateKey) {
+        if (!ctxOrOpts.key || !ctxOrOpts.cert) return;
+        sc = createSecureContext(ctxOrOpts);
+      }
+      if (sc.certificateChain) context.local_cert_chain = sc.certificateChain;
+      if (sc.privateKey)       context.cert_private_key = sc.privateKey;
     },
 
     /** Whether the peer certificate passed validation. */
@@ -4857,26 +5666,45 @@ function TLSSession(options){
       };
     },
 
-    /** Compute JA3 fingerprint from the ClientHello (server-side only).
-     *  Returns { hash, raw } or null if no ClientHello available.
-     *  JA3 = md5(SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats)
+    /**
+     * Every fingerprint this session can produce, in one object.
+     *
+     * All five keys are always present. In BOTH roles the ClientHello and the
+     * ServerHello of the connection are visible — one you sent, one you
+     * received — so ja3/ja4 (the client) and ja3s/ja4s (the server) are
+     * populated either way. Which one describes you depends on `isServer`.
+     *
+     *   ja3   client, 2017 format   md5 over the ClientHello
+     *   ja4   client, 2023 format   stable under extension-order shuffling
+     *   ja3s  server, 2017 format   md5 over the ServerHello
+     *   ja4s  server, 2023 format
+     *   ja4x  certificate           not implemented yet, always null
+     *
+     * Each value is { hash, raw } once its hello has been seen, and null
+     * before that. Values are computed on first request and cached
+     * individually, so calling this from the 'clienthello' handler — which
+     * fires before any ServerHello exists — still returns live ja3s/ja4s
+     * later in the same session.
+     *
+     * `opts.protocol` overrides the transport character for callers driving
+     * this session from a transport it cannot observe (QUIC -> 'q').
      */
-    getJA3: function(){
-      if (!context.rawClientHello) return null;
-      try {
-        let hello = parse_tls_message(context.rawClientHello);
-
-        let version = hello.client_version || 0x0303;
-        let ciphers = (hello.cipher_suites || []).filter(c => (c & 0x0F0F) !== 0x0A0A).join('-');
-        let extensions = (hello.extensions || []).map(e => e.type).filter(t => t !== 0x0A0A).join('-');
-        let curves = (hello.supported_groups || []).filter(g => (g & 0x0F0F) !== 0x0A0A).join('-');
-        let pointFormats = (hello.ec_point_formats || [0]).join('-');
-
-        let raw = [version, ciphers, extensions, curves, pointFormats].join(',');
-        let hash = crypto.createHash('md5').update(raw).digest('hex');
-        return { hash, raw };
-      } catch(e) { return null; }
+    getFingerprints: function(opts){
+      return {
+        ja3:  fp_get('ja3',  opts),
+        ja4:  fp_get('ja4',  opts),
+        ja3s: fp_get('ja3s', opts),
+        ja4s: fp_get('ja4s', opts),
+        // JA4X fingerprints the peer's X.509 certificate, which survives an IP
+        // or port change. Wiring it up needs ASN.1 parsing of the issuer and
+        // subject RDNs; the key is reserved so consumers can read it today.
+        ja4x: null
+      };
     },
+
+    /** JA3 fingerprint of the connection's ClientHello. Shorthand for
+     *  getFingerprints().ja3 — kept because it predates the combined call. */
+    getJA3: function(){ return fp_get('ja3'); },
 
     /** Request a TLS 1.3 Key Update. requestPeer=true means ask the other side to update too. */
     requestKeyUpdate: function(requestPeer){

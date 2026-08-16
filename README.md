@@ -11,15 +11,10 @@
   <a href="https://www.npmjs.com/package/lemon-tls">
     <img src="https://img.shields.io/npm/v/lemon-tls?color=blue" alt="npm">
   </a>
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="status">
   <img src="https://img.shields.io/github/license/colocohen/lemon-tls?color=brightgreen" alt="license">
 </p>
 
 ---
-
-> **⚠️ Project status: *Active development*.**
-> APIs may change without notice until we reach v1.0.
-> Use at your own risk and please report issues!
 
 ## ✨ Features
 

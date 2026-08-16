@@ -60,17 +60,28 @@ function makeX509FromDerOrPem(buf) {
 }
 
 function makePrivateKeyFromDerOrPem(buf, passphrase) {
+  // node:crypto rejects an explicit `passphrase: null` with ERR_INVALID_ARG_VALUE
+  // — for an unencrypted key the property must be ABSENT, not present-and-null.
+  // Callers that forward an optional option straight through would otherwise
+  // break every unencrypted key, which is the overwhelmingly common case.
+  let pass = (passphrase === null || passphrase === undefined) ? undefined : passphrase;
+
   if (isPEM(buf)) {
-    return crypto.createPrivateKey({ key: buf, format: 'pem', passphrase: passphrase });
+    let opts = { key: buf, format: 'pem' };
+    if (pass !== undefined) opts.passphrase = pass;
+    return crypto.createPrivateKey(opts);
   } else {
     let der = Buffer.from(buf), keyObj = null;
     try {
-      keyObj = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8', passphrase: passphrase });
+      keyObj = crypto.createPrivateKey(Object.assign({ key: der, format: 'der', type: 'pkcs8' },
+                                        pass !== undefined ? { passphrase: pass } : {}));
     } catch (e1) {
       try {
-        keyObj = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs1', passphrase: passphrase });
+        keyObj = crypto.createPrivateKey(Object.assign({ key: der, format: 'der', type: 'pkcs1' },
+                                        pass !== undefined ? { passphrase: pass } : {}));
       } catch (e2) {
-        keyObj = crypto.createPrivateKey({ key: der, format: 'der', type: 'sec1', passphrase: passphrase });
+        keyObj = crypto.createPrivateKey(Object.assign({ key: der, format: 'der', type: 'sec1' },
+                                        pass !== undefined ? { passphrase: pass } : {}));
       }
     }
     return keyObj;

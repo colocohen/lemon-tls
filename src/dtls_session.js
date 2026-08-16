@@ -195,6 +195,10 @@ function DTLSSession(options) {
     SNICallback: options.SNICallback,
     rejectUnauthorized: options.rejectUnauthorized,
     checkServerIdentity: options.checkServerIdentity,
+    // DTLS peers in WebRTC present self-signed certificates by design and are
+    // authenticated by the SDP fingerprint, not by a CA chain. Falling back to
+    // the platform trust store here would mark every such peer unauthorized.
+    useDefaultCA: options.useDefaultCA === true,
     ca: options.ca,
     noTickets: options.noTickets,
     requestCert: options.requestCert,

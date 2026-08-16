@@ -6,6 +6,7 @@
  */
 
 import net from 'node:net';
+import nodeTls from 'node:tls';   // for the shipped CA bundle only
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { TLS_CIPHER_SUITES } from './crypto.js';
@@ -42,6 +43,46 @@ function getCiphers() {
     if (info.name) out.push(info.name.toLowerCase());
   }
   return out;
+}
+
+/* ===================== Default CA store ===================== */
+
+/**
+ * The trust anchors Node ships (Mozilla's CA bundle). Exposed under the same
+ * name Node uses so `tls.rootCertificates` works unchanged, and so this
+ * library has a real default to chain against.
+ *
+ * That default matters more than parity. Until now, "no `ca` configured" meant
+ * "authorize every certificate", while `rejectUnauthorized` defaulted to true
+ * — the connection reported itself verified without ever verifying anything.
+ * Node never behaved that way: it falls back to this bundle.
+ *
+ * Parsing all ~144 certificates costs a few tens of milliseconds, so it is
+ * done once, lazily, and only if something actually needs it.
+ */
+let _rootPems = null;
+function getRootCertificates() {
+  if (_rootPems === null) {
+    try { _rootPems = nodeTls.rootCertificates.slice(); }
+    catch (e) { _rootPems = []; }   // a build without the bundle
+  }
+  return _rootPems;
+}
+
+/** Node-compat: tls.getCACertificates([type]). 'default' and 'bundled' both
+ *  resolve to the shipped bundle; 'extra' and 'system' are not sourced here
+ *  and return empty rather than pretending. */
+function getCACertificates(type) {
+  let t = type || 'default';
+  if (t === 'default' || t === 'bundled') return getRootCertificates().slice();
+  return [];
+}
+
+/** Node-compat: tls.setDefaultCACertificates(certs). Replaces the bundle for
+ *  every subsequent connection that does not pass its own `ca`. */
+function setDefaultCACertificates(certs) {
+  if (!Array.isArray(certs)) throw new TypeError('certs must be an array');
+  _rootPems = certs.slice();
 }
 
 // ===================== tls.checkServerIdentity() =====================
@@ -185,6 +226,8 @@ function connect(/* ...args */) {
     secureContext: options.secureContext,
     passphrase: options.passphrase,
     ca: options.ca,
+    useDefaultCA: options.useDefaultCA,
+    defaultCA: getRootCertificates,
     session: options.session,
     ALPNProtocols: options.ALPNProtocols,
     minVersion: options.minVersion,
@@ -289,6 +332,17 @@ function Server(options, connectionListener) {
   // tls.createSecureContext() and reuse across servers, instead of paying to
   // re-parse the same PEM on every construction. An explicit `secureContext`
   // wins over key/cert — same precedence Node uses.
+  // SNI contexts registered through addContext(). Each is compiled ONCE here
+  // and handed out by reference, which is the whole point: a hand-written
+  // SNICallback that calls createSecureContext() per connection re-parses the
+  // same PEM every time, and if it reads the files inside the callback it also
+  // does disk I/O on the handshake path.
+  //
+  // Node's matching rule: last registration wins on a tie, and an exact
+  // hostname beats a wildcard. Insertion order is preserved, so a later
+  // addContext() for the same pattern replaces the earlier one in place.
+  let sniContexts = [];   // [{ pattern, re, ctx }]
+
   let defaultCtx = null;
   if (options.secureContext) {
     defaultCtx = options.secureContext;
@@ -337,17 +391,24 @@ function Server(options, connectionListener) {
     };
 
     if (options.SNICallback) {
+      // An explicit callback wins outright — it may do things the registry
+      // cannot, such as fetching a certificate on demand.
       socketOpts.SNICallback = options.SNICallback;
-    } else if (defaultCtx) {
+    } else if (defaultCtx || sniContexts.length > 0) {
       socketOpts.SNICallback = function(servername, cb) {
-        cb(null, defaultCtx);
+        cb(null, contextForServername(servername));
       };
     }
 
     return socketOpts;
   }
 
-  self._tcpServer = net.createServer(function(tcp) {
+  function acceptConnection(tcp) {
+    // Node: "emitted when a new TCP stream is established, before the TLS
+    // handshake begins... can also be explicitly emitted by users to inject
+    // connections into the TLS server. In that case, any Duplex stream can be
+    // passed." Emitting first is what makes that injection path work.
+    self.emit('connection', tcp);
     let socket;
     try {
       socket = new TLSSocket(tcp, buildSocketOpts());
@@ -408,7 +469,23 @@ function Server(options, connectionListener) {
         self.emit('tlsClientError', err, socket);
       }
     });
-  });
+  }
+
+  self._tcpServer = net.createServer(acceptConnection);
+
+  /**
+   * Node documents 'connection' as injectable: emitting it by hand feeds an
+   * arbitrary Duplex into the TLS server. That cannot be done by listening for
+   * our own event — acceptConnection emits it, so the listener would re-enter
+   * on every real connection and loop. A method is the honest shape.
+   */
+  self.injectConnection = function(stream) {
+    if (!stream || typeof stream.write !== 'function') {
+      throw new TypeError('injectConnection requires a Duplex stream');
+    }
+    acceptConnection(stream);
+    return self;
+  };
 
   // Delegate net.Server methods
   self.listen = function() {
@@ -448,6 +525,66 @@ function Server(options, connectionListener) {
     if (opts.secureContext) { defaultCtx = opts.secureContext; return; }
     if (opts.key && opts.cert) defaultCtx = createSecureContext(opts);
   };
+
+  /**
+   * Node-compat: addContext(hostname, context)
+   *
+   * Register a certificate for an SNI host name or wildcard. `context` is
+   * either a compiled context from createSecureContext() or the plain
+   * { key, cert, ... } options to compile from — Node accepts both.
+   *
+   * The declarative alternative to writing an SNICallback by hand. It matters
+   * for more than tidiness: the common hand-rolled callback compiles a context
+   * per connection, and often reads the cert off disk inside it. Here every
+   * context is compiled once at registration and served by reference.
+   */
+  self.addContext = function(hostname, context) {
+    if (!hostname) throw new TypeError('addContext requires a hostname');
+    let ctx = context;
+    if (!ctx || (!ctx.certificateChain && !ctx.privateKey)) {
+      if (!context || !context.key || !context.cert) {
+        throw new TypeError('addContext requires a SecureContext or { key, cert }');
+      }
+      ctx = createSecureContext(context);
+    }
+    let pattern = String(hostname).toLowerCase();
+    let entry = { pattern: pattern, re: sniPatternToRegExp(pattern), ctx: ctx };
+
+    // Replace in place rather than appending a duplicate, so re-registering a
+    // host swaps its certificate without leaving the old one shadowing it.
+    let i = sniContexts.findIndex(function(e){ return e.pattern === pattern; });
+    if (i >= 0) sniContexts[i] = entry;
+    else sniContexts.push(entry);
+    return self;
+  };
+
+  /**
+   * Wildcards match ONE label and only as the leftmost one, per RFC 6125:
+   * `*.example.com` covers `a.example.com` but neither `a.b.example.com` nor
+   * the bare `example.com`. A bare `*` matches any single-or-multi label name
+   * and is the documented catch-all.
+   */
+  function sniPatternToRegExp(pattern) {
+    if (pattern === '*') return /^.+$/;
+    let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp('^' + esc.replace(/\*/g, '[^.]+') + '$');
+  }
+
+  /**
+   * Resolve a servername to a context. Exact matches beat wildcards; among
+   * equals the most recently added wins, which is what Node documents.
+   */
+  function contextForServername(servername) {
+    if (!servername) return defaultCtx;
+    let name = String(servername).toLowerCase();
+    for (let i = sniContexts.length - 1; i >= 0; i--) {
+      if (sniContexts[i].pattern === name) return sniContexts[i].ctx;
+    }
+    for (let i = sniContexts.length - 1; i >= 0; i--) {
+      if (sniContexts[i].re.test(name)) return sniContexts[i].ctx;
+    }
+    return defaultCtx;
+  }
 
   return self;
 }
@@ -530,6 +667,8 @@ export {
   getCiphers,
   checkServerIdentity,
   addCompatMethods,
+  getCACertificates,
+  setDefaultCACertificates,
   DEFAULT_MIN_VERSION,
   DEFAULT_MAX_VERSION,
   DEFAULT_CIPHERS,

@@ -140,6 +140,9 @@ tls.getCiphers()                                   // ['tls_aes_128_gcm_sha256',
 tls.DEFAULT_MIN_VERSION                            // 'TLSv1.2'
 tls.DEFAULT_MAX_VERSION                            // 'TLSv1.3'
 tls.DEFAULT_CIPHERS                                // 'TLS_AES_256_GCM_SHA384:...'
+tls.rootCertificates                               // the shipped CA bundle (~144 PEMs)
+tls.getCACertificates('default')                   // same, as a copy
+tls.setDefaultCACertificates([...])                // replace it for later connections
 tls.DEFAULT_ECDH_CURVE                             // 'auto'
 ```
 
@@ -312,6 +315,7 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `socket.session` | Access the underlying `TLSSession` (low-level state machine) |
 | `socket.isResumed` | Alias for `isSessionReused()` |
 | `socket.handshakeDuration` | Handshake time in ms |
+| `useDefaultCA` | When no `ca` is given, chain against the platform trust store instead of authorizing everything (default `true`). **Breaking change**: a self-signed or private-CA peer that previously connected with no `ca` configured now fails with `UNABLE_TO_GET_ISSUER_CERT`. That is the point — the old behaviour reported a connection as verified while verifying nothing, with `rejectUnauthorized` defaulting to true. Set `false` to opt back out explicitly. DTLS defaults to `false`, since WebRTC peers are self-signed by design and authenticated by SDP fingerprint |
 | `allowHalfOpen` | When `false` (the Node default, and now ours) the writable side ends automatically once the peer stops writing. This was hardcoded `true`, the opposite of Node — code expecting the documented behaviour was left holding connections open |
 | `checkServerIdentity(hostname, cert)` | Replaces the built-in RFC 6125 identity check. Return `undefined` to accept, an `Error` to reject. Runs **after** chain verification, as Node documents — a hook that only checks a pin cannot rescue a chain that failed |
 | `socket` | Run the handshake over an existing `Duplex` instead of dialling out. `host`/`port` are then ignored and nothing is connected for you, so the caller can speak cleartext first and upgrade — STARTTLS for SMTP, IMAP, PostgreSQL |
@@ -324,6 +328,8 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `socket.isSessionReused()` | Whether this connection resumed an earlier session (same value as the `isResumed` property; Node spells it as a method) |
 | `socket.address()` | `{ port, family, address }` of the underlying transport, `{}` when not connected |
 | `socket.getEphemeralKeyInfo()` | `{ type, name, size }` for the negotiated key agreement. `null` on a server socket, as in Node |
+| `server.injectConnection(stream)` | Feed an arbitrary `Duplex` into the server as if it had just connected. Node does this by emitting `'connection'` by hand; here it is a method, because the server emits that event itself and a self-listener would re-enter on every real connection |
+| `server.addContext(host, ctx)` | Register a certificate for an SNI host or wildcard (`'*.example.com'`, or `'*'` as catch-all). Takes a `createSecureContext()` result or plain `{ key, cert }`. Exact matches beat wildcards; re-registering a host replaces it. Each context is compiled **once** — the hand-written `SNICallback` equivalent usually recompiles per connection, and often reads the cert off disk on the handshake path |
 | `socket.setKeyCert(context)` | Swap the certificate and key for this one connection. Takes a `createSecureContext()` result or a plain `{ key, cert }`. Pairs with `ALPNCallback`, where the protocol is known but `SNICallback` has already run |
 | `socket.getJA3()` | `{ hash, raw }` - shorthand for `getFingerprints().ja3` |
 | `socket.getSharedSecret()` | ECDHE shared secret (Buffer) |

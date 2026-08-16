@@ -174,6 +174,12 @@ function TLSSession(options){
     // undefined to accept, an Error to reject. See validatePeerCertificate().
     checkServerIdentity: typeof options.checkServerIdentity === 'function'
       ? options.checkServerIdentity : null,
+    // When no `ca` is configured, chain against the platform trust store
+    // instead of authorizing everything. Opt out with useDefaultCA:false —
+    // DTLS does exactly that, since WebRTC peers are self-signed by design
+    // and authenticated out of band via the SDP fingerprint.
+    useDefaultCA: options.useDefaultCA !== false,
+    defaultCA: typeof options.defaultCA === 'function' ? options.defaultCA : null,
     // Node parity: synchronous ALPN selector, server side. Receives
     // { servername, protocols } and returns the chosen protocol, or undefined
     // to refuse with no_application_protocol. Mutually exclusive with
@@ -3935,8 +3941,11 @@ function TLSSession(options){
 
         if(context.clientCert && context.clientKey){
           // Send client certificate
-          let certCtx = createSecureContext({ key: context.clientKey, cert: context.clientCert,
-                                              passphrase: context.clientKeyPassphrase });
+          // Only include passphrase when there is one — node:crypto treats an
+          // explicit null as an error rather than as "no passphrase".
+          let certOpts = { key: context.clientKey, cert: context.clientCert };
+          if (context.clientKeyPassphrase) certOpts.passphrase = context.clientKeyPassphrase;
+          let certCtx = createSecureContext(certOpts);
           let cert_data = build_tls_message({
             type: 'certificate',
             version: wire.TLS_VERSION.TLS1_3,
@@ -4652,8 +4661,22 @@ function TLSSession(options){
       // and sets rejectUnauthorized:false) may rely on it — but it is now
       // explicit, recorded in authorizationError, and trivial to flip.
       // See LEMON_TLS_INSECURE_NO_CA below.
-      if (context.ca == null ||
-          (Array.isArray(context.ca) && context.ca.length === 0)) {
+      // Resolve trust anchors: explicit `ca` first, then the platform store.
+      //
+      // This is the fix for the branch below. Previously an absent `ca` meant
+      // "authorize everything" while rejectUnauthorized defaulted to true, so
+      // a plain-TLS caller who configured nothing got a connection that
+      // reported itself verified and was not. Node has always fallen back to
+      // its bundled roots; now so do we.
+      let anchors = context.ca;
+      if ((anchors == null || (Array.isArray(anchors) && anchors.length === 0)) &&
+          context.useDefaultCA && context.defaultCA) {
+        let roots = context.defaultCA();
+        if (roots && roots.length > 0) anchors = roots;
+      }
+
+      if (anchors == null ||
+          (Array.isArray(anchors) && anchors.length === 0)) {
         // The identity check still runs here. It is the only check left, and
         // skipping it would make "no CA configured" mean "no verification at
         // all" — including any fingerprint pin the caller installed precisely
@@ -4665,7 +4688,7 @@ function TLSSession(options){
         return;
       }
 
-      let cas = Array.isArray(context.ca) ? context.ca : [context.ca];
+      let cas = Array.isArray(anchors) ? anchors : [anchors];
       let chainResult = verify_cert_chain(context.remote_cert_chain, cas, now);
       if (!chainResult.ok) {
         context.authorizationError = chainResult.error;

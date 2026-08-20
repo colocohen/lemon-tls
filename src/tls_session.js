@@ -413,6 +413,19 @@ function TLSSession(options){
     tls12_session_id_emitted: false,        // 'newSession' event already fired
     tls12_client_session_emitted: false,    // client-side 'session' event fired (TLS 1.2 Session ID or ticket)
     tls12_resume_pending: false,            // waiting for 'resumeSession' async callback
+
+    // Waiting for SNICallback to hand back a certificate.
+    //
+    // Node documents SNICallback as (servername, cb) precisely so a server can
+    // look a certificate up — from disk, from a cache, from another process —
+    // and any virtual-host server must, because it cannot know every
+    // certificate in advance. The lookup may therefore answer later, and until
+    // it does there is nothing to sign or send with.
+    //
+    // Same shape and same reason as tls12_resume_pending directly above: a
+    // gate the reactive loop honours, cleared by the callback, which then lets
+    // the loop run again with the answer in context.
+    sni_pending: false,
     tls12_client_session: null,             // client: saved session to resume with (parsed sessionData)
   };
 
@@ -1090,6 +1103,7 @@ function TLSSession(options){
   }
 
   function pushTranscript(data) {
+
     if (context.transcriptHook) {
       data = context.transcriptHook(data);
     }
@@ -1115,6 +1129,7 @@ function TLSSession(options){
    * re-hashes the same bytes 4 fewer times.
    */
   function get_transcript_hash(hashName) {
+
     if (context.transcriptHash !== null && context.transcriptHashName === hashName) {
       return new Uint8Array(context.transcriptHash.copy().digest());
     }
@@ -1690,16 +1705,54 @@ function TLSSession(options){
       // as "wrong certificate type". Inputs first, then the loop.
       if (context.isServer === true && message.type === 'client_hello' &&
           typeof context.SNICallback === 'function') {
+
+        // Raised BEFORE calling out, so the set_context below — which runs
+        // whether or not the callback has answered — finds the gate closed and
+        // stops short of the ServerHello. A synchronous callback lowers it
+        // again before that line is reached and nothing is deferred at all.
+        context.sni_pending = true;
+
+        let sniResolved = false;
+        // True only while the call below is still on the stack.
+        let sniSync = true;
+
         context.SNICallback(message.sni || null, function (err, creds) {
+          // A lookup that times out and then answers late would otherwise
+          // re-enter the handshake a second time.
+          if (sniResolved) return;
+          sniResolved = true;
+          context.sni_pending = false;
+
           if (!err && creds) {
-            // Direct assignment, not set_context: we are deliberately seeding
-            // inputs ahead of the single set_context below, which is what
-            // actually runs the loop. Going through set_context here would run
-            // it twice, once with a half-populated hello.
+            // Direct assignment, not set_context: these are inputs seeded
+            // ahead of the loop, not a reason to run it.
             context.local_cert_chain  = creds.certificateChain;
             context.cert_private_key  = creds.privateKey;
+
+            // Whether to run the loop depends on WHEN this fired:
+            //
+            //   Synchronously — the set_context that processes this hello has
+            //   not run yet. It will, in a moment, carrying the certificate
+            //   with it. Running the loop here as well would process the same
+            //   hello twice.
+            //
+            //   Asynchronously — that set_context has already run and stopped
+            //   at the closed gate. Nothing else will run the loop, so it has
+            //   to be nudged.
+            if (!sniSync) set_context({ sni_resolved: true });
+            return;
           }
+
+          // No certificate for this name. Refusing is the only honest answer:
+          // leaving the gate raised means a handshake that never completes and
+          // never fails either — a timeout for the client and silence in the
+          // log. unrecognized_name (112) is what RFC 6066 §3 defines for it.
+          fatalAlert(112, 'No certificate for server name ' +
+                          JSON.stringify(message.sni || '') +
+                          (err ? ': ' + (err.message || err) : ''));
         });
+
+        sniSync = false;
       }
 
       set_context({
@@ -2011,9 +2064,33 @@ function TLSSession(options){
         context.remote_extensions = _mergedExts;
       }
 
-      set_context({
-        remote_supported_groups: message.supported_groups || [],
-      });
+      // The server's ALPN choice lives HERE in TLS 1.3, not in the ServerHello:
+      // RFC 8446 §4.3.1 moved every non-key-establishment extension into
+      // EncryptedExtensions, and RFC 7301 negotiation is one of them.
+      //
+      // Reading only supported_groups left selected_alpn null on the client:
+      // the server picked 'h2', said so, and the client reported
+      // alpnProtocol === false. Nothing failed, so nothing pointed here — the
+      // connection simply behaved as though ALPN had never been negotiated,
+      // which for HTTP/2 means it cannot be used at all (RFC 9113 §3.2).
+      let eeUpdate = { remote_supported_groups: message.supported_groups || [] };
+      if (message.alpn !== undefined && message.alpn !== null) {
+        // The extension carries a list, but a server names exactly one
+        // protocol in its answer (RFC 7301 §3.2).
+        let chosenAlpn = Array.isArray(message.alpn) ? message.alpn[0] : message.alpn;
+        if (typeof chosenAlpn === 'string' && chosenAlpn.length > 0) {
+          // A server may only select something we offered; anything else is
+          // unnegotiable and must not be accepted.
+          if (context.local_supported_alpns &&
+              context.local_supported_alpns.indexOf(chosenAlpn) < 0) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER,
+                       'Server selected an ALPN protocol that was not offered: ' + chosenAlpn);
+            return;
+          }
+          eeUpdate.selected_alpn = chosenAlpn;
+        }
+      }
+      set_context(eeUpdate);
 
     }else if(message.type=='certificate'){
 
@@ -2290,6 +2367,14 @@ function TLSSession(options){
 
     if (options && typeof options === 'object'){
 
+
+      // A bare nudge: carries no state, exists only to set has_changed so the
+      // loop runs again. Used by the SNI callback when it answers
+      // asynchronously, where the certificate was assigned directly and there
+      // is no other input to carry it in.
+      if('sni_resolved' in options){
+        has_changed=true;
+      }
 
       if('local_supported_versions' in options){
         if(arraysEqual(options.local_supported_versions,context.local_supported_versions)==false){
@@ -3228,7 +3313,21 @@ function TLSSession(options){
 
         let can_send_hello=false;
 
-        if(context.hello_sent==false){
+        // Nothing goes out while the certificate is still being looked up.
+        //
+        // The ServerHello COMMITS this connection to a cipher suite, and which
+        // suites are even possible depends on the key type of the certificate
+        // about to be presented — an ECDSA certificate cannot serve an
+        // ECDHE_RSA suite. Sending it first is not merely early, it is a
+        // decision made without its input.
+        //
+        // What that looked like in practice, with an asynchronous SNICallback:
+        // ServerHello and EncryptedExtensions went out, the certificate
+        // arrived a moment later, and by then nothing was left to run the
+        // reactive loop again — so Certificate was never sent at all. The
+        // handshake simply stopped, with no alert on either side, and the peer
+        // waited until it timed out.
+        if(context.hello_sent==false && !context.sni_pending){
           
           if(context.selected_version!==null && context.selected_cipher_suite!==null && context.selected_session_id!==null){
             if((is13())){
@@ -3440,7 +3539,24 @@ function TLSSession(options){
       
 
       //get base_secret
-      if (context.base_secret==null && context.selected_cipher_suite !== null){
+      //
+      // Guarded by hello_sent on the server, and this is not a formality.
+      //
+      // RFC 8446 §7.1 derives the handshake traffic secrets over
+      // ClientHello || ServerHello — both of them. Running before our
+      // ServerHello has been pushed to the transcript hashes ONE message
+      // instead of two, so the server derives one set of keys and the client,
+      // which has seen both, derives another. Nothing detects the mismatch:
+      // the handshake completes and the first encrypted record fails with
+      // bad_record_mac, which names the symptom and hides the cause entirely.
+      //
+      // Before an asynchronous SNICallback existed this could not happen —
+      // hello_sent and the key derivation were reached on the same pass, in
+      // that order. Holding the ServerHello back for a certificate lookup
+      // separates them, and only then does the ordering become load-bearing.
+      var _keysReadyToDerive = context.isServer ? (context.hello_sent === true) : true;
+
+      if (context.base_secret==null && context.selected_cipher_suite !== null && _keysReadyToDerive){
         if((is13()) && (context.ecdhe_shared_secret !== null)){
 
           let hashName = negotiated_hash();

@@ -1398,6 +1398,73 @@ function TLSSocket(duplex, options){
         }
     });
 
+    /**
+     * Push the client's negotiable preferences into the session before its
+     * ClientHello is built.
+     *
+     * The server does this from the 'hello' event, because a server only
+     * learns what to offer once it has seen the client's hello. A client has
+     * no such event to wait for — its hello IS the first message — so the
+     * equivalent has to happen at construction. TLSSession builds the
+     * ClientHello from a setTimeout, so a synchronous set_context here lands
+     * first.
+     *
+     * ALPNProtocols is the one that matters most: RFC 7301 negotiation cannot
+     * start unless the client offers something, and HTTP/2 over TLS does not
+     * merely benefit from ALPN but REQUIRES it (RFC 9113 §3.2). A client that
+     * silently offers nothing can never speak h2 to any server.
+     *
+     * The other four are applied for the same reason — each is documented as a
+     * per-connection option, and each was being dropped on the client side.
+     */
+    function applyClientContext() {
+        if (session.isServer) return;
+
+        let update = {};
+
+        if (Array.isArray(options.ALPNProtocols) && options.ALPNProtocols.length > 0) {
+            update.local_supported_alpns = options.ALPNProtocols.map(function (p) {
+                return Buffer.isBuffer(p) ? p.toString('latin1') : String(p);
+            });
+        }
+
+        let maxVer = parseVersion(options.maxVersion);
+        let minVer = parseVersion(options.minVersion);
+        if (maxVer || minVer) {
+            maxVer = maxVer || 0x0304;
+            minVer = minVer || 0x0303;
+            let versions = [];
+            if (maxVer >= 0x0304 && minVer <= 0x0304) versions.push(0x0304);
+            if (maxVer >= 0x0303 && minVer <= 0x0303) versions.push(0x0303);
+            if (versions.length === 0) versions.push(0x0303);
+            update.local_supported_versions = versions;
+        }
+
+        if (options.groups) update.local_supported_groups = options.groups;
+        if (options.signatureAlgorithms) {
+            update.local_supported_signature_algorithms = options.signatureAlgorithms;
+        }
+
+        if (options.allowedCipherSuites || options.prioritizeChaCha) {
+            let vers = update.local_supported_versions || [0x0304, 0x0303];
+            let ciphers = default_cipher_suites(vers.indexOf(0x0304) >= 0,
+                                                vers.indexOf(0x0303) >= 0);
+            if (options.prioritizeChaCha) {
+                let chacha = ciphers.filter(c => c === 0x1303 || c === 0xCCA8);
+                let rest = ciphers.filter(c => c !== 0x1303 && c !== 0xCCA8);
+                ciphers = [...chacha, ...rest];
+            }
+            if (options.allowedCipherSuites) {
+                ciphers = ciphers.filter(c => options.allowedCipherSuites.includes(c));
+            }
+            update.local_supported_cipher_suites = ciphers;
+        }
+
+        if (Object.keys(update).length > 0) session.set_context(update);
+    }
+
+    applyClientContext();
+
     // If duplex was passed in constructor, start reading
     if (context.transport) {
         bindTransport();

@@ -13,6 +13,8 @@ import { TLS_CIPHER_SUITES } from './crypto.js';
 import TLSSession from './tls_session.js';
 import TLSSocket from './tls_socket.js';
 import createSecureContext from './secure_context.js';
+import { parseCiphers, parseEcdhCurve, parseSigalgs } from './node_options.js';
+import { prepare_ech_server } from './session/ech.js';
 
 // ===================== Constants =====================
 
@@ -232,15 +234,35 @@ function connect(/* ...args */) {
     ALPNProtocols: options.ALPNProtocols,
     minVersion: options.minVersion,
     maxVersion: options.maxVersion,
-    signatureAlgorithms: options.signatureAlgorithms,
-    groups: options.groups,
+    // node:tls's own strings (ciphers, ecdhCurve, sigalgs) — taken by
+    // nothing until now — or lemon-tls's code lists, which win.
+    signatureAlgorithms: options.signatureAlgorithms || parseSigalgs(options.sigalgs),
+    groups: options.groups || parseEcdhCurve(options.ecdhCurve),
     prioritizeChaCha: options.prioritizeChaCha,
+    // Forwarded on the server side but dropped here, so a client could not
+    // narrow the suites it offers.
+    allowedCipherSuites: options.allowedCipherSuites || parseCiphers(options.ciphers),
     maxRecordSize: options.maxRecordSize,
     sessionTickets: options.sessionTickets,
     ticketLifetime: options.ticketLifetime,
+    // RFC 8879: algorithms to offer for the server's certificate chain.
+    certificateCompression: options.certificateCompression,
+    // node:tls: ask the server for a stapled OCSP response ('OCSPResponse').
+    requestOCSP: options.requestOCSP === true,
     cert: options.cert,
     key: options.key,
     maxHandshakeSize: options.maxHandshakeSize,
+    // Encrypted Client Hello (RFC 9849): the server's ECHConfigList (bytes or
+    // base64 — the `ech=` of its HTTPS record), or GREASE ECH without one.
+    ech: options.ech,
+    echGrease: options.echGrease === true,
+    // ClientHello shaping, documented as connect() options and dropped
+    // here: neither reached the socket.
+    grease: options.grease,
+    permuteExtensions: options.permuteExtensions,
+    // 0-RTT: with `session` whose ticket allows it, what is written before
+    // 'secureConnect' goes in the first flight ('earlyData' says if taken).
+    earlyData: options.earlyData === true,
   });
 
   addCompatMethods(socket);
@@ -265,7 +287,13 @@ function connect(/* ...args */) {
     tcp = options.socket;
     socket.setSocket(tcp);
   } else {
-    tcp = net.connect(port, host, function() {
+    // The rest of the options go to net.connect, as node:tls does ("any
+    // socket.connect() option not already listed"): noDelay, keepAlive,
+    // keepAliveInitialDelay, localAddress, localPort, family, lookup, timeout.
+    // Dropped here, none of them could be set through connect() at all.
+    let netOptions = Object.assign({}, options, { port: port, host: host });
+    delete netOptions.socket;
+    tcp = net.connect(netOptions, function() {
       socket.setSocket(tcp);
     });
   }
@@ -291,6 +319,7 @@ function connect(/* ...args */) {
  * Provides:
  *   - listen(), close(), address(), getConnections()
  *   - getTicketKeys(), setTicketKeys(), setSecureContext()
+ *   - getEchKeys(), setEchKeys() — Encrypted Client Hello keys (RFC 9849)
  */
 function Server(options, connectionListener) {
   if (!(this instanceof Server)) return new Server(options, connectionListener);
@@ -309,6 +338,17 @@ function Server(options, connectionListener) {
 
   // Shared ticketKeys across all connections
   self._ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+
+  // Encrypted Client Hello keys, checked here — a key that does not match
+  // its config throws now, not as every client's handshake failing.
+  prepare_ech_server(options.ech);
+  self._ech = options.ech || null;
+
+  // node:tls's strings, read once (node_options.js) — a bad one throws here,
+  // as Node's createServer does, not on the first connection.
+  let nodeSuites = options.allowedCipherSuites || parseCiphers(options.ciphers);
+  let nodeGroups = options.groups || parseEcdhCurve(options.ecdhCurve);
+  let nodeSigalgs = options.signatureAlgorithms || parseSigalgs(options.sigalgs);
 
   // sessionTimeout: seconds to cache a TLS 1.2 Session ID (Node default: 300)
   let sessionTimeoutSec = (typeof options.sessionTimeout === 'number' && options.sessionTimeout > 0)
@@ -364,13 +404,40 @@ function Server(options, connectionListener) {
     let socketOpts = {
       isServer: true,
       ticketKeys: self._ticketKeys,
-      ticketLifetime: options.ticketLifetime,
+      // node:tls's sessionTimeout is how long a session stays good — a
+      // ticket's lifetime as much as a cached Session ID's. It set the cache
+      // alone, and tickets went out with the default 7200 s whatever it said.
+      // ticketLifetime, lemon-tls's own name, where given.
+      ticketLifetime: options.ticketLifetime != null ? options.ticketLifetime
+                    : (typeof options.sessionTimeout === 'number' ? options.sessionTimeout : undefined),
+      ticketData: options.ticketData,
+      // RFC 8879: compress the chain for a client that offers it (all
+      // algorithms unless set; false: never).
+      certificateCompression: options.certificateCompression,
+      // node:tls: the cipher suite by the server's order (default: the client's).
+      honorCipherOrder: options.honorCipherOrder === true,
+      // Encrypted Client Hello (RFC 9849): { keys: [{ config, privateKey, retry }] }.
+      ech: self._ech,
+      // node:tls's 'OCSPRequest': (certificate, issuer, callback) when a
+      // client asks for a stapled OCSP response. Without a listener nothing
+      // is stapled — and nothing waits.
+      ocspRequest: function (certificate, issuer, callback) {
+        if (self.listenerCount('OCSPRequest') === 0) return callback(null, null);
+        self.emit('OCSPRequest', Buffer.from(certificate), issuer ? Buffer.from(issuer) : null, callback);
+      },
       ALPNProtocols: options.ALPNProtocols,
       ALPNCallback: options.ALPNCallback,
+      // 0-RTT (off unless asked for): tickets that allow it, and taking it
+      // under the session's checks — read on each socket as it comes
+      // (socket.isEarlyData), before 'secureConnection'.
+      earlyData: options.earlyData === true,
+      earlyDataMaxAge: options.earlyDataMaxAge,
+      earlyDataReplay: options.earlyDataReplay,
+      maxEarlyData: options.maxEarlyData,
       minVersion: options.minVersion || DEFAULT_MIN_VERSION,
       maxVersion: options.maxVersion || DEFAULT_MAX_VERSION,
-      signatureAlgorithms: options.signatureAlgorithms,
-      groups: options.groups,
+      signatureAlgorithms: nodeSigalgs,
+      groups: nodeGroups,
       prioritizeChaCha: options.prioritizeChaCha,
       maxRecordSize: options.maxRecordSize,
       sessionTickets: options.sessionTickets,
@@ -386,8 +453,16 @@ function Server(options, connectionListener) {
       rejectUnauthorized: options.rejectUnauthorized,
       ca: options.ca,
       maxHandshakeSize: options.maxHandshakeSize,
-      allowedCipherSuites: options.allowedCipherSuites,
-      handshakeTimeout: options.handshakeTimeout,
+      allowedCipherSuites: nodeSuites,
+      // node:tls's default for a server, 120 s. TLSSocket's own is none
+      // (it is also the client's, where Node has none either), and a server
+      // left at it let a client that sent half a ClientHello hold its socket
+      // for as long as it liked.
+      handshakeTimeout: options.handshakeTimeout != null ? options.handshakeTimeout : 120000,
+      // The server's default certificate. With an explicit SNICallback it was
+      // never handed to the socket, so a client sending no server_name got
+      // the callback asked with null instead of this certificate, as in Node.
+      secureContext: defaultCtx || undefined,
     };
 
     if (options.SNICallback) {
@@ -471,7 +546,31 @@ function Server(options, connectionListener) {
     });
   }
 
-  self._tcpServer = net.createServer(acceptConnection);
+  // node:tls's Server IS a net.Server, built from the same options object, so
+  // the TCP ones apply to every connection it accepts. Only those: the stream
+  // shape of the raw socket (allowHalfOpen, pauseOnConnect) is this layer's
+  // to manage, and the TLS socket takes allowHalfOpen itself.
+  self._tcpServer = net.createServer({
+    noDelay: options.noDelay === true,
+    keepAlive: options.keepAlive === true,
+    keepAliveInitialDelay: options.keepAliveInitialDelay || 0,
+  }, acceptConnection);
+
+  // The net.Server's own events, re-emitted: node:tls's Server IS a net.Server
+  // and emits these itself, and code written for it listens for them here.
+  // Without this, 'listening' never fired, and a failed bind (EADDRINUSE,
+  // EACCES) was emitted on an inner object nobody could reach — an uncaught
+  // exception that took the whole process down.
+  ['listening', 'error', 'close', 'drop'].forEach(function (name) {
+    self._tcpServer.on(name, function () {
+      if (name === 'error' && self.listenerCount('error') === 0) {
+        // Same as node:tls when nobody listens: it throws. Preserved, rather
+        // than swallowed — but from the Server a caller can now listen on.
+        throw arguments[0];
+      }
+      self.emit.apply(self, [name].concat(Array.prototype.slice.call(arguments)));
+    });
+  });
 
   /**
    * Node documents 'connection' as injectable: emitting it by hand feeds an
@@ -517,6 +616,19 @@ function Server(options, connectionListener) {
       throw new RangeError('ticketKeys must be exactly 48 bytes');
     }
     self._ticketKeys = Buffer.from(keys);
+  };
+
+  // ECH keys. Rotation without a restart: publish the new config in DNS,
+  // then setEchKeys with the new key first (retry: true) and the old one
+  // kept (retry: false) until the old DNS record's TTL has run out — clients
+  // still holding it can then connect. New connections use the new set.
+  self.getEchKeys = function() {
+    return self._ech;
+  };
+
+  self.setEchKeys = function(ech) {
+    prepare_ech_server(ech);          // throws on a bad key, keeping the old set
+    self._ech = ech || null;
   };
 
   // setSecureContext — replace cert/key without restart (Node.js compat)

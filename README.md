@@ -23,14 +23,19 @@
 * 📡 **DTLS 1.3 (RFC 9147)** + **DTLS 1.2** – server and client, with cookie exchange, retransmission, and **DTLS-SRTP** (RFC 5764) for WebRTC. Not a shim over TLS: the record layer, epochs, and sequence-number handling are implemented for datagrams.
 * 🌐 **Browser-tested** – verified interop with Chrome, curl, Node.js, openssl s_client, and msquic.
 * 🔑 **Key Access** – read handshake secrets, traffic keys, ECDHE shared secret, and resumption data at any point.
-* 🔁 **Session Resumption** – session tickets + PSK with binder validation.
+* 🔁 **Session Resumption** – session tickets + PSK with binder validation, with application data carried inside the ticket (`ticketData`, `getTicketInfo()`).
 * 🔄 **Key Update** – refresh traffic keys on long-lived TLS 1.3 connections.
 * 🔃 **HelloRetryRequest** – automatic group negotiation fallback (X25519, P-256, P-384).
+* 🛰 **Post-quantum key exchange** – the hybrid **X25519MLKEM768** group, as Chrome, Firefox, Safari and Cloudflare negotiate it, wherever `node:crypto` has ML-KEM (Node 24.7+).
+* 🕶 **Encrypted Client Hello (RFC 9849)** – server *and* client. The real ClientHello — the site's name, the ALPN list — goes encrypted with HPKE to a key published in DNS. Key generation, rotation, `retry_configs`, HelloRetryRequest, resumption inside ECH, and GREASE ECH. Tested against Go's `crypto/tls` in both directions.
+* 🗜 **Certificate compression (RFC 8879)** – brotli, zlib and zstd, both directions; a public CA's chain often shrinks by half — over QUIC that can save a round trip.
+* 📄 **OCSP stapling** – the server staples (`'OCSPRequest'`, as `node:tls`), the client asks for it (`requestOCSP`, `'OCSPResponse'`).
 * 📜 **Client Certificate Auth** – mutual TLS (mTLS) with `requestCert` / `cert` / `key` options.
 * 🛡 **Designed for extensibility** – exposes cryptographic keys and record-layer primitives for QUIC or custom transports (DTLS ships implemented, see above).
 * 🧩 **Two API levels** – high-level `TLSSocket` (drop-in Node.js Duplex stream) and low-level `TLSSession` (state machine only, you handle the transport).
-* 🔍 **TLS fingerprinting, built in** – `getFingerprints()` returns **JA4**, **JA3**, **JA4S** and **JA3S** for the connection. Both the client and the server values are populated **in either role**, because both hellos are visible to both peers. Verified byte-for-byte against independent implementations. Node cannot do this at all: OpenSSL parses the ClientHello and discards the offer, so other libraries re-read the raw bytes off the socket in parallel — here the data is already in hand.
-* 🎭 **Handshake shaping** – `permuteExtensions` (Chrome 110+ extension-order randomisation) and `grease` (RFC 8701, across all seven insertion points). Both opt-in, both collision-safe against anything you configured by hand.
+* 🔍 **TLS fingerprinting, built in** – `getJA4()`, `getJA5()` and `getJA4S()`: the client's fingerprint, its resumption-stable variant, and the server's. Each is available **in either role**, because both hellos are visible to both peers. Verified byte-for-byte against independent implementations. Node cannot do this at all: OpenSSL parses the ClientHello and discards the offer, so other libraries re-read the raw bytes off the socket in parallel — here the data is already in hand.
+* 🎭 **Handshake shaping** – `permuteExtensions` (Chrome 110+ extension-order randomisation), `grease` (RFC 8701, across all seven insertion points) and `echGrease` (GREASE ECH, RFC 9849 §6.2). All opt-in, all collision-safe against anything you configured by hand.
+* 🧮 **HPKE (RFC 9180)** – exported as a module of its own (`crypto.hpke`): all four modes, the DHKEMs over X25519, X448, P-256, P-384 and P-521 — what ECH is built on, and the base of Oblivious HTTP and MLS.
 * 🔧 **Beyond Node.js** – per-connection cipher/sigalg/group selection, certificate pinning, `ALPNCallback`, `setKeyCert`, and more options that are impossible or require `openssl.cnf` hacks in Node.js.
 * 📘 **TypeScript support** – full `.d.ts` bundled, type-checked in strict mode.
 
@@ -120,6 +125,91 @@ const socket = tls.connect(8443, 'localhost', {
 });
 ```
 
+### Encrypted Client Hello (ECH)
+
+Without ECH the first message of every TLS connection — the ClientHello, with the
+site's name — crosses the network in the clear. With ECH (RFC 9849) the client sends
+the real ClientHello encrypted, inside an outer one that names only a shared
+*public name*, to a key the server publishes in DNS (the `ech=` key of its HTTPS
+record, RFC 9460).
+
+```js
+import tls from 'lemon-tls';
+
+// Server: a key — keep k.config and k.privateKey across restarts,
+// publish k.configListBase64 as ech= in the domain's HTTPS record.
+const k = tls.generateEchKey({ publicName: 'ech.example.com' });
+
+const server = tls.createServer({
+  key, cert,                     // must cover ech.example.com too (see below)
+  ech: { keys: [{ config: k.config, privateKey: k.privateKey }] },
+}, (socket) => {
+  console.log(socket.servername, socket.echStatus);   // 'www.example.com' 'accepted'
+});
+
+// Client: the server's key list, from DNS.
+const socket = tls.connect({
+  host: 'www.example.com', port: 443, servername: 'www.example.com',
+  ech: k.configListBase64,
+}, () => console.log(socket.echStatus));               // 'accepted'
+
+socket.on('error', (err) => {
+  if (err.code === 'ERR_ECH_REJECTED' && err.retryConfigs) {
+    // The server's keys changed: connect again with err.retryConfigs.
+  }
+});
+```
+
+**When the server cannot decrypt** (a key it no longer holds), it completes the
+handshake as the public name — so its certificate must cover that name too — and
+sends its current keys (`retry_configs`). The client checks that certificate against
+the public name, sends `ech_required`, and fails with `ERR_ECH_REJECTED`:
+`err.retryConfigs` is the server's new ECHConfigList (given only when the server was
+authenticated), or `null` — the server has turned ECH off. There is no automatic
+fallback to a hello in the clear: that is the application's decision.
+
+**What the client does.** Two hellos go in one:
+- **Inner:** the real one, sealed with HPKE.
+- **Outer:** in the clear, naming the public name.
+
+Extensions the two share, the `key_share` above all, are sent once: the inner hello
+names them (`ech_outer_extensions`). The inner hello is padded so its length tells
+little about the name. The server says which hello it answered with 8 bytes of its
+random (or of its HelloRetryRequest) that only a holder of the inner hello can compute.
+
+**Also covered:**
+- HelloRetryRequest
+- A resumed session inside the inner hello
+- `echGrease: true`: an ECH extension no server can decrypt, as Chrome and Firefox send, so that clients using ECH do not stand out.
+
+**Key rotation** — the new key in DNS first, then on the server, the old one kept with
+`retry: false` until the old record's TTL has passed:
+
+```js
+server.setEchKeys({ keys: [
+  { config: next.config, privateKey: next.privateKey },
+  { config: prev.config, privateKey: prev.privateKey, retry: false },
+] });
+```
+
+A key is not certified by anyone — its trust comes from DNS. A substituted key could
+reveal which name was asked for, never let anyone impersonate the site: the
+certificate is still checked against that name. TLS 1.3 only, not DTLS.
+
+### OCSP Stapling
+
+```js
+// Server — as node:tls: asked when a client requests status. Fetch and cache
+// responses ahead of time; the handshake waits for the callback.
+server.on('OCSPRequest', (certificate, issuer, callback) => {
+  callback(null, cachedOcspResponseFor(certificate));   // DER Buffer, or null for none
+});
+
+// Client
+const socket = tls.connect({ host, port, requestOCSP: true });
+socket.on('OCSPResponse', (response) => { /* DER Buffer — check it, e.g. with the `ocsp` package */ });
+```
+
 ## 📚 API
 
 ### Module-Level Functions
@@ -139,6 +229,18 @@ tls.rootCertificates                               // the shipped CA bundle (~14
 tls.getCACertificates('default')                   // same, as a copy
 tls.setDefaultCACertificates([...])                // replace it for later connections
 tls.DEFAULT_ECDH_CURVE                             // 'auto'
+
+// node:tls's option strings → the code lists lemon-tls works with (what
+// createServer / connect do with `ciphers`, `ecdhCurve`, `sigalgs`)
+tls.parseCiphers('TLS_AES_256_GCM_SHA384:ECDHE-RSA-AES128-GCM-SHA256')  // [0x1302, 0xc02f]
+tls.parseEcdhCurve('X25519:P-256')                 // [0x001d, 0x0017]; 'auto' → null (the default)
+tls.parseSigalgs('ECDSA+SHA256:rsa_pss_rsae_sha256') // [0x0403, 0x0804]
+tls.certificateObject(der)                         // a DER certificate as getPeerCertificate() describes it
+
+// Encrypted Client Hello (RFC 9849)
+tls.generateEchKey({ publicName, configId?, maxNameLength?, kem? })
+                                                   // → { config, privateKey, configList, configListBase64 }
+tls.checkEchKeys({ keys: [{ config, privateKey, retry }] })  // throws, saying what is wrong
 ```
 
 ### `tls.Server` (returned by `createServer`)
@@ -149,6 +251,8 @@ server.close(callback?)                            // Stop accepting new connect
 server.setSecureContext({ key, cert })             // Runtime cert rotation (Let's Encrypt, etc.)
 server.getTicketKeys()                             // 48-byte Buffer (ticket encryption keys)
 server.setTicketKeys(keys)                         // For clustered deployments
+server.getEchKeys()                                // the current `ech` option
+server.setEchKeys(ech)                             // ECH key rotation; a bad key throws, the old set stays
 server.address()                                   // { port, family, address }
 ```
 
@@ -161,6 +265,7 @@ server.address()                                   // { port, family, address }
 | `keylog` | `(line, socket)` | SSLKEYLOGFILE-format line (for Wireshark) |
 | `newSession` | `(id, data, cb)` | Store a TLS 1.2 Session ID (for custom session stores) |
 | `resumeSession` | `(id, cb)` | Look up a TLS 1.2 Session ID (for custom session stores) |
+| `OCSPRequest` | `(certificate, issuer, callback)` | A client asked for the certificate's OCSP status (as `node:tls`). `certificate` and `issuer` are DER Buffers (`issuer` `null` when the chain has none); `callback(null, response)` staples a DER OCSP response, `callback(null, null)` none, `callback(err)` fails the handshake. Without a listener nothing is stapled |
 | `error` / `close` | — | Transport-level |
 
 ### `TLSSocket`
@@ -186,6 +291,9 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `requestCert` | boolean | Request client certificate (server) |
 | `cert` | Buffer/string | Client certificate PEM (for mTLS) |
 | `key` | Buffer/string | Client private key PEM (for mTLS) |
+| `ciphers`, `ecdhCurve`, `sigalgs` | string | As `node:tls` takes them (`createServer` / `connect`); a value naming nothing usable throws. `sigalgs` limits what the endpoint signs with, as well as what it offers and accepts |
+| `requestOCSP` | boolean | Client: ask for the server's stapled OCSP response; it comes as `'OCSPResponse'` |
+| `sessionTimeout` | number | Server: seconds a session stays good — TLS 1.2 Session IDs, and the ticket lifetime unless `ticketLifetime` is given |
 
 **LemonTLS-only (not available in Node.js):**
 
@@ -198,9 +306,21 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `maxRecordSize` | number | Max plaintext per TLS record (default: 16384) |
 | `allowedCipherSuites` | number[] | Whitelist - only these ciphers are offered |
 | `pins` | string[] | Certificate pinning: `['sha256/AAAA...']` |
-| `handshakeTimeout` | number | Abort handshake after N ms |
+| `handshakeTimeout` | number | Abort handshake after N ms. `createServer`: `120000` by default, as in Node |
 | `maxHandshakeSize` | number | Max handshake bytes - DoS protection |
 | `certificateCallback` | function | Dynamic cert selection: `(info, cb) => cb(null, ctx)` |
+| `ech` | object / Buffer / string | Encrypted Client Hello (RFC 9849). **Server:** `{ keys: [{ config, privateKey, retry }] }` — from `generateEchKey()`; `retry: false` keeps a key for decrypting without offering it in `retry_configs`. **Client:** the server's ECHConfigList, bytes or base64 (the `ech=` of its HTTPS record); the hello then offers TLS 1.3 only. A malformed list, or one with no config this client can use, throws |
+| `echGrease` | boolean | Client, without `ech`: send GREASE ECH (RFC 9849 §6.2), as browsers do (default `false`) |
+| `certificateCompression` | boolean / string[] | RFC 8879: `['brotli', 'zlib', 'zstd']`, `true` (all this Node has) or `false`. Server: what it compresses its chain with, for a client that offers it (default: all). Client: what it offers (default: none) |
+| `ticketLifetime` | number | Server: seconds a TLS 1.3 ticket is good for (default `7200`, capped at 7 days, RFC 8446 §4.6.1) |
+| `ticketData` | function | Server: `(resumed) => data` — JSON-safe data (≤ 256 bytes serialized) carried inside each ticket, encrypted with `ticketKeys`; `resumed` is the data of the ticket this connection resumed with (`null` on a full handshake). It comes back in `getTicketInfo()` on the connection that presents the ticket |
+
+**Client certificates and resumption.** A resumed handshake carries no certificate, so the
+ticket (or TLS 1.2 session) keeps the client's: on a resumed connection `authorized`,
+`authorizationError` and `getPeerCertificate()` answer as on the full handshake that issued it.
+A server that requires an authorized client (`requestCert` + `rejectUnauthorized`) resumes
+only a ticket that says it had one — anything else is a full handshake, where the
+certificate is asked for again.
 
 ### Supported cipher suites
 
@@ -263,9 +383,10 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `keyUpdate` | `(direction)` | Traffic keys refreshed: `'send'` or `'receive'` |
 | `keylog` | `(Buffer)` | SSLKEYLOGFILE-format line (for Wireshark) |
 | `secure` | `()` | Handshake complete. Fires on **both** sides and on sockets built with `new TLSSocket()` — unlike `secureConnect`, which Node does not emit there. The signal to use when wrapping an existing socket for STARTTLS |
-| `clienthello` | `(raw, parsed)` | ClientHello received (server side). Fires **synchronously before the ServerHello is built** — use it for JA3/JA4 fingerprinting, or to inspect the client's offered extensions (`parsed.extensions` / `getRemoteExtension`) and answer them via `set_context({ local_extensions })` (e.g. DTLS-SRTP `use_srtp`) |
+| `clienthello` | `(raw, parsed)` | ClientHello received (server side). Fires **synchronously before the ServerHello is built** — use it for JA4/JA5 fingerprinting, or to inspect the client's offered extensions (`parsed.extensions` / `getRemoteExtension`) and answer them via `set_context({ local_extensions })` (e.g. DTLS-SRTP `use_srtp`) |
 | `handshakeMessage` | `(type, raw, parsed)` | Every handshake message (debugging) |
 | `certificateRequest` | `(msg)` | Server requested a client certificate |
+| `OCSPResponse` | `(Buffer)` | Client, with `requestOCSP`: the server's stapled OCSP response (DER) |
 | `error` | `(Error)` | TLS or transport error |
 | `close` | `()` | Connection closed |
 
@@ -296,7 +417,7 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `socket.authorized` | `true` if peer certificate is valid |
 | `socket.authorizationError` | Error string or `null` |
 | `socket.alpnProtocol` | Negotiated ALPN protocol or `false` |
-| `socket.servername` | SNI value (string or `false`) |
+| `socket.servername` | SNI value (string or `false`). Server with ECH accepted: the name that was hidden; rejected: the public name |
 | `socket.encrypted` | Always `true` |
 | `socket.remoteAddress` / `.remotePort` | Peer address (delegated to transport) |
 | `socket.setNoDelay()` / `.setKeepAlive()` / `.setTimeout()` | Transport delegation |
@@ -310,6 +431,9 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `socket.session` | Access the underlying `TLSSession` (low-level state machine) |
 | `socket.isResumed` | Alias for `isSessionReused()` |
 | `socket.handshakeDuration` | Handshake time in ms |
+| `socket.echStatus` | Encrypted Client Hello. Server: `null` (not offered), `'accepted'`, `'rejected'` (the handshake ran as the public name and `retry_configs` went out). Client: `null` (no ECH), `'grease'`, `'accepted'`, `'rejected'` |
+| `socket.echAccepted` | `echStatus === 'accepted'` |
+| `socket.getTicketInfo()` | `{ data, resumed, offered, state }` — the `ticketData` of the ticket this connection resumed with (server), whether it resumed, whether a ticket was offered |
 | `useDefaultCA` | When no `ca` is given, chain against the platform trust store instead of authorizing everything (default `true`). **Breaking change**: a self-signed or private-CA peer that previously connected with no `ca` configured now fails with `UNABLE_TO_GET_ISSUER_CERT`. That is the point — the old behaviour reported a connection as verified while verifying nothing, with `rejectUnauthorized` defaulting to true. Set `false` to opt back out explicitly. DTLS defaults to `false`, since WebRTC peers are self-signed by design and authenticated by SDP fingerprint |
 | `allowHalfOpen` | When `false` (the Node default, and now ours) the writable side ends automatically once the peer stops writing. This was hardcoded `true`, the opposite of Node — code expecting the documented behaviour was left holding connections open |
 | `checkServerIdentity(hostname, cert)` | Replaces the built-in RFC 6125 identity check. Return `undefined` to accept, an `Error` to reject. Runs **after** chain verification, as Node documents — a hook that only checks a pin cannot rescue a chain that failed |
@@ -318,7 +442,9 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `ALPNCallback` | `({ servername, protocols }) => protocol \| undefined`. Server-side, synchronous. Returning `undefined` refuses with `no_application_protocol`. Mutually exclusive with `ALPNProtocols` |
 | `grease` | Insert GREASE (RFC 8701) reserved values into the ClientHello, as browsers do (default `false`). Covers cipher suites, extension types, supported groups, signature algorithms, supported versions, ALPN, `psk_key_exchange_modes` and a dummy `key_share` entry. **Changes no fingerprint** — JA3 and JA4 both strip GREASE — but its *absence* reads as "not a browser". Any list you already GREASE'd by hand is left alone, so `grease: true` never collides with manual configuration. Safe against public HTTPS servers; leave off for DTLS/WebRTC peers until tested |
 | `permuteExtensions` | Shuffle ClientHello extension order per connection, as Chrome 110+ does (default `false`). Changes your **JA3** on every handshake; leaves your **JA4** byte-for-byte identical, since JA4 sorts before hashing. Order is chosen once and replayed on a post-HRR retry, per RFC 8446 §4.1.2 |
-| `socket.getFingerprints()` | `{ ja3, ja4, ja3s, ja4s, ja4x }` - every fingerprint of the connection. Client values (`ja3`/`ja4`) **and** server values (`ja3s`/`ja4s`) are populated in either role, since both hellos are visible to both peers. Each is `{ hash, raw }`, or `null` before its hello has been seen. `ja4x` is reserved and always `null` for now. Pass `{ protocol: 'q' }` when driving the session from QUIC |
+| `socket.getJA4(opts?)` | The client's **JA4** fingerprint, `{ hash, raw }` (`t13d1516h2_8daaf6152771_e5627ece308c`). Available in either role, since both hellos are visible to both peers; `null` before the ClientHello has been seen. Pass `{ protocol: 'q' }` when driving the session from QUIC |
+| `socket.getJA5(opts?)` | **JA5**: JA4 without the extensions that describe the connection rather than the client (`pre_shared_key`, `session_ticket`, `early_data`, `padding`, `cookie`, `psk_key_exchange_modes`) — the same client build has one JA5 whether it resumed or not — and with the `supported_groups` it offers, which JA4 does not look at. `{ hash, raw }` |
+| `socket.getJA4S(opts?)` | The server's **JA4S** fingerprint, `{ hash, raw }` — `null` until a ServerHello exists |
 | `socket.getFinished()` / `getPeerFinished()` | The Finished verify_data, ours and the peer's — the `tls-unique` channel binding of RFC 5929. `undefined` before the handshake |
 | `socket.isSessionReused()` | Whether this connection resumed an earlier session (same value as the `isResumed` property; Node spells it as a method) |
 | `socket.address()` | `{ port, family, address }` of the underlying transport, `{}` when not connected |
@@ -326,7 +452,6 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `server.injectConnection(stream)` | Feed an arbitrary `Duplex` into the server as if it had just connected. Node does this by emitting `'connection'` by hand; here it is a method, because the server emits that event itself and a self-listener would re-enter on every real connection |
 | `server.addContext(host, ctx)` | Register a certificate for an SNI host or wildcard (`'*.example.com'`, or `'*'` as catch-all). Takes a `createSecureContext()` result or plain `{ key, cert }`. Exact matches beat wildcards; re-registering a host replaces it. Each context is compiled **once** — the hand-written `SNICallback` equivalent usually recompiles per connection, and often reads the cert off disk on the handshake path |
 | `socket.setKeyCert(context)` | Swap the certificate and key for this one connection. Takes a `createSecureContext()` result or a plain `{ key, cert }`. Pairs with `ALPNCallback`, where the protocol is known but `SNICallback` has already run |
-| `socket.getJA3()` | `{ hash, raw }` - shorthand for `getFingerprints().ja3` |
 | `socket.getSharedSecret()` | ECDHE shared secret (Buffer) |
 | `socket.getNegotiationResult()` | `{ version, cipher, group, sni, alpn, resumed, helloRetried, ... }` |
 | `socket.rekeySend()` | Refresh outgoing encryption keys (TLS 1.3) |
@@ -375,6 +500,15 @@ session.on('secureConnect', () => {
 session.requestKeyUpdate(true); // true = request peer to update too
 session.on('keyUpdate', ({ direction, secret }) => { /* ... */ });
 
+// Tickets carrying the protocol layer's own state (server, TLS 1.3) —
+// apart from the application's ticketData, ≤ 128 bytes JSON. A QUIC stack
+// keeps its path measurements here; sendTicket() issues another ticket
+// now, after the handshake (OpenSSL's SSL_new_session_ticket), carrying it.
+session.setTicketState({ rtt: 120, bw: 1250000 });
+session.sendTicket();
+// …and on the connection that resumes with it:
+session.getTicketInfo(); // { data, resumed: true, offered: true, state: { rtt: 120, bw: 1250000 } }
+
 // PSK callback - full control over ticket validation (server)
 session.on('psk', (identity, callback) => {
   const psk = myTicketStore.lookup(identity);
@@ -384,10 +518,9 @@ session.on('psk', (identity, callback) => {
 // Fingerprinting (server) — fires before the ServerHello is built, so this is
 // where you drop a connection without spending a full handshake on it.
 session.on('clienthello', (raw, parsed) => {
-  const { ja4 } = session.getFingerprints();
-  console.log(ja4.hash);  // 't13d521100_b262b3658495_8e6e362c5eac'
-  // ja3s/ja4s are still null here — no ServerHello exists yet. Ask again
-  // later in the session and they will be populated.
+  console.log(session.getJA4().hash);  // 't13d521100_b262b3658495_8e6e362c5eac'
+  // getJA4S() is still null here — no ServerHello exists yet. Ask again
+  // later in the session and it will be there.
 });
 ```
 
@@ -396,6 +529,11 @@ session.on('clienthello', (raw, parsed) => {
 Everything above has a DTLS twin. Same TLS state machine underneath, same
 methods, plus datagram-specific plumbing (retransmission flights, epoch
 handling, cookie exchange):
+
+Retransmission under loss: in DTLS 1.3 an ACK that covers only part of a
+flight retires only those records — the rest are resent when the timer
+fires (RFC 9147 §7.1) — and a client keeps resending its final flight until
+the peer ACKs it or sends protected data (§5.8.3).
 
 ```js
 import { DTLSSession, DTLSSocket, createDTLSServer, connectDTLS } from 'lemon-tls';
@@ -544,19 +682,18 @@ socket.on('keylog', (line) => fs.appendFileSync('keys.log', line));
 
 // Fingerprinting — server-side bot detection
 server.on('secureConnection', (socket) => {
-  const { ja3, ja4, ja4s } = socket.getFingerprints();
-  console.log(ja4.hash);   // 't13d1516h2_8daaf6152771_e5627ece308c' — the client
-  console.log(ja4.raw);    // unhashed form: shows which ciphers actually differ
-  console.log(ja4s.hash);  // 't130200_1301_a56c5b993250' — how WE look to them
-  console.log(ja3.hash);   // 2017 format, for anything already keyed on it
+  const ja4 = socket.getJA4();
+  console.log(ja4.hash);              // 't13d1516h2_8daaf6152771_e5627ece308c' — the client
+  console.log(ja4.raw);               // unhashed form: shows which ciphers actually differ
+  console.log(socket.getJA5().hash);  // the same client, resumed or not
+  console.log(socket.getJA4S().hash); // 't130200_1301_a56c5b993250' — how WE look to them
 });
 
-// Client side: the same call, and the same four values
+// Client side: the same calls, the same values
 const socket = connect({ host: 'example.com', port: 443 });
 socket.on('secureConnect', () => {
-  const { ja4, ja4s } = socket.getFingerprints();
-  console.log(ja4.hash);   // how this library looks to the server
-  console.log(ja4s.hash);  // which server stack answered
+  console.log(socket.getJA4().hash);  // how this library looks to the server
+  console.log(socket.getJA4S().hash); // which server stack answered
 });
 
 // Full negotiation result
@@ -583,6 +720,7 @@ LemonTLS is verified against real-world TLS implementations:
 | **Node.js `tls`** | Client / Server | 1.2 / 1.3 | Bidirectional interop + session resumption |
 | **openssl s_client** | Client | 1.2 / 1.3 | All supported ciphers & groups |
 | **msquic** | (via QUICO) | 1.3 | HRR + P-384 + AES-256-GCM-SHA384 tested |
+| **Go `crypto/tls`** | Client / Server | 1.3 | **ECH** both ways: accepted, `retry_configs` then accepted with them, HelloRetryRequest; GREASE ECH (our client), resumption inside ECH (our server) |
 
 ## ⚡ Performance
 
@@ -633,6 +771,12 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ✅ | Zero dependencies - `node:crypto` only |
 | ✅ | **72 automated tests** (compat, resumption, data transfer) |
 | ✅ | Browser-tested (Chrome) |
+| ✅ | Encrypted Client Hello (RFC 9849) — server and client, GREASE ECH |
+| ✅ | HPKE (RFC 9180) — all modes, five KEMs |
+| ✅ | Hybrid post-quantum key exchange — X25519MLKEM768 |
+| ✅ | Certificate compression (RFC 8879) — brotli, zlib, zstd |
+| ✅ | OCSP stapling — server (`'OCSPRequest'`) and client (`requestOCSP`) |
+| ✅ | Application data in session tickets (`ticketData`, `getTicketInfo()`) |
 
 ### ⏳ Planned
 
@@ -641,7 +785,6 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ⏳ | Loss detection + PTO (for QUIC integration) | Buffer ready, needs timers |
 | ⏳ | 0-RTT Early Data | Risky (replay attacks), low priority |
 | ⏳ | Full certificate chain validation | Including CA/revocation checks |
-| ⏳ | OCSP stapling | Rare in modern web, low priority |
 | ⏳ | Fuzz testing | Security hardening |
 
 ### Compatibility Test Summary
@@ -683,15 +826,20 @@ src/
   crypto.js              - key schedule (HKDF, PRF, resumption primitives)
   compat.js              - Node.js tls API wrappers (connect, createServer,
                            checkServerIdentity, Server)
+  node_options.js        - node:tls option strings (ciphers, ecdhCurve, sigalgs)
+                           → code-point lists
   secure_context.js      - PEM/DER cert/key loading
-  utils.js               - array helpers
+  utils.js               - array helpers, certificateObject
   dtls_session.js        - DTLS state machine
   dtls_socket.js         - DTLS socket wrapper (UDP transport)
   session/
     signing.js           - signature scheme selection + signing
     ecdh.js              - X25519 / P-256 / P-384 key exchange
     message.js           - high-level message build/parse
-    ticket.js            - TLS 1.2 session ticket encryption
+    ticket.js            - session ticket encryption
+    ech.js               - Encrypted Client Hello: configs, keys, both sides
+    hpke.js              - HPKE (RFC 9180)
+    cert_compression.js  - certificate compression (RFC 8879)
 ```
 
 ## 🤝 Contributing
@@ -714,6 +862,12 @@ You can support ongoing development via [GitHub Sponsors](https://github.com/spo
 * [RFC 6125 – Hostname Verification](https://datatracker.ietf.org/doc/html/rfc6125)
 * [RFC 5705 – Exported Keying Material](https://datatracker.ietf.org/doc/html/rfc5705)
 * [RFC 5077 – Stateless Session Resumption (TLS 1.2 tickets)](https://datatracker.ietf.org/doc/html/rfc5077)
+* [RFC 9849 – TLS Encrypted Client Hello](https://datatracker.ietf.org/doc/html/rfc9849)
+* [RFC 9180 – Hybrid Public Key Encryption (HPKE)](https://datatracker.ietf.org/doc/html/rfc9180)
+* [RFC 9460 – SVCB and HTTPS DNS records](https://datatracker.ietf.org/doc/html/rfc9460)
+* [RFC 8879 – TLS Certificate Compression](https://datatracker.ietf.org/doc/html/rfc8879)
+* [RFC 8701 – GREASE](https://datatracker.ietf.org/doc/html/rfc8701)
+* [draft-ietf-tls-ecdhe-mlkem – Hybrid ML-KEM key agreement](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/)
 
 ## 📜 License
 

@@ -241,10 +241,12 @@ function makeHashFn(algorithm, outputLen) {
 
 let sha256 = makeHashFn('sha256', 32);
 let sha384 = makeHashFn('sha384', 48);
+let sha512 = makeHashFn('sha512', 64);   // HPKE: HKDF-SHA512, DHKEM(P-521 / X448)
 
 function getHashFn(hashName) {
   if (hashName === 'sha256') return sha256;
   if (hashName === 'sha384') return sha384;
+  if (hashName === 'sha512') return sha512;
   throw new Error('Unsupported hash: ' + hashName);
 }
 
@@ -537,6 +539,17 @@ function derive_handshake_traffic_secrets_psk(hashName, psk, shared_secret, tran
     client_handshake_traffic_secret: client_handshake_traffic_secret,
     server_handshake_traffic_secret: server_handshake_traffic_secret,
   };
+}
+
+/**
+ * client_early_traffic_secret (RFC 8446 §7.1): Derive-Secret(Early Secret,
+ * "c e traffic", ClientHello) — the 0-RTT key's secret, from the PSK and the
+ * hash of the ClientHello alone.
+ */
+function derive_client_early_traffic_secret(hashName, psk, clienthello_hash, labelPrefix) {
+  let hashLen = getHashFn(hashName).outputLen | 0;
+  let early_secret = hkdf_extract(hashName, new Uint8Array(0), psk);
+  return hkdf_expand_label(hashName, early_secret, 'c e traffic', clienthello_hash, hashLen, labelPrefix);
 }
 
 /**
@@ -904,6 +917,7 @@ export {
   compute_psk_binder,
   derive_handshake_traffic_secrets_psk,
   derive_handshake_traffic_secrets_psk_with_hash,
+  derive_client_early_traffic_secret,
   build_cert_verify_tbs,
   build_cert_verify_tbs_with_hash,
   get_handshake_finished,

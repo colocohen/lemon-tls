@@ -9,7 +9,7 @@ import * as wire from '../wire.js';
 /**
  * Normalize a parsed hello into a flat object with named extension fields.
  */
-function normalize_hello(hello) {
+function normalize_hello(hello, kind) {
   let out = {};
 
   for (let key in hello) {
@@ -28,9 +28,16 @@ function normalize_hello(hello) {
         out.alpn = value;
       } else if (name === 'KEY_SHARE') {
         if (!('key_groups' in out)) out.key_groups = [];
-        if (!('supported_groups' in out)) out.supported_groups = [];
+        // A ServerHello's key_share names the group chosen, which the
+        // client's code reads as its supported_groups. A ClientHello's
+        // shares are NOT added to its supported_groups: they came only from
+        // that extension. Merged, the result depended on which extension came
+        // first (supported_groups after key_share replaced the list; before
+        // it, the shares' groups were appended), and a share for a group the
+        // client never listed looked listed (RFC 8446 §4.2.8).
+        if (kind !== 'client' && !('supported_groups' in out)) out.supported_groups = [];
         for (let i2 = 0; i2 < value.length; i2++) {
-          if (out.supported_groups.indexOf(value[i2].group) < 0) {
+          if (kind !== 'client' && out.supported_groups.indexOf(value[i2].group) < 0) {
             out.supported_groups.push(value[i2].group);
           }
           out.key_groups.push({
@@ -60,6 +67,8 @@ function normalize_hello(hello) {
         out.status_request = value;
       } else if (name === 'MAX_FRAGMENT_LENGTH') {
         out.max_fragment_length = value;
+      } else if (name === 'COMPRESS_CERTIFICATE') {
+        out.compress_certificate = value;
       } else if (name === 'CERTIFICATE_AUTHORITIES') {
         out.certificate_authorities = value;
       } else if (name === 'SCT') {
@@ -127,12 +136,21 @@ function build_tls_message(params) {
   } else if (params.type == 'certificate') {
     type = wire.TLS_MESSAGE_TYPE.CERTIFICATE;
     body = wire.build_certificate(params);
+  } else if (params.type == 'compressed_certificate') {
+    type = wire.TLS_MESSAGE_TYPE.COMPRESSED_CERTIFICATE;
+    body = wire.build_compressed_certificate(params);
+  } else if (params.type == 'certificate_status') {
+    type = wire.TLS_MESSAGE_TYPE.CERTIFICATE_STATUS;
+    body = wire.build_certificate_status(params.response);
   } else if (params.type == 'certificate_verify') {
     type = wire.TLS_MESSAGE_TYPE.CERTIFICATE_VERIFY;
     body = wire.build_certificate_verify(params.scheme, params.signature);
   } else if (params.type == 'finished') {
     type = wire.TLS_MESSAGE_TYPE.FINISHED;
     body = params.data;
+  } else if (params.type == 'end_of_early_data') {
+    type = wire.TLS_MESSAGE_TYPE.END_OF_EARLY_DATA;
+    body = new Uint8Array(0);
   } else if (params.type == 'key_update') {
     type = wire.TLS_MESSAGE_TYPE.KEY_UPDATE;
     body = wire.build_key_update(params.request_update);
@@ -167,7 +185,7 @@ function parse_tls_message(data, negotiatedVersion) {
   if (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO || message.type == wire.TLS_MESSAGE_TYPE.SERVER_HELLO) {
     let kind = (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO) ? 'client' : 'server';
     let hello = wire.parse_hello({ kind: kind, body: message.body });
-    out = normalize_hello(hello);
+    out = normalize_hello(hello, kind);
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.SERVER_KEY_EXCHANGE) {
     out = wire.parse_server_key_exchange(message.body);
@@ -191,6 +209,17 @@ function parse_tls_message(data, negotiatedVersion) {
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE) {
     out = wire.parse_certificate(message.body);
     out.type = 'certificate';
+
+  } else if (message.type == wire.TLS_MESSAGE_TYPE.COMPRESSED_CERTIFICATE) {
+    // RFC 8879: decompressed by the session, which knows what it offered.
+    out = wire.parse_compressed_certificate(message.body);
+    out.type = 'compressed_certificate';
+
+  } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE_STATUS) {
+    // TLS 1.2: the stapled OCSP response, between Certificate and
+    // ServerKeyExchange (RFC 6066 §8).
+    out = wire.parse_certificate_status(message.body);
+    out.type = 'certificate_status';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE_VERIFY) {
     // Decode scheme + signature so the session can actually VERIFY it.
@@ -218,6 +247,12 @@ function parse_tls_message(data, negotiatedVersion) {
       out = wire.parse_new_session_ticket(message.body);
     }
     out.type = 'new_session_ticket';
+
+  } else if (message.type == wire.TLS_MESSAGE_TYPE.END_OF_EARLY_DATA) {
+    // TLS over TCP, after early data (RFC 8446 §4.5): an empty body.
+    if (message.body.length !== 0) { let e = new Error('EndOfEarlyData with a body'); e.alertDesc = wire.TLS_ALERT.DECODE_ERROR; throw e; }
+    out.type = 'end_of_early_data';
+    out.body = message.body;
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.KEY_UPDATE) {
     out = wire.parse_key_update(message.body);

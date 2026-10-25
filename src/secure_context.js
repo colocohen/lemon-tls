@@ -117,6 +117,40 @@ function dedupeDerArray(arr) {
 function createSecureContext(options) {
   if (!options) options = {};
 
+  // Several key/certificate pairs — node:tls's arrays: `key` an array of
+  // keys (or { pem, passphrase }), `cert` an array of chains, one per key —
+  // for a server that holds certificates of more than one kind: an ML-DSA one
+  // for clients that ask for post-quantum authentication, an ECDSA or RSA one
+  // for everyone else. Each key is paired with the chain whose leaf carries
+  // its public key, in whatever order they were given; the first key's pair
+  // is the default, the others `alternates`. Which one a handshake presents
+  // is the client's signature_algorithms' to decide (tls_session).
+  if (Array.isArray(options.key) && options.key.length > 1) {
+    let certs = Array.isArray(options.cert) ? options.cert : [options.cert];
+    let contexts = options.key.map(function (k, i) {
+      let keyIn = (k && typeof k === 'object' && !Buffer.isBuffer(k) && !(k instanceof Uint8Array) && k.pem) ? k.pem : k;
+      let pass = (k && typeof k === 'object' && k.passphrase != null) ? k.passphrase : options.passphrase;
+      let pub = crypto.createPublicKey(makePrivateKeyFromDerOrPem(readMaybeFile(keyIn), pass)).export({ type: 'spki', format: 'der' });
+      let cert = null;
+      for (let j = 0; j < certs.length && cert === null; j++) {
+        let raw = readMaybeFile(certs[j]);
+        let first = isPEM(raw) ? splitPEMBlocks(raw.toString('utf8')).filter(function (b) { return b.type.indexOf('CERTIFICATE') !== -1; })[0] : { der: new Uint8Array(raw) };
+        if (!first) continue;
+        let leafPub = makeX509FromDerOrPem(first.der).publicKey.export({ type: 'spki', format: 'der' });
+        if (Buffer.compare(Buffer.from(leafPub), Buffer.from(pub)) === 0) cert = certs[j];
+      }
+      if (cert === null) throw new Error('createSecureContext: no certificate in `cert` for key ' + i);
+      return createSecureContext(Object.assign({}, options, { key: keyIn, passphrase: pass, cert: cert }));
+    });
+    let primary = contexts[0];
+    primary.alternates = contexts.slice(1).map(function (c) {
+      return { certificateChain: c.certificateChain, privateKey: c.privateKey, keyObj: c.keyObj, certObjs: c.certObjs };
+    });
+    return primary;
+  }
+  if (Array.isArray(options.key)) options = Object.assign({}, options, { key: options.key[0] && options.key[0].pem ? options.key[0].pem : options.key[0] });
+  if (Array.isArray(options.cert) && options.cert.length === 1) options = Object.assign({}, options, { cert: options.cert[0] });
+
   // --- תעודות (כולל שרשרת בתוך cert אם קיימת) ---
   let certBlocksDer = [];
   let certObjs = [];

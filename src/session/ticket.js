@@ -122,6 +122,25 @@ function encode_client_session(state) {
  * @param {Uint8Array|Buffer} blob
  * @returns {Object|null}
  */
+/**
+ * What an application may know of a client session blob ('session' event)
+ * without its secrets: { version, servername, alpn, created, expiresAt (ms),
+ * earlyData (whether its ticket allows 0-RTT) } — or null for a blob that is
+ * not one. For a cache to drop what has expired.
+ */
+function client_session_info(blob) {
+    let s = decode_client_session(blob);
+    if (!s) return null;
+    return {
+        version: s.v === 13 ? 'TLSv1.3' : s.v === 12 ? 'TLSv1.2' : null,
+        servername: s.sni != null ? s.sni : null,
+        alpn: s.alpn != null ? s.alpn : null,
+        created: typeof s.created === 'number' ? s.created : null,
+        expiresAt: typeof s.created === 'number' && typeof s.lifetime === 'number' ? s.created + s.lifetime * 1000 : null,
+        earlyData: !!(s.max_early_data > 0),
+    };
+}
+
 function decode_client_session(blob) {
     try {
         if (!blob || blob.length === 0) return null;
@@ -138,22 +157,19 @@ function decode_client_session(blob) {
 
 /**
  * Convert state object to JSON-safe form.
- * Uint8Array/Buffer fields → { $b: base64 }
+ * Uint8Array/Buffer values → { $b: base64 }, inside objects and arrays alike
+ * (a client blob holds the server's certificate chain: an array of DER).
  */
+function serialize_value(v) {
+    if (v == null) return null;
+    if (v instanceof Uint8Array || Buffer.isBuffer(v)) return { $b: Buffer.from(v).toString('base64') };
+    if (Array.isArray(v)) return v.map(serialize_value);
+    if (typeof v === 'object') return serialize_state(v);
+    return v;
+}
 function serialize_state(state) {
     let out = {};
-    for (let k in state) {
-        let v = state[k];
-        if (v == null) {
-            out[k] = null;
-        } else if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
-            out[k] = { $b: Buffer.from(v).toString('base64') };
-        } else if (typeof v === 'object' && !Array.isArray(v)) {
-            out[k] = serialize_state(v);
-        } else {
-            out[k] = v;
-        }
-    }
+    for (let k in state) out[k] = serialize_value(state[k]);
     return out;
 }
 
@@ -161,21 +177,17 @@ function serialize_state(state) {
  * Convert JSON-decoded form back to state object.
  * { $b: base64 } → Uint8Array
  */
+function deserialize_value(v) {
+    if (v == null) return null;
+    if (Array.isArray(v)) return v.map(deserialize_value);
+    if (typeof v === 'object' && typeof v.$b === 'string' && Object.keys(v).length === 1) return new Uint8Array(Buffer.from(v.$b, 'base64'));
+    if (typeof v === 'object') return deserialize_state(v);
+    return v;
+}
 function deserialize_state(obj) {
     if (obj == null) return null;
     let out = {};
-    for (let k in obj) {
-        let v = obj[k];
-        if (v == null) {
-            out[k] = null;
-        } else if (typeof v === 'object' && typeof v.$b === 'string' && Object.keys(v).length === 1) {
-            out[k] = new Uint8Array(Buffer.from(v.$b, 'base64'));
-        } else if (typeof v === 'object' && !Array.isArray(v)) {
-            out[k] = deserialize_state(v);
-        } else {
-            out[k] = v;
-        }
-    }
+    for (let k in obj) out[k] = deserialize_value(obj[k]);
     return out;
 }
 
@@ -183,6 +195,7 @@ export {
     encrypt_session_blob,
     decrypt_session_blob,
     encode_client_session,
+    client_session_info,
     decode_client_session,
     split_ticket_keys,
 };

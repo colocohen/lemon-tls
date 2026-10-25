@@ -163,8 +163,35 @@ function parseDN(dn) {
   return out;
 }
 
+/**
+ * A certificate (DER) as node:tls's getPeerCertificate() describes it:
+ * subject and issuer as RDN objects, the SAN string, the validity dates,
+ * fingerprints, serial, and the raw DER. One place for TLSSocket, the
+ * session's identity check and anything above (QUIC) — they built it
+ * apiece. Unparseable: just { raw }.
+ */
+function certificateObject(der) {
+  if (!der) return null;
+  try {
+    let x = new crypto.X509Certificate(der);
+    return {
+      subject: parseDN(x.subject),
+      issuer: parseDN(x.issuer),
+      subjectaltname: x.subjectAltName,
+      valid_from: x.validFrom,
+      valid_to: x.validTo,
+      fingerprint: x.fingerprint,
+      fingerprint256: x.fingerprint256,
+      serialNumber: x.serialNumber,
+      raw: der
+    };
+  } catch (e) {
+    return { raw: der };
+  }
+}
 
 export {
+  certificateObject,
   concatUint8Arrays,
   arraybufferEqual,
   arraysEqual,

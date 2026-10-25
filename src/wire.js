@@ -54,6 +54,14 @@ const TLS_CONTENT_TYPE = {
   APPLICATION_DATA: 23
 };
 
+// The largest one handshake message may be, as its header declares it, or a
+// CompressedCertificate decompressed to. OpenSSL allows a ClientHello of
+// 128 KB and certificate chains up to 100 KB (max_cert_list); QUIC's CRYPTO
+// buffer in QUICO is 64 KB. The 24-bit length would allow 16 MB — memory a
+// peer could make us hold, or inflate a few hundred bytes into, before it
+// has proven anything. A maxHandshakeSize below it lowers it.
+const HANDSHAKE_MESSAGE_MAX = 128 * 1024;
+
 const TLS_ALERT_LEVEL = {
   WARNING: 1,
   FATAL: 2
@@ -75,12 +83,14 @@ const TLS_ALERT = {
   PROTOCOL_VERSION: 70,
   INSUFFICIENT_SECURITY: 71,
   INTERNAL_ERROR: 80,
+  INAPPROPRIATE_FALLBACK: 86,   // RFC 7507 (TLS_FALLBACK_SCSV)
   USER_CANCELED: 90,
   MISSING_EXTENSION: 109,
   UNSUPPORTED_EXTENSION: 110,
   UNRECOGNIZED_NAME: 112,
   CERTIFICATE_REQUIRED: 116,
-  NO_APPLICATION_PROTOCOL: 120
+  NO_APPLICATION_PROTOCOL: 120,
+  ECH_REQUIRED: 121
 };
 
 const TLS_MESSAGE_TYPE = {
@@ -97,6 +107,8 @@ const TLS_MESSAGE_TYPE = {
   CLIENT_KEY_EXCHANGE: 16,
   FINISHED: 20,
   KEY_UPDATE: 24,
+  CERTIFICATE_STATUS: 22,       // RFC 6066 §8 (TLS 1.2: the stapled OCSP response)
+  COMPRESSED_CERTIFICATE: 25,   // RFC 8879
   MESSAGE_HASH: 254 // HRR flow marker
 };
 
@@ -113,6 +125,7 @@ const TLS_EXT = {
   MAX_FRAGMENT_LENGTH: 1,
   STATUS_REQUEST: 5,
   SUPPORTED_GROUPS: 10,
+  EC_POINT_FORMATS: 11,
   SIGNATURE_ALGORITHMS: 13,
   USE_SRTP: 14,
   HEARTBEAT: 15,
@@ -122,6 +135,7 @@ const TLS_EXT = {
   SERVER_CERT_TYPE: 20,
   PADDING: 21,
   EXTENDED_MASTER_SECRET: 23,
+  COMPRESS_CERTIFICATE: 27,     // RFC 8879
   SESSION_TICKET: 35,
   PRE_SHARED_KEY: 41,
   EARLY_DATA: 42,
@@ -304,6 +318,7 @@ let exts = {};
 exts.SERVER_NAME = { encode: null, decode: null };
 exts.SUPPORTED_VERSIONS = { encode: null, decode: null };
 exts.SUPPORTED_GROUPS = { encode: null, decode: null };
+exts.EC_POINT_FORMATS = { encode: null, decode: null };
 exts.SIGNATURE_ALGORITHMS = { encode: null, decode: null };
 exts.PSK_KEY_EXCHANGE_MODES = { encode: null, decode: null };
 exts.KEY_SHARE = { encode: null, decode: null };
@@ -313,6 +328,47 @@ exts.RENEGOTIATION_INFO = { encode: null, decode: null };
 exts.SESSION_TICKET = { encode: null, decode: null };
 exts.EXTENDED_MASTER_SECRET = { encode: null, decode: null };
 exts.CERTIFICATE_AUTHORITIES = { encode: null, decode: null };
+exts.COMPRESS_CERTIFICATE = { encode: null, decode: null };
+exts.STATUS_REQUEST = { encode: null, decode: null };
+
+/* ---------------------- STATUS_REQUEST (5) ---------------------- */
+// RFC 6066 §8. Three places, three bodies:
+//   ClientHello:       CertificateStatusRequest — status_type ocsp(1),
+//                      responder_id_list<0..2^16-1>, request_extensions<0..2^16-1>
+//   ServerHello (1.2): empty — "a CertificateStatus message follows"
+//   CertificateEntry (1.3, RFC 8446 §4.4.2.1): CertificateStatus itself
+// Encoded from { ocsp: true } (the request with empty lists, as every
+// browser sends it) or a raw body; decoded to { status_type } or {} when
+// empty. Unknown status types are not an error: the server just does not
+// answer them.
+exts.STATUS_REQUEST.encode = function (value) {
+  if (value instanceof Uint8Array) return value;
+  if (value && value.ocsp) return new Uint8Array([1, 0, 0, 0, 0]);
+  return new Uint8Array(0);
+};
+exts.STATUS_REQUEST.decode = function (data) {
+  if (data.length === 0) return {};
+  return { status_type: data[0] };
+};
+
+/* ---------------------- COMPRESS_CERTIFICATE (27) ---------------------- */
+// RFC 8879 §3: CertificateCompressionAlgorithm algorithms<2..2^8-2> — a
+// one-byte length, then 16-bit codes.
+exts.COMPRESS_CERTIFICATE.encode = function (value) {
+  let list = Array.isArray(value) ? value : [];
+  let out = new Uint8Array(1 + list.length * 2);
+  out[0] = list.length * 2;
+  for (let i = 0; i < list.length; i++) w_u16(out, 1 + i * 2, list[i]);
+  return out;
+};
+exts.COMPRESS_CERTIFICATE.decode = function (data) {
+  if (data.length < 1) throw parseError('compress_certificate: empty');
+  let n = data[0];
+  if (n < 2 || n % 2 !== 0 || 1 + n !== data.length) throw parseError('compress_certificate: bad length');
+  let out = [];
+  for (let i = 1; i < 1 + n; i += 2) out.push((data[i] << 8) | data[i + 1]);
+  return out;
+};
 
 /* ---------------------- CERTIFICATE_AUTHORITIES (47) ---------------------- */
 // RFC 8446 §4.2.4: DistinguishedName authorities<3..2^16-1> — the list is
@@ -527,6 +583,24 @@ exts.SUPPORTED_GROUPS.decode = function (data) {
   return out; // array of named groups
 };
 
+/* ---------------------------- EC_POINT_FORMATS (11) ---------------------------- */
+// RFC 8422 §5.1.2: ECPointFormat ec_point_format_list<1..2^8-1>, one byte per
+// format. 0 is uncompressed — the only format TLS 1.2 still uses, and the one
+// every list must contain.
+exts.EC_POINT_FORMATS.encode = function (value) {
+  let formats = Array.isArray(value) && value.length > 0 ? value : [0];
+  return veclen(1, new Uint8Array(formats));
+};
+
+exts.EC_POINT_FORMATS.decode = function (data) {
+  let off = 0;
+  let list;
+  [list, off] = readVec(data, off, 1);
+  if (off !== data.length) throw parseError('trailing data after ec_point_formats');
+  if (list.length === 0) throw parseError('empty ec_point_formats list');
+  return Array.from(list); // array of point formats
+};
+
 /* -------------------------- SIGNATURE_ALGORITHMS (13) -------------------------- */
 exts.SIGNATURE_ALGORITHMS.encode = function (value) {
   // A codec encodes what it is handed; the set of signature schemes is policy
@@ -723,7 +797,16 @@ exts.KEY_SHARE.encode = function (value) {
   return veclen(2, concatUint8Arrays(parts));
 };
 
-exts.KEY_SHARE.decode = function (data) {
+// `kind` — the message the extension is in ('client_hello', 'server_hello';
+// parse_hello passes it) — decides the form; the three forms cannot be told
+// apart by length. An empty client_shares, which RFC 8446 §4.2.8 allows ("in
+// order to request group selection from the server, at the cost of an
+// additional round trip"), is two bytes [00 00]: read as a HelloRetryRequest's
+// NamedGroup it became a share for group 0x0000, refused illegal_parameter
+// (not in supported_groups) — where the client asked for a HelloRetryRequest.
+// Scanners enumerate a server's groups exactly so; every probe failed.
+exts.KEY_SHARE.decode = function (data, kind) {
+  if (kind === 'client_hello') return decode_client_shares(data);
   // HelloRetryRequest form: just NamedGroup (2 bytes, no key_exchange)
   if (data.length === 2) {
     let g, off = 0;
@@ -747,12 +830,17 @@ exts.KEY_SHARE.decode = function (data) {
     }
   }
 
-  // ClientHello form: vector<2> of KeyShareEntry
+  return decode_client_shares(data);
+};
+
+// ClientHello form: vector<2> of KeyShareEntry, exactly filling the extension.
+function decode_client_shares(data) {
   let off2 = 0;
   let listBytes;
   [listBytes, off2] = r_u16(data, off2);
 
   let end = off2 + listBytes;
+  if (end !== data.length) throw parseError('key_share: client_shares length does not match the extension');
   let out = [];
 
   while (off2 < end) {
@@ -767,9 +855,10 @@ exts.KEY_SHARE.decode = function (data) {
 
     out.push({ group: g2, key_exchange: ke2 });
   }
+  if (off2 !== end) throw parseError('key_share: an entry overruns client_shares');
 
   return out; // array of entries
-};
+}
 
 /* ------------------------------------ ALPN (16) ----------------------------------- */
 exts.ALPN.encode = function (value) {
@@ -949,7 +1038,7 @@ function build_extensions(list) {
  *     CertificateRequest) → use parse_extension_list().
  * Both share this core so the duplicate/overflow rules apply identically.
  */
-function parse_extension_list(buf) {
+function parse_extension_list(buf, kind) {
   let off = 0;
   let out = [];
   let seen = {};   // RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type"
@@ -986,7 +1075,7 @@ function parse_extension_list(buf) {
 
     let name = ext_name_by_code(t);
     let dec = exts[name] && exts[name].decode;
-    let val = dec ? dec(d) : null;
+    let val = dec ? dec(d, kind) : null;
 
     out.push({ type: t, name: name, data: d, value: val });
   }
@@ -998,7 +1087,7 @@ function parse_extension_list(buf) {
  * Parse a length-prefixed extensions vector that ENDS the enclosing structure.
  * `buf` must START with the 2-byte vector length and contain nothing after it.
  */
-function parse_extensions(buf) {
+function parse_extensions(buf, kind) {
   let off = 0;
   let n;
   [n, off] = r_u16(buf, off);
@@ -1010,7 +1099,7 @@ function parse_extensions(buf) {
   if (end > buf.length) throw parseError('extensions vector length exceeds body');
   if (end < buf.length) throw parseError('trailing data after extensions vector');
 
-  return parse_extension_list(buf.subarray(off, end));
+  return parse_extension_list(buf.subarray(off, end), kind);
 }
 
 
@@ -1158,7 +1247,7 @@ function parse_hello(params) {
   let extensions = [];
   if (body.length > off) {
     let extRaw = body.subarray(off);
-    extensions = parse_extensions(extRaw);
+    extensions = parse_extensions(extRaw, type);
   }
 
   // --- version תמיד ערך יחיד ---
@@ -1260,6 +1349,51 @@ function build_certificate(params) {
     }
     return veclen(3, concatUint8Arrays(certListParts));
   }
+}
+
+/* ------------------------ CompressedCertificate ------------------------ */
+// RFC 8879 §4: algorithm (u16), uncompressed_length (u24),
+// compressed_certificate_message<1..2^24-1> (u24-prefixed).
+/**
+ * CertificateStatus (RFC 6066 §8): status_type ocsp(1), then the DER OCSP
+ * response as an opaque<1..2^24-1>. The body of the TLS 1.2 handshake
+ * message, and of the status_request extension in a TLS 1.3 CertificateEntry.
+ */
+function build_certificate_status(response) {
+  let r = toU8(response);
+  let out = new Uint8Array(4 + r.length);
+  out[0] = 1;
+  out[1] = (r.length >>> 16) & 0xff; out[2] = (r.length >>> 8) & 0xff; out[3] = r.length & 0xff;
+  out.set(r, 4);
+  return out;
+}
+
+/** CertificateStatus → { status_type, response }; decode_error on a bad length. */
+function parse_certificate_status(body) {
+  if (body.length < 4) throw parseError('CertificateStatus: too short');
+  let len = (body[1] << 16) | (body[2] << 8) | body[3];
+  if (len === 0 || 4 + len !== body.length) throw parseError('CertificateStatus: bad length');
+  return { status_type: body[0], response: body.slice(4) };
+}
+
+function build_compressed_certificate(params) {
+  let data = params.compressed;
+  let out = new Uint8Array(2 + 3 + 3 + data.length);
+  let o = 0;
+  o = w_u16(out, o, params.algorithm);
+  out[o++] = (params.uncompressed_length >>> 16) & 0xff; out[o++] = (params.uncompressed_length >>> 8) & 0xff; out[o++] = params.uncompressed_length & 0xff;
+  out[o++] = (data.length >>> 16) & 0xff; out[o++] = (data.length >>> 8) & 0xff; out[o++] = data.length & 0xff;
+  out.set(data, o);
+  return out;
+}
+
+function parse_compressed_certificate(body) {
+  if (body.length < 8) throw parseError('CompressedCertificate: truncated');
+  let algorithm = (body[0] << 8) | body[1];
+  let uncompressed_length = (body[2] << 16) | (body[3] << 8) | body[4];
+  let n = (body[5] << 16) | (body[6] << 8) | body[7];
+  if (n < 1 || 8 + n !== body.length) throw parseError('CompressedCertificate: bad length');
+  return { algorithm: algorithm, uncompressed_length: uncompressed_length, compressed: body.subarray(8) };
 }
 
 function parse_certificate(body) {
@@ -1932,6 +2066,7 @@ function parse_hello_verify_request(body) {
 
 /* ================================ Exports ================================= */
 export {
+  HANDSHAKE_MESSAGE_MAX,
   TLS_VERSION,
   DTLS_VERSION,
   is_tls13_wire,
@@ -1967,6 +2102,10 @@ export {
 
   build_certificate,
   parse_certificate,
+  build_compressed_certificate,
+  parse_compressed_certificate,
+  build_certificate_status,
+  parse_certificate_status,
 
   build_certificate_verify,
   parse_certificate_verify,

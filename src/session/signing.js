@@ -36,6 +36,27 @@ const SIG_SCHEMES_MODERN = [
   0x0804, 0x0805, 0x0806,   // rsa_pss_rsae_sha256/384/512
 ];
 
+// ML-DSA (FIPS 204), post-quantum signatures, TLS 1.3 only
+// (draft-ietf-tls-mldsa): mldsa44, mldsa65, mldsa87 — where node:crypto has
+// them (Node 24.7+, OpenSSL 3.5). Offered after the classical schemes: a
+// server holding both an ML-DSA and a classical certificate (key/cert
+// arrays) follows the client's order, and an ML-DSA chain is 3–4× the size
+// of an ECDSA one — kilobytes more in every handshake — so a client gets it
+// when it asks for it first. Offered at all so that a server with ML-DSA
+// alone can be verified.
+const MLDSA_SCHEMES = { 0x0904: 'ml-dsa-44', 0x0905: 'ml-dsa-65', 0x0906: 'ml-dsa-87' };
+const MLDSA_AVAILABLE = (function () {
+  try {
+    for (const code in MLDSA_SCHEMES) {
+      let kp = crypto.generateKeyPairSync(MLDSA_SCHEMES[code]);
+      let sig = crypto.sign(null, Buffer.from('x'), kp.privateKey);
+      if (!crypto.verify(null, Buffer.from('x'), kp.publicKey, sig)) return false;
+    }
+    return true;
+  } catch (e) { return false; }
+})();
+const SIG_SCHEMES_MLDSA = MLDSA_AVAILABLE ? [0x0904, 0x0905, 0x0906] : [];
+
 const SIG_SCHEMES_LEGACY_PKCS1 = [
   0x0401, 0x0501, 0x0601,   // rsa_pkcs1_sha256/384/512
 ];
@@ -73,6 +94,7 @@ const SIG_SCHEMES_LEGACY_SHA1 = [
  */
 function default_signature_schemes() {
   return SIG_SCHEMES_MODERN
+    .concat(SIG_SCHEMES_MLDSA)
     .concat(SIG_SCHEMES_LEGACY_PKCS1)
     .concat(SIG_SCHEMES_LEGACY_SHA1);
 }
@@ -97,6 +119,13 @@ function scheme_info(version, scheme) {
   // versions agree on every modern codepoint. sign_with_scheme and
   // verify_with_scheme share this function, so signing and verification can
   // never drift apart.
+
+  // ML-DSA: TLS 1.3 only (draft-ietf-tls-mldsa §3), pure ML-DSA with an
+  // empty context string — the whole TLS 1.3 signature input, unhashed.
+  if (MLDSA_SCHEMES[scheme]) {
+    if (!MLDSA_AVAILABLE || version !== TLS_VERSION_TLS1_3) return null;
+    return { hash: null, sig: 'mldsa', isPSS: false };
+  }
 
   // EdDSA
   if (scheme === 0x0807 || scheme === 0x0808) {
@@ -129,8 +158,13 @@ function scheme_info(version, scheme) {
 
 /**
  * Pick the best signature scheme given the server's key type and client's supported list.
+ * `localAllowed`, when given and not empty: our own list — only a scheme in
+ * both is used (OpenSSL's "shared sigalgs"). Without it, the `sigalgs` a
+ * server was configured with limited what it offered and accepted, and not
+ * what it signed with: an ECDSA key restricted to RSA-PSS still signed with
+ * ECDSA.
  */
-function pick_scheme(version, certKeyObj, peerSupported) {
+function pick_scheme(version, certKeyObj, peerSupported, localAllowed) {
   // Iterate the PEER's list, in the peer's own order.
   //
   // RFC 8446 §4.2.3: signature_algorithms is "in descending order of
@@ -151,6 +185,7 @@ function pick_scheme(version, certKeyObj, peerSupported) {
   for (let i = 0; i < peerSupported.length; i++) {
     let s2 = peerSupported[i];
     if (typeof s2 !== 'number') continue;
+    if (Array.isArray(localAllowed) && localAllowed.length > 0 && localAllowed.indexOf(s2) < 0) continue;
     if (!scheme_matches_key(version, s2, certKeyObj)) continue;
     picked = s2;
     break;
@@ -168,7 +203,7 @@ function sign_with_scheme(version, scheme, tbs, certKeyObj) {
   let info = scheme_info(version, scheme);
   if (!info) return null;
 
-  if (info.sig === 'eddsa') {
+  if (info.sig === 'eddsa' || info.sig === 'mldsa') {
     return new Uint8Array(crypto.sign(null, tbs, certKeyObj));
   }
 
@@ -213,6 +248,7 @@ function sign_with_scheme(version, scheme, tbs, certKeyObj) {
  *                     CertificateVerify (scheme_info returns null there)
  *   ecdsa_*         → EC key on exactly the curve the scheme names
  *   ed25519/ed448   → the matching Edwards key
+ *   mldsa44/65/87   → the ML-DSA key of that parameter set
  * Returns false for any scheme unusable at this version, so callers get
  * version filtering for free.
  */
@@ -247,6 +283,8 @@ function scheme_matches_key(version, scheme, keyObj) {
     return want === null || curve === want;
   }
 
+  if (info.sig === 'mldsa') return kt === MLDSA_SCHEMES[scheme];
+
   if (info.sig === 'eddsa') {
     if (scheme === 0x0807) return kt === 'ed25519';
     if (scheme === 0x0808) return kt === 'ed448';
@@ -277,7 +315,7 @@ function verify_with_scheme(version, scheme, tbs, publicKey, signature) {
   if (!scheme_matches_key(version, scheme, publicKey)) return false;
 
   try {
-    if (info.sig === 'eddsa') {
+    if (info.sig === 'eddsa' || info.sig === 'mldsa') {
       return crypto.verify(null, tbs, publicKey, signature);
     }
 
@@ -310,7 +348,20 @@ function verify_with_scheme(version, scheme, tbs, publicKey, signature) {
   return false;
 }
 
+// IANA's names (RFC 8446 §4.2.3; draft-ietf-tls-mldsa).
+const SCHEME_NAMES = {
+  0x0401: 'rsa_pkcs1_sha256', 0x0501: 'rsa_pkcs1_sha384', 0x0601: 'rsa_pkcs1_sha512',
+  0x0403: 'ecdsa_secp256r1_sha256', 0x0503: 'ecdsa_secp384r1_sha384', 0x0603: 'ecdsa_secp521r1_sha512',
+  0x0804: 'rsa_pss_rsae_sha256', 0x0805: 'rsa_pss_rsae_sha384', 0x0806: 'rsa_pss_rsae_sha512',
+  0x0807: 'ed25519', 0x0808: 'ed448',
+  0x0809: 'rsa_pss_pss_sha256', 0x080a: 'rsa_pss_pss_sha384', 0x080b: 'rsa_pss_pss_sha512',
+  0x0904: 'mldsa44', 0x0905: 'mldsa65', 0x0906: 'mldsa87',
+  0x0201: 'rsa_pkcs1_sha1', 0x0203: 'ecdsa_sha1',
+};
+function scheme_name(scheme) { return SCHEME_NAMES[scheme] || null; }
+
 export {
+  scheme_name,
   scheme_info,
   pick_scheme,
   sign_with_scheme,
@@ -318,5 +369,7 @@ export {
   SIG_SCHEMES_MODERN,
   SIG_SCHEMES_LEGACY_PKCS1,
   SIG_SCHEMES_LEGACY_SHA1,
+  SIG_SCHEMES_MLDSA,
+  MLDSA_AVAILABLE,
   default_signature_schemes
 };

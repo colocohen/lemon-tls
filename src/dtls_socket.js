@@ -51,6 +51,7 @@ function DTLSSocket(udpSocket, options) {
     minVersion: options.minVersion,
     maxVersion: options.maxVersion,
     mtu: options.mtu,
+    groups: options.groups,
     ticketKeys: options.ticketKeys,
     useCookies: options.useCookies,
     srtpProfiles: options.srtpProfiles,
@@ -131,15 +132,11 @@ function DTLSSocket(udpSocket, options) {
   self.getALPN = function() { return session.getALPN(); };
   self.getPeerCertificate = function() { return session.getPeerCertificate(); };
 
-  /** Every fingerprint of this connection: { ja3, ja4, ja3s, ja4s, ja4x }.
-   *  Both the client and the server values are populated in either role. */
-  self.getFingerprints = function(opts) {
-    return session.getFingerprints ? session.getFingerprints(opts)
-      : { ja3: null, ja4: null, ja3s: null, ja4s: null, ja4x: null };
-  };
-
-  /** JA3 of the connection's ClientHello. Shorthand for getFingerprints().ja3. */
-  self.getJA3 = function() { return session.getJA3 ? session.getJA3() : null; };
+  /** TLS fingerprints, { hash, raw } or null (see TLSSession): JA4 and JA5
+   *  of the ClientHello, JA4S of the ServerHello — in either role. */
+  self.getJA4 = function(opts) { return session.getJA4(opts); };
+  self.getJA5 = function(opts) { return session.getJA5(opts); };
+  self.getJA4S = function(opts) { return session.getJA4S(opts); };
 
   /** Set the key and certificate for this connection (Node parity). */
   self.setKeyCert = function(ctxOrOpts) {
@@ -226,6 +223,7 @@ function createDTLSServer(options, connectionListener) {
           minVersion: options.minVersion,
           maxVersion: options.maxVersion,
           mtu: options.mtu,
+          groups: options.groups,
           ticketKeys: options.ticketKeys,
           useCookies: options.useCookies,
           srtpProfiles: options.srtpProfiles,
@@ -309,6 +307,7 @@ function connectDTLS(options, callback) {
     minVersion: options.minVersion,
     maxVersion: options.maxVersion,
     mtu: options.mtu,
+    groups: options.groups,
   });
 
   if (callback) socket.on('connect', callback);

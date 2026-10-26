@@ -186,6 +186,20 @@ function createSecureContext(options) {
     if (!privateKey) throw new Error('createSecureContext: missing private key.');
   }
 
+  // The key must be the certificate's — node:tls throws on this too
+  // (KEY_VALUES_MISMATCH). Unchecked, a renewal that paired the new key with
+  // the old certificate went in without a word, and every handshake after it
+  // failed at the client's signature check.
+  if (keyObj && certObjs.length > 0) {
+    let fromKey = crypto.createPublicKey(keyObj).export({ type: 'spki', format: 'der' });
+    let fromCert = certObjs[0].publicKey.export({ type: 'spki', format: 'der' });
+    if (Buffer.compare(Buffer.from(fromKey), Buffer.from(fromCert)) !== 0) {
+      let e = new Error('createSecureContext: the private key does not match the certificate');
+      e.code = 'ERR_OSSL_X509_KEY_VALUES_MISMATCH';
+      throw e;
+    }
+  }
+
   // --- CA (Trust store) ---
   let ca = normalizeCA(options.ca);
 

@@ -1,0 +1,40 @@
+// lemon-tls/record — The record layer: AEAD keys and nonces, encrypt/decrypt for TLS and DTLS records.
+// Low-level: typed loosely; see the source for each signature.
+
+export declare const CT: any;
+export declare function aesEcbEncrypt(...args: any[]): any;
+export declare function buildAad12(...args: any[]): any;
+export declare function buildDtlsAad12(...args: any[]): any;
+export declare function buildDtlsAck(...args: any[]): any;
+export declare function buildDtlsPlaintext(...args: any[]): any;
+export declare function buildEncryptedDtls12(...args: any[]): any;
+export declare function buildEncryptedDtls13(...args: any[]): any;
+export declare function buildUnifiedHdr(...args: any[]): any;
+export declare function decrypt12(...args: any[]): any;
+export declare function decryptDtls12(...args: any[]): any;
+export declare function decryptEncryptedDtls13(...args: any[]): any;
+export declare function decryptRecord(...args: any[]): any;
+export declare function decryptRecordWithAadView(...args: any[]): any;
+export declare function deriveKeys(...args: any[]): any;
+export declare function deriveKeys12(...args: any[]): any;
+export declare function encrypt12(...args: any[]): any;
+export declare function encryptCompleteRecord12(...args: any[]): any;
+export declare function encryptCompleteRecord13(...args: any[]): any;
+export declare function encryptDtls12(...args: any[]): any;
+export declare function encryptRecord(...args: any[]): any;
+export declare function getAeadAlgo(...args: any[]): any;
+export declare function getChachaNonce12(...args: any[]): any;
+export declare function getNonce(...args: any[]): any;
+export declare function getNonce12(...args: any[]): any;
+export declare function getNonceInto(...args: any[]): any;
+export declare function isUnifiedHdr(...args: any[]): any;
+export declare function maskRecordNumber(...args: any[]): any;
+export declare function parseDtlsAck(...args: any[]): any;
+export declare function parseDtlsDatagram(...args: any[]): any;
+export declare function parseDtlsPlaintext(...args: any[]): any;
+export declare function parseInnerPlaintext(...args: any[]): any;
+export declare function parseUnifiedHdr(...args: any[]): any;
+export declare function reconstructDtlsSeq(...args: any[]): any;
+export declare function resolveReadEpoch(...args: any[]): any;
+export declare function seqToBytes(...args: any[]): any;
+export declare function writeRecord(...args: any[]): any;

@@ -603,6 +603,12 @@ function Server(options, connectionListener) {
     return self._tcpServer.getConnections(cb);
   };
 
+  // node:net's: whether it is listening, and whether the process may exit
+  // while it does.
+  Object.defineProperty(self, 'listening', { get: function() { return self._tcpServer.listening; }, enumerable: true });
+  self.ref = function() { self._tcpServer.ref(); return self; };
+  self.unref = function() { self._tcpServer.unref(); return self; };
+
   // Ticket key management
   self.getTicketKeys = function() {
     return Buffer.from(self._ticketKeys);
@@ -631,11 +637,13 @@ function Server(options, connectionListener) {
     self._ech = ech || null;
   };
 
-  // setSecureContext — replace cert/key without restart (Node.js compat)
+  // setSecureContext — replace cert/key without restart (Node.js compat).
+  // A bad one throws, as Node's does, and the certificate in use stays: it
+  // returned quietly when key or cert was missing, and a renewal that read
+  // an empty file went unnoticed until the old certificate expired.
   self.setSecureContext = function(opts) {
-    if (!opts) return;
-    if (opts.secureContext) { defaultCtx = opts.secureContext; return; }
-    if (opts.key && opts.cert) defaultCtx = createSecureContext(opts);
+    if (!opts || typeof opts !== 'object') throw new TypeError('setSecureContext requires { key, cert } or { secureContext }');
+    defaultCtx = opts.secureContext ? opts.secureContext : createSecureContext(opts);
   };
 
   /**

@@ -1,10 +1,26 @@
 {
   "name": "lemon-tls",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "TLS 1.3/1.2 DTLS 1.3/1.2 implementation for Node.js - full control over cryptographic keys, record layer, and handshake. Drop-in replacement for node:tls with advanced options impossible in OpenSSL.",
   "main": "index.js",
   "type": "module",
   "types": "index.d.ts",
+  "typesVersions": {
+    "*": {
+      "wire": [
+        "types/wire.d.ts"
+      ],
+      "crypto": [
+        "types/crypto.d.ts"
+      ],
+      "record": [
+        "types/record.d.ts"
+      ],
+      "session": [
+        "types/session.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
       "types": "./index.d.ts",
@@ -12,22 +28,35 @@
       "require": "./index.cjs",
       "default": "./index.js"
     },
-    "./wire": "./src/wire.js",
-    "./crypto": "./src/crypto.js",
-    "./record": "./src/record.js",
-    "./session": "./src/tls_session.js"
+    "./wire": {
+      "types": "./types/wire.d.ts",
+      "default": "./src/wire.js"
+    },
+    "./crypto": {
+      "types": "./types/crypto.d.ts",
+      "default": "./src/crypto.js"
+    },
+    "./record": {
+      "types": "./types/record.d.ts",
+      "default": "./src/record.js"
+    },
+    "./session": {
+      "types": "./types/session.d.ts",
+      "default": "./src/tls_session.js"
+    }
   },
   "files": [
     "index.js",
     "index.cjs",
     "index.d.ts",
+    "types/",
     "src/",
     "README.md",
     "LICENSE",
     "lemontls.svg"
   ],
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=24.0.0"
   },
   "keywords": [
     "tls",
@@ -70,6 +99,10 @@
     "alpn",
     "ja3",
     "ja3-fingerprint",
+    "ja4",
+    "ja4-fingerprint",
+    "ja5",
+    "ja5-fingerprint",
     "fingerprint",
     "keylog",
     "wireshark",

@@ -1,12 +1,14 @@
 /**
  * CJS wrapper for lemon-tls.
- * 
- * On Node 22+, require('lemon-tls') works natively with the ESM module.
- * On Node 16-21, this wrapper provides require() support via dynamic import.
  *
- * Usage:
- *   const tls = require('lemon-tls');           // sync on Node 22+
- *   const tls = await require('lemon-tls');     // async on Node 16-21
+ * lemon-tls needs Node 24+ (package.json "engines"), where require() of an
+ * ES module is built in: require('lemon-tls') returns the module itself,
+ * synchronously.
+ *
+ *   const tls = require('lemon-tls');
+ *
+ * The fallback below — a Promise of the module — is for a runtime or bundler
+ * whose require() cannot load ES modules; there, `await require('lemon-tls')`.
  */
 
 let cached = null;
@@ -21,7 +23,7 @@ try {
   const m = require('./index.js');
   module.exports = m.default || m;
 } catch (e) {
-  // Node 16-21: return a promise that resolves to the module
+  // require() of ES modules not available: a promise of the module.
   // Users need: const tls = await require('lemon-tls');
   module.exports = load();
   module.exports.__esModule = true;

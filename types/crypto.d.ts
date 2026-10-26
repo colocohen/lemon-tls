@@ -1,0 +1,40 @@
+// lemon-tls/crypto — Key schedule primitives: HKDF, the TLS 1.3 secrets, exporters, cipher-suite tables.
+// Low-level: typed loosely; see the source for each signature.
+
+export declare const DEFAULT_CIPHER_SUITES_TLS12: any;
+export declare const DEFAULT_CIPHER_SUITES_TLS13: any;
+export declare const LABEL_PREFIX_DTLS13: string;
+export declare const LABEL_PREFIX_TLS13: string;
+export declare const TLS_CIPHER_SUITES: any;
+export declare function build_cert_verify_tbs(...args: any[]): any;
+export declare function build_cert_verify_tbs_with_hash(...args: any[]): any;
+export declare function build_hkdf_label(...args: any[]): any;
+export declare function compute_psk_binder(...args: any[]): any;
+export declare function default_cipher_suites(...args: any[]): any;
+export declare function derive_app_traffic_secrets(...args: any[]): any;
+export declare function derive_app_traffic_secrets_with_hash(...args: any[]): any;
+export declare function derive_binder_key(...args: any[]): any;
+export declare function derive_client_early_traffic_secret(...args: any[]): any;
+export declare function derive_exporter_master_secret_with_hash(...args: any[]): any;
+export declare function derive_handshake_traffic_secrets(...args: any[]): any;
+export declare function derive_handshake_traffic_secrets_psk(...args: any[]): any;
+export declare function derive_handshake_traffic_secrets_psk_with_hash(...args: any[]): any;
+export declare function derive_handshake_traffic_secrets_with_hash(...args: any[]): any;
+export declare function derive_psk(...args: any[]): any;
+export declare function derive_resumption_master_secret(...args: any[]): any;
+export declare function derive_resumption_master_secret_with_hash(...args: any[]): any;
+export declare function derive_sn_key(...args: any[]): any;
+export declare function getHashFn(...args: any[]): any;
+export declare function getHashLen(...args: any[]): any;
+export declare function get_handshake_finished(...args: any[]): any;
+export declare function get_handshake_finished_with_hash(...args: any[]): any;
+export declare function hkdf_expand(...args: any[]): any;
+export declare function hkdf_expand_label(...args: any[]): any;
+export declare function hkdf_extract(...args: any[]): any;
+export declare function hmac(...args: any[]): any;
+export declare function is_usable_cipher_suite(...args: any[]): any;
+export declare function suite_matches_version(...args: any[]): any;
+export declare function tls12_exporter(...args: any[]): any;
+export declare function tls12_prf(...args: any[]): any;
+export declare function tls13_exporter(...args: any[]): any;
+export declare function tls_derive_from_master_secret_tls12(...args: any[]): any;

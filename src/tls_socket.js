@@ -491,146 +491,202 @@ function TLSSocket(duplex, options){
         }
     }
 
-    // trial: early data not taken may come before the client's handshake
-    // flight (RFC 8446 §4.2.10): a record that the handshake key does not
-    // open is that, and is skipped (false) rather than fatal.
-    function processCiphertext(body, header, trial){
-        // Hot path — same optimizations as writeAppDataSingle:
-        //   - cached context.isTls13 instead of per-record session.getVersion()
-        //   - cached context.aeadAlgo instead of per-record getAeadAlgo()
-        //   - getTrafficSecrets() called once per key derivation (not per decrypt)
-        //   - For TLS 1.3 app-data: header view is used directly as AAD, avoiding
-        //     the 5-byte AAD allocation that decryptRecord would otherwise do
-        let out = null;
-        const isTls13 = context.isTls13 !== undefined
-            ? context.isTls13
-            : session.getVersion() === 0x0304; // early records (pre-secureConnect)
+    // ============================================================================
+    //  Reading records: one state, one set of rules
+    // ============================================================================
+    //
+    // What protects the next record from the peer is one of four states, and
+    // every rule about what a record may be follows from it — rather than from
+    // flags tested here and there (remote_ccs_seen, using_app_keys), which is
+    // how a plaintext Finished came to be read after the ServerHello, how a
+    // TLS 1.2 record's type came to be guessed instead of authenticated, and
+    // how application data came to be taken before the handshake was done.
+    //
+    //   'plain' — nothing yet: before the TLS 1.3 handshake keys (or before the
+    //             version is known); a TLS 1.2 handshake before the peer's
+    //             ChangeCipherSpec.
+    //   'hs13'  — TLS 1.3 under the handshake traffic keys: after the
+    //             ServerHello, until the peer's Finished.
+    //   'app13' — TLS 1.3 under the application traffic keys.
+    //   'tls12' — TLS 1.2 after the peer's ChangeCipherSpec: every record
+    //             protected, its type authenticated (it is in the AAD).
+    function negotiated13() {
+        if (context.isTls13 !== undefined) return context.isTls13;
+        const v = session.getVersion();
+        return v === 0x0304 ? true : v === 0x0303 ? false : undefined;
+    }
+    // The peer's Finished, verified: from here it writes under its
+    // application keys (TLS 1.3), and what it sends is application data it
+    // may send (both). Not using_app_keys, which flips at 'secureConnect' —
+    // later, for a server (its ticket goes first): a record in between was
+    // read under the wrong keys, and a CCS there passed as one before the
+    // Finished.
+    function peerFinished() {
+        return context.using_app_keys === true || (session.context && session.context.remote_finished_ok === true);
+    }
+    function readState() {
+        const v13 = negotiated13();
+        if (v13 === false) return context.remote_ccs_seen ? 'tls12' : 'plain';
+        if (v13 === true) {
+            if (peerFinished()) return 'app13';
+            const hs = session.getHandshakeSecrets();
+            if (hs && hs.remoteSecret) return 'hs13';
+        }
+        return 'plain';
+    }
 
-        // AEAD decryption can throw on any forged/corrupted record (GCM/ChaCha
-        // tag mismatch surfaces as an exception from decipher.final()). Left
-        // unhandled, a single injected bad segment would throw out of the
-        // transport 'data' handler — an unhandled exception that tears down the
-        // connection or the process: a trivial remote DoS.
-        //
-        // RFC 8446 §5.2: in TLS (unlike DTLS, which silently drops), a record
-        // that fails to decrypt MUST be treated as a fatal error. So we catch,
-        // send a fatal bad_record_mac alert, destroy the connection, and stop.
-        // The read sequence number is intentionally NOT advanced on failure —
-        // the rejected record never counts.
+    // Every fatal condition of the record layer ends the same way: our alert,
+    // both layers inert, the transport ended after the alert has gone (end(),
+    // which also uncorks the flight the alert sits in — destroy() dropped it:
+    // 336 of 338 bad_record_mac alerts were never sent), then the report.
+    function abort(alert, message, code) {
+        if (context.destroyed) return;
+        const err = new Error(message);
+        if (code) err.code = code;
+        try { session.sendAlert(2, alert); } catch (e) {}
+        markTransportDead();
+        closeAfterAlert();
+        self.emit('error', err);
+    }
+
+    // A record's plaintext, by its content type — the decrypted one, or a
+    // cleartext record's own. Content longer than a record carries is
+    // record_overflow (RFC 8446 §5.4, RFC 5246 §6.2.1); a handshake or alert
+    // fragment of zero bytes is not one (§5.1).
+    function dispatchContent(contentType, content, state) {
+        if (content.length > 16384) {
+            abort(TLS_ALERT.RECORD_OVERFLOW, 'record of ' + content.length + ' bytes of plaintext, more than 2^14', 'ERR_SSL_RECORD_OVERFLOW');
+            return;
+        }
+        if (contentType === CT.APPLICATION_DATA) {
+            // Only once the handshake is done: under TLS 1.3's application
+            // keys; in TLS 1.2 after the peer's Finished.
+            // Before that, it was handed to the reader all the same.
+            if (state === 'app13' || (state === 'tls12' && peerFinished())) {
+                if (content.length > 0) pushAppData(content);
+                return;
+            }
+            abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'application data before the handshake is complete', 'ERR_SSL_UNEXPECTED_MESSAGE');
+            return;
+        }
+        if (contentType === CT.HANDSHAKE) {
+            if (content.length === 0) { abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'empty handshake record', 'ERR_SSL_UNEXPECTED_MESSAGE'); return; }
+            feedHandshakeBytes(content);
+            return;
+        }
+        if (contentType === CT.ALERT) { handleAlert(content); return; }
+        // Anything else — a ChangeCipherSpec inside protection (§5: "MUST
+        // abort"), content type 0, an unknown one: unexpected_message.
+        abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'unexpected content type ' + contentType + ' in a ' + state + ' record', 'ERR_SSL_UNEXPECTED_MESSAGE');
+    }
+
+    // TLS 1.3 protected record (outer type application_data), under the keys
+    // of `state`. trial: early data not taken may come before the client's
+    // handshake flight (RFC 8446 §4.2.10): a record the handshake key does not
+    // open is that, and is skipped (false) rather than fatal.
+    function openRecord13(body, header, state, trial) {
+        let out;
         try {
-        if (!isTls13 && context.remote_ccs_seen === true) {
-            // TLS 1.2: decrypt with key_block derived keys
+            const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
+            if (state === 'app13') {
+                if (context.app_read_key === null) {
+                    const ts = session.getTrafficSecrets();
+                    if (ts.remoteAppSecret === null) throw new Error('no application read key');
+                    const d = tls_derive_from_tls_secrets(ts.remoteAppSecret, ts.cipher);
+                    context.app_read_key = d.key;
+                    context.app_read_iv = d.iv;
+                }
+                out = decrypt_tls_record_with_aad(header, body, context.app_read_key,
+                    get_nonce_into(context._nonceDecScratch, context.app_read_iv, context.app_read_seq), algo);
+                context.app_read_seq++;
+            } else {
+                if (context.handshake_read_key === null) {
+                    const hs = session.getHandshakeSecrets();
+                    if (hs.remoteSecret === null || hs.cipher === null) throw new Error('no handshake read key');
+                    const d = tls_derive_from_tls_secrets(hs.remoteSecret, hs.cipher);
+                    context.handshake_read_key = d.key;
+                    context.handshake_read_iv = d.iv;
+                }
+                out = decrypt_tls_record_with_aad(header, body, context.handshake_read_key,
+                    get_nonce_into(context._nonceDecScratch, context.handshake_read_iv, context.handshake_read_seq), algo);
+                context.handshake_read_seq++;
+            }
+        } catch (e) {
+            // RFC 8446 §5.2: a record that does not open is fatal. The read
+            // sequence is not advanced — the rejected record never counts.
+            if (trial) return false;
+            abort(TLS_ALERT.BAD_RECORD_MAC, 'TLS record decryption failed (bad_record_mac)', 'ERR_SSL_BAD_RECORD_MAC');
+            return false;
+        }
+        if (trial) context.early.trialDone = true;
+        // TLSInnerPlaintext: content, the type, then zeros. All zeros: no
+        // type at all (§5.4: unexpected_message) — it was an 'error' event
+        // and a connection left open.
+        let j = out.length - 1;
+        while (j >= 0 && out[j] === 0) j--;
+        if (j < 0) {
+            abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'TLSInnerPlaintext with no content type', 'ERR_SSL_UNEXPECTED_MESSAGE');
+            return true;
+        }
+        dispatchContent(out[j], out.subarray(0, j), state);
+        return true;
+    }
+
+    // TLS 1.2 protected record: its type — the header's — is part of the AAD
+    // (RFC 5246 §6.2.3.3). It was guessed from the state (handshake until the
+    // handshake was done, application data after), so a record relabelled
+    // from one to the other on the way still opened; and an encrypted alert
+    // was read as a cleartext one.
+    function openRecord12(type, body) {
+        let out;
+        try {
             if (context.app_read_key === null) {
                 const ts = session.getTrafficSecrets();
-
-                // Guard: if master_secret isn't derived yet, we can't compute keys.
-                if (!ts.masterSecret) {
-                    self.emit('error', new Error('Received encrypted record before master_secret derived'));
-                    return;
-                }
-
+                if (!ts.masterSecret) throw new Error('no master secret');
                 const d12 = deriveKeys12(ts.masterSecret, ts.localRandom, ts.remoteRandom, ts.cipher, ts.isServer);
                 context.app_read_key = d12.readKey;
                 context.app_read_iv = d12.readIv;
                 context.app_write_key = d12.writeKey;
                 context.app_write_iv = d12.writeIv;
             }
-
-            const recordType = context.using_app_keys ? 0x17 : 0x16;
-            out = decrypt_tls12_fragment(body, context.app_read_key, context.app_read_iv, context.tls12_read_seq, recordType);
-
-        } else if (isTls13 && context.using_app_keys === true) {
-            // TLS 1.3: decrypt app data with app traffic secret
-            if (context.app_read_key === null) {
-                const ts = session.getTrafficSecrets();
-                if (ts.remoteAppSecret === null) return;
-                const d = tls_derive_from_tls_secrets(ts.remoteAppSecret, ts.cipher);
-                context.app_read_key = d.key;
-                context.app_read_iv = d.iv;
-            }
-
-            const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
-            // Use header-view AAD path when header is available (parseRecordsAndDispatch).
-            // Saves a 5-byte allocation per record — small individually but meaningful
-            // cumulatively on the Download hot path (many records per second).
-            // get_nonce_into also reuses context._nonceDecScratch to avoid alloc per record.
-            const nonce = get_nonce_into(context._nonceDecScratch, context.app_read_iv, context.app_read_seq);
-            if (header !== undefined) {
-                out = decrypt_tls_record_with_aad(header, body, context.app_read_key, nonce, algo);
-            } else {
-                out = decrypt_tls_record(body, context.app_read_key, nonce, algo);
-            }
-            context.app_read_seq++;
-
-        } else if (isTls13) {
-            // TLS 1.3: decrypt handshake with handshake traffic secret
-            if (context.handshake_read_key === null) {
-                const hs = session.getHandshakeSecrets();
-                if (hs.remoteSecret === null || hs.cipher === null) return;
-                const d = tls_derive_from_tls_secrets(hs.remoteSecret, hs.cipher);
-                context.handshake_read_key = d.key;
-                context.handshake_read_iv = d.iv;
-            }
-
-            const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
-            const nonce = get_nonce_into(context._nonceDecScratch, context.handshake_read_iv, context.handshake_read_seq);
-            if (header !== undefined) {
-                out = decrypt_tls_record_with_aad(header, body, context.handshake_read_key, nonce, algo);
-            } else {
-                out = decrypt_tls_record(body, context.handshake_read_key, nonce, algo);
-            }
-            context.handshake_read_seq++;
-        }
+            out = decrypt_tls12_fragment(body, context.app_read_key, context.app_read_iv, context.tls12_read_seq, type);
+            context.tls12_read_seq++;
         } catch (e) {
-            if (trial) return false;
-            // Record failed authentication → fatal bad_record_mac (RFC 8446 §5.2).
-            try { session.sendAlert ? session.sendAlert(2, TLS_ALERT.BAD_RECORD_MAC) : null; } catch (_) {}
-            self.emit('error', new Error('TLS record decryption failed (bad_record_mac)'));
-            self.destroy();
+            abort(TLS_ALERT.BAD_RECORD_MAC, 'TLS record decryption failed (bad_record_mac)', 'ERR_SSL_BAD_RECORD_MAC');
             return;
         }
-
-
-        if (out !== null) {
-            // Reuse cached isTls13 computed at the top of this function
-            if (isTls13) {
-                // Inlined parseInnerPlaintext — parse_tls_inner_plaintext would
-                // allocate a {type, content} object per record. With 640 records
-                // per 10MB download, that's 640 short-lived objects just for
-                // destructuring — enough GC pressure to matter. We do the scan
-                // and dispatch directly here.
-                let j = out.length - 1;
-                while (j >= 0 && out[j] === 0) j--;
-                if (j < 0) {
-                    self.emit('error', new Error('Malformed TLSInnerPlaintext'));
-                    return;
-                }
-                const content_type = out[j];
-
-                if (content_type === CT.APPLICATION_DATA) {
-                    // zero-copy view into the decrypted plaintext
-                    pushAppData(out.subarray(0, j));
-                } else if (content_type === CT.HANDSHAKE) {
-                    feedHandshakeBytes(out.subarray(0, j));
-                } else if (content_type === CT.ALERT) {
-                    // TLS 1.3 alerts after ServerHello are encrypted — a client
-                    // refusing our certificate always sends its alert this way.
-                    // They were decrypted and dropped here.
-                    handleAlert(out.subarray(0, j));
-                }
-            } else {
-                // TLS 1.2: no inner plaintext wrapping — `out` is the Buffer from decrypt12
-                if (context.using_app_keys === true) {
-                    pushAppData(out);
-                } else {
-                    feedHandshakeBytes(out);
-                }
-            }
-        }
-        if (trial && out !== null) context.early.trialDone = true;
-        return out !== null;
+        dispatchContent(type, out, 'tls12');
     }
 
+    // ChangeCipherSpec: one byte, 1 (RFC 8446 §5, RFC 5246 §7.1).
+    //   TLS 1.2: once, when the peer's keys exist (the master secret is
+    //     derived) and no handshake message is cut by it (§5.1 of 8446 holds
+    //     the same for 1.2: messages do not straddle a key change).
+    //   TLS 1.3: a middlebox-compatibility record, dropped — "at any time
+    //     after the first ClientHello ... and before the peer's Finished"
+    //     (§5); not before the version is known, not after the Finished.
+    // Anything else: unexpected_message. A CCS of two bytes, or one after the
+    // Finished, used to be passed over in silence.
+    function handleChangeCipherSpec(body, state) {
+        if (body.length !== 1 || body[0] !== 0x01) {
+            abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'malformed ChangeCipherSpec (' + body.length + ' bytes)', 'ERR_SSL_UNEXPECTED_MESSAGE');
+            return;
+        }
+        const v13 = negotiated13();
+        if (v13 === true) {
+            if (state === 'app13') abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'ChangeCipherSpec after the Finished', 'ERR_SSL_UNEXPECTED_MESSAGE');
+            return;   // compatibility record: dropped, no sequence advanced
+        }
+        if (v13 === false && state === 'plain') {
+            const ts = session.getTrafficSecrets();
+            if (ts && ts.masterSecret && (context.hsBuf === null || context.hsBuf.length === 0)) {
+                context.tls12_read_seq = 0;
+                context.remote_ccs_seen = true;
+                return;
+            }
+        }
+        abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'unexpected ChangeCipherSpec', 'ERR_SSL_UNEXPECTED_MESSAGE');
+    }
 
     // ============================================================================
     //  Early data (0-RTT over TCP, RFC 8446 §4.2.10, §4.5)
@@ -670,10 +726,7 @@ function TLSSocket(duplex, options){
     }
 
     function earlyTooMuch() {
-        try { session.sendAlert(2, TLS_ALERT.UNEXPECTED_MESSAGE); } catch (e) {}
-        self.emit('error', new Error('More early data than max_early_data_size'));
-        markTransportDead();
-        closeAfterAlert();
+        abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'More early data than max_early_data_size', 'ERR_SSL_UNEXPECTED_MESSAGE');
     }
 
     // A record of early data not taken: skipped, counted (its plaintext at
@@ -690,24 +743,23 @@ function TLSSocket(duplex, options){
         try {
             out = decrypt_tls_record_with_aad(header, body, r.key, get_nonce_into(context._nonceDecScratch, r.iv, r.seq), r.algo);
         } catch (e) {
-            try { session.sendAlert(2, TLS_ALERT.BAD_RECORD_MAC); } catch (_) {}
-            self.emit('error', new Error('TLS early data record decryption failed (bad_record_mac)'));
-            self.destroy();
+            abort(TLS_ALERT.BAD_RECORD_MAC, 'TLS early data record decryption failed (bad_record_mac)', 'ERR_SSL_BAD_RECORD_MAC');
             return;
         }
         r.seq++;
         let j = out.length - 1;
         while (j >= 0 && out[j] === 0) j--;
-        if (j < 0) { self.emit('error', new Error('Malformed TLSInnerPlaintext')); return; }
+        if (j < 0) { abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'TLSInnerPlaintext with no content type', 'ERR_SSL_UNEXPECTED_MESSAGE'); return; }
         const ct = out[j];
         if (ct === CT.APPLICATION_DATA) {
+            if (j > 16384) { abort(TLS_ALERT.RECORD_OVERFLOW, 'early data record of ' + j + ' bytes, more than 2^14', 'ERR_SSL_RECORD_OVERFLOW'); return; }
             context.early.recv += j;
             if (context.early.recv > earlyLimit()) { earlyTooMuch(); return; }
             if (j > 0) pushAppData(out.subarray(0, j));
-        } else if (ct === CT.HANDSHAKE) {
-            feedHandshakeBytes(out.subarray(0, j));      // EndOfEarlyData, and nothing else (the session checks)
-        } else if (ct === CT.ALERT) {
-            handleAlert(out.subarray(0, j));
+        } else {
+            // EndOfEarlyData (the session checks it is that), an alert, or
+            // anything else — the same rules as any other record.
+            dispatchContent(ct, out.subarray(0, j), 'hs13');
         }
     }
 
@@ -859,9 +911,7 @@ function TLSSocket(duplex, options){
             if (len > maxMsg) {
                 // OpenSSL's answer to an excessive message: illegal_parameter.
                 context.hsBuf = null;
-                try { session.sendAlert(2, TLS_ALERT.ILLEGAL_PARAMETER); } catch (_) {}
-                self.emit('error', new Error('TLS handshake message of ' + len + ' bytes, more than ' + maxMsg));
-                self.destroy();
+                abort(TLS_ALERT.ILLEGAL_PARAMETER, 'TLS handshake message of ' + len + ' bytes, more than ' + maxMsg);
                 return;
             }
             if (context.hsBuf.length < 4 + len) break; // partial message — wait for more records
@@ -923,25 +973,25 @@ function TLSSocket(duplex, options){
             // in silence; OpenSSL rejects on the header ("wrong version
             // number"), and so does this now, with node:tls's codes.
             //   RFC 8446 §5.1: legacy_record_version is 0x03xx, ContentType
-            //   one of the four; §5.2: no record beyond 2^14 + 256 bytes of
-            //   ciphertext (2^14 + 2048 in TLS 1.2, RFC 5246 §6.2.3).
+            //   one of the four. The length, by the state the record is read
+            //   in: a cleartext record carries at most 2^14 bytes; a TLS 1.3
+            //   protected one 2^14 + 256 (§5.2) — early data, still before
+            //   the handshake keys, is one; a TLS 1.2 one 2^14 + 2048
+            //   (RFC 5246 §6.2.3). It was 2^14 + 2048 for all.
+            const state = readState();
             {
                 const recVer = (rb[off + 1] << 8) | rb[off + 2];
-                let bad = null, alert = 0;
+                const maxLen = state === 'tls12' ? 16384 + 2048
+                             : (state === 'hs13' || state === 'app13' || type === CT.APPLICATION_DATA) ? 16384 + 256
+                             : 16384;
                 if ((recVer >>> 8) !== 0x03 || type < CT.CHANGE_CIPHER_SPEC || type > CT.APPLICATION_DATA) {
-                    bad = new Error('wrong version number: not a TLS record (type 0x' + type.toString(16) + ', version 0x' + recVer.toString(16) + ')');
-                    bad.code = 'ERR_SSL_WRONG_VERSION_NUMBER';
-                    alert = (recVer >>> 8) !== 0x03 ? TLS_ALERT.PROTOCOL_VERSION : TLS_ALERT.UNEXPECTED_MESSAGE;
-                } else if (len > 16384 + 2048) {
-                    bad = new Error('record overflow: ' + len + ' bytes');
-                    bad.code = 'ERR_SSL_RECORD_OVERFLOW';
-                    alert = TLS_ALERT.RECORD_OVERFLOW;
+                    abort((recVer >>> 8) !== 0x03 ? TLS_ALERT.PROTOCOL_VERSION : TLS_ALERT.UNEXPECTED_MESSAGE,
+                        'wrong version number: not a TLS record (type 0x' + type.toString(16) + ', version 0x' + recVer.toString(16) + ')',
+                        'ERR_SSL_WRONG_VERSION_NUMBER');
+                    return;
                 }
-                if (bad) {
-                    try { session.sendAlert(2, alert); } catch (e) {}
-                    self.emit('error', bad);
-                    markTransportDead();
-                    closeAfterAlert();
+                if (len > maxLen) {
+                    abort(TLS_ALERT.RECORD_OVERFLOW, 'record overflow: ' + len + ' bytes, more than ' + maxLen, 'ERR_SSL_RECORD_OVERFLOW');
                     return;
                 }
             }
@@ -959,86 +1009,57 @@ function TLSSocket(duplex, options){
             // CPU (BoGo: TooManyEmptyFragments / TooManyChangeCipherSpec).
             if (len === 0) {
                 if (++context.consecutive_empty_records > 32) {
-                    try { session.sendAlert(2, TLS_ALERT.UNEXPECTED_MESSAGE); } catch (e) {}
-                    self.emit('error', new Error('Too many consecutive empty records'));
-                    markTransportDead();
-                    closeAfterAlert();
+                    abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'Too many consecutive empty records');
                     return;
                 }
             } else {
                 context.consecutive_empty_records = 0;
             }
-
             if (type === CT.CHANGE_CIPHER_SPEC) {
                 if (++context.consecutive_ccs_records > 8) {
-                    try { session.sendAlert(2, TLS_ALERT.UNEXPECTED_MESSAGE); } catch (e) {}
-                    self.emit('error', new Error('Too many consecutive ChangeCipherSpec records'));
-                    markTransportDead();
-                    closeAfterAlert();
+                    abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'Too many consecutive ChangeCipherSpec records');
                     return;
                 }
             } else {
                 context.consecutive_ccs_records = 0;
             }
 
-            if (type === CT.APPLICATION_DATA && session.isServer && !context.using_app_keys && context.isTls13 !== false) {
+            // Early data, at a TLS 1.3 server that has not yet the client's
+            // Finished: its own rules (see "Early data").
+            if (type === CT.APPLICATION_DATA && session.isServer && state !== 'app13' && state !== 'tls12' && negotiated13() !== false) {
                 const em = serverEarlyMode();
                 if (em === 'pending') { off -= 5 + len; break; }   // the decision first; this record waits
                 if (em === 'skip') { if (!skipEarly(len)) return; continue; }
                 if (em === 'accepted') { processEarlyRecord(body, header); if (context.destroyed) return; continue; }
-                if (em === 'trial') { if (!processCiphertext(body, header, true) && !skipEarly(len)) return; continue; }
+                if (em === 'trial' && state === 'hs13') { if (!openRecord13(body, header, state, true) && !skipEarly(len)) return; continue; }
             }
-            if (type === CT.APPLICATION_DATA) {
-                processCiphertext(body, header);
-                context.tls12_read_seq++;
-            } else if (type === CT.HANDSHAKE) {
-                if (context.remote_ccs_seen === true) {
-                    // Encrypted handshake (TLS 1.2 Finished post-CCS). decrypt output is
-                    // a FRESH Buffer per record — safe to pass views of it downstream.
-                    processCiphertext(body, header);
+
+            if (type === CT.CHANGE_CIPHER_SPEC) {
+                handleChangeCipherSpec(body, state);
+            } else if (state === 'tls12') {
+                // Everything after the peer's CCS is protected, its type
+                // authenticated with it.
+                openRecord12(type, body);
+            } else if (state === 'hs13' || state === 'app13') {
+                if (type === CT.APPLICATION_DATA) {
+                    openRecord13(body, header, state, false);
+                } else if (type === CT.ALERT && state === 'hs13') {
+                    // A peer that cannot yet protect its alert — a client
+                    // refusing the ServerHello before it has the keys.
+                    dispatchContent(CT.ALERT, body, state);
                 } else {
-                    // Plaintext handshake (ClientHello, ServerHello, Certificate, ...).
-                    // `body` is a zero-copy view into readBuffer. session.message()
-                    // stashes the raw bytes into the handshake transcript (used later
-                    // for Finished MAC verification and TLS 1.3 key derivation), and
-                    // also extracts fields like remote_random as subarray views.
-                    //
-                    // When the NEXT incoming chunk triggers readBuffer compact/reuse,
-                    // those stashed views would point to overwritten bytes — causing
-                    // bad key derivations and GCM tag failures much later. We must hand
-                    // the session an owned Buffer so its transcript survives.
-                    feedHandshakeBytes(body);
+                    // A cleartext handshake record — or alert — where only
+                    // protected records may be (RFC 8446 §5: unexpected_message).
+                    // A cleartext Finished was taken here, and a KeyUpdate
+                    // injected on the path was acted on.
+                    abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'unprotected record (type ' + type + ') after the handshake keys', 'ERR_SSL_UNEXPECTED_MESSAGE');
                 }
-                context.tls12_read_seq++;
-            } else if (type === CT.CHANGE_CIPHER_SPEC) {
-                // Version-dependent meaning:
-                //  - TLS 1.2: a real protocol event — the peer's next records
-                //    are encrypted. Flip remote_ccs_seen so type-22 records are
-                //    routed to the decrypt path.
-                //  - TLS 1.3: a middlebox-compat artifact (RFC 8446 §D.4)
-                //    carrying no meaning; cipher state is driven by the key
-                //    schedule. It MUST be ignored and MUST NOT advance any
-                //    read sequence.
-                //
-                // The test is "do we POSITIVELY know this is TLS 1.2", not
-                // "is it not 1.3", and that is the correct test on its own
-                // merits: a CCS carries no meaning unless we have actually
-                // negotiated 1.2, so an unknown version must not be treated as
-                // a cipher change. (It also used to be load-bearing for a
-                // second reason — the HelloRetryRequest path did not record
-                // selected_version, so mid-HRR the version was simply unknown.
-                // That gap is fixed at its source now, but the rule stands.)
-                const ccsVersion = (context.isTls13 !== undefined)
-                    ? (context.isTls13 ? 0x0304 : 0x0303)
-                    : session.getVersion();
-                if (ccsVersion === 0x0303) {
-                    context.tls12_read_seq = 0;
-                    context.remote_ccs_seen = true;
-                }
-                // TLS 1.3, or version not yet negotiated: swallow silently.
-            } else if (type === CT.ALERT) {
-                handleAlert(body);
+            } else {
+                // 'plain': handshake and alerts in the clear; application data
+                // has no place before the keys.
+                dispatchContent(type, body, state);
             }
+            if (context.destroyed) return;
         }
 
         // Reset offsets when buffer is fully drained (enables fast path on next chunk)
@@ -1108,10 +1129,22 @@ function TLSSocket(duplex, options){
     // certificate") — without it the socket just closed and nothing learned
     // why: a server could not see that clients were refusing its certificate.
     function handleAlert(body) {
-        if (!body || body.length < 2) return;
-        const level = body[0];
+        // Two bytes, a level of 1 or 2 (RFC 8446 §6, RFC 5246 §7.2). An empty
+        // or short alert was passed over and the connection left open.
+        if (!body || body.length !== 2) {
+            abort(TLS_ALERT.DECODE_ERROR, 'alert of ' + (body ? body.length : 0) + ' bytes, not 2', 'ERR_SSL_DECODE_ERROR');
+            return;
+        }
+        if (body[0] !== TLS_ALERT_LEVEL.WARNING && body[0] !== TLS_ALERT_LEVEL.FATAL) {
+            abort(TLS_ALERT.ILLEGAL_PARAMETER, 'alert of level ' + body[0], 'ERR_SSL_ILLEGAL_PARAMETER');
+            return;
+        }
         const desc  = body[1];
-        self.emit('alert', { level: level, description: desc });
+        // TLS 1.3: every alert but close_notify and user_canceled ends the
+        // connection, "regardless of the AlertLevel in the message" (§6.2).
+        const level = (negotiated13() === true && desc !== TLS_ALERT.CLOSE_NOTIFY && desc !== TLS_ALERT.USER_CANCELED)
+            ? TLS_ALERT_LEVEL.FATAL : body[0];
+        self.emit('alert', { level: body[0], description: desc });
         if (desc === TLS_ALERT.CLOSE_NOTIFY) {
             // The peer is done sending: end our readable side, so 'end' is
             // emitted once what came before it is read.
@@ -1563,10 +1596,8 @@ function TLSSocket(duplex, options){
         // peer packed after its Finished — a framing violation, not padding.
         if (context.hsBuf !== null && context.hsBuf.length > 0) {
             context.hsBuf = null;
-            markTransportDead();
-            self.emit('error', new Error('Trailing data after handshake completion (decode_error)'));
-            const t = context.transport;
-            if (t && typeof t.destroy === 'function' && !t.destroyed) t.destroy();
+            // An alert this time: the peer learns why.
+            abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'Trailing data after handshake completion', 'ERR_SSL_UNEXPECTED_MESSAGE');
             return;
         }
 
@@ -2040,9 +2071,11 @@ function TLSSocket(duplex, options){
             flushEarly();
         }
 
+        // A HelloRetryRequest is TLS 1.3 by definition — the version need not
+        // be recorded yet, and was not: the CCS went after the second
+        // ServerHello instead of right after the HRR.
         if (session.isServer &&
-            (type === 'hello' || type === 'hello_retry_request') &&
-            session.getVersion() === 0x0304) {
+            (type === 'hello_retry_request' || (type === 'hello' && session.getVersion() === 0x0304))) {
             sendCompatCCS();
         }
     }

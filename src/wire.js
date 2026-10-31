@@ -1977,11 +1977,14 @@ function build_key_update(request_update) {
 }
 
 /**
- * Parse KeyUpdate message body.
- * Returns { request_update: 0|1 }
+ * Parse KeyUpdate message body (RFC 8446 §4.6.3): one byte, 0 or 1.
+ * Returns { request_update: 0|1 }. Another length: decode_error; another
+ * value: illegal_parameter ("MUST" — it was read as 0, and a 2 passed).
  */
 function parse_key_update(body) {
-  return { request_update: body[0] || 0 };
+  if (!body || body.length !== 1) throw parseError('KeyUpdate of ' + (body ? body.length : 0) + ' bytes, not 1');
+  if (body[0] > 1) throw parseError('KeyUpdate request_update ' + body[0] + ', not 0 or 1', TLS_ALERT.ILLEGAL_PARAMETER);
+  return { request_update: body[0] };
 }
 
 

@@ -299,6 +299,12 @@ function connectDTLS(options, callback) {
     remoteAddress: host,
     remotePort: port,
     servername: options.servername || host,
+    // The client's own certificate (a server that asks for one — WebRTC
+    // always does) and its SRTP profiles: they were not passed on, so a
+    // connectDTLS client presented nothing.
+    cert: options.cert,
+    key: options.key,
+    srtpProfiles: options.srtpProfiles,
     rejectUnauthorized: options.rejectUnauthorized,
     checkServerIdentity: options.checkServerIdentity,
     requestCert: options.requestCert,

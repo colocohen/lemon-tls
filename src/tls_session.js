@@ -1197,6 +1197,41 @@ function TLSSession(options){
   }
 
   /**
+   * The peer's handshake signature — TLS 1.3 CertificateVerify (either role),
+   * TLS 1.2 CertificateVerify (a client's), TLS 1.2 ServerKeyExchange (a
+   * server's) — checked in one place, in one order:
+   *
+   *   1. the signature itself, under the leaf's key (verify_with_scheme, which
+   *      also binds the scheme to the key type): decrypt_error if it fails;
+   *   2. then the scheme: one we offered (RFC 8446 §4.4.3, RFC 5246 §7.4.8,
+   *      RFC 4492 §5.4 — "MUST be one of those present in" our
+   *      signature_algorithms, sent in the ClientHello or the
+   *      CertificateRequest): illegal_parameter if not. Not before 1: a
+   *      policy error must not stand in for a signature failure.
+   *
+   * It was three copies, one per message, and the scheme was held to what we
+   * offered in none of them (1.3: removed on purpose; 1.2: never written) —
+   * so `sigalgs` narrowed what we asked for, not what we took.
+   *
+   * Returns null when the signature stands; otherwise { alert, reason }, for
+   * the caller's fatalAlert. On success, records it (peerSignatureVerified).
+   */
+  function check_peer_signature(version, scheme, tbs, signature, what) {
+    let pub = peer_leaf_public_key();
+    if (!pub) return { alert: wire.TLS_ALERT.BAD_CERTIFICATE, reason: 'Cannot read peer certificate public key' };
+    if (verify_with_scheme(version, scheme, tbs, pub, signature) !== true) {
+      return { alert: wire.TLS_ALERT.DECRYPT_ERROR, reason: what + ' signature verification failed' };
+    }
+    let offered = context.local_supported_signature_algorithms || [];
+    if (offered.length > 0 && offered.indexOf(scheme) < 0) {
+      return { alert: wire.TLS_ALERT.ILLEGAL_PARAMETER, reason: what + ' signed with scheme 0x' + (scheme >>> 0).toString(16) + ', which was not offered' };
+    }
+    context.peerSignatureVerified = true;
+    context.peerSignatureScheme = scheme;
+    return null;
+  }
+
+  /**
    * The cipher suite a ServerHello / HelloRetryRequest selected.
    *
    * parse_hello normalises the server's single choice into `cipher_suites[0]`,
@@ -2255,6 +2290,19 @@ function TLSSession(options){
             fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'pre_shared_key identities/binders count mismatch (' + nIds + '/' + nBinders + ')');
             return;
           }
+          // ...and the last extension, its binders list the hello's last bytes
+          // (§4.2.11: "MUST be the last extension", or illegal_parameter): the
+          // binders are computed over the hello up to them.
+          let chExts = Array.isArray(message.extensions) ? message.extensions : [];
+          let lastExt = chExts[chExts.length - 1];
+          let bindersLen = 0;
+          for (let bi = 0; bi < nBinders; bi++) bindersLen += 1 + message.pre_shared_key.binders[bi].length;
+          let ld = lastExt && lastExt.data;
+          if (!lastExt || lastExt.type !== 41 || !ld || ld.length < 2 + bindersLen ||
+              ((ld[ld.length - 2 - bindersLen] << 8) | ld[ld.length - 1 - bindersLen]) !== bindersLen) {
+            fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'pre_shared_key not the last extension, or its binders not the last bytes');
+            return;
+          }
         }
       }
 
@@ -2349,7 +2397,14 @@ function TLSSession(options){
           let binder_key = derive_binder_key(hashName, pskResult.psk, false, label_prefix());
 
           let hashLen = getHashFn(hashName).outputLen;
-          let bindersSize = 2 + 1 + hashLen;
+          // The binders list, as it is on the wire, ends the hello (§4.2.11:
+          // pre_shared_key is last): its 2-byte length, then each binder with
+          // its 1-byte length. Taken as one binder of hashLen, as it was, a
+          // client offering two tickets (h3spec does; a client that keeps
+          // every ticket it is given does) never matched: always a full
+          // handshake, never 0-RTT.
+          let bindersSize = 2;
+          for (let bi = 0; bi < message.pre_shared_key.binders.length; bi++) bindersSize += 1 + message.pre_shared_key.binders[bi].length;
           // After a HelloRetryRequest the binder covers message_hash and the
           // retry too (§4.2.11.2): what the transcript holds before this hello.
           let truncatedCH = data.slice(0, data.length - bindersSize);
@@ -2369,7 +2424,18 @@ function TLSSession(options){
           // a time. timingSafeEqualU8 always compares the full length.
           let binderOk = timingSafeEqualU8(expectedBinder, pskBinder);
 
-          dbg('SRV-PSK', binderOk ? '✓ BINDER MATCH — psk_accepted' : '✗ BINDER MISMATCH — full handshake');
+          dbg('SRV-PSK', binderOk ? '✓ BINDER MATCH — psk_accepted' : '✗ BINDER MISMATCH — decrypt_error');
+
+          // A ticket of ours, opened, whose binder does not verify: the
+          // handshake ends (RFC 8446 §4.2.11: "MUST abort", decrypt_error) —
+          // the hello was changed on the way, or the client does not hold the
+          // PSK. It went on as a full handshake, which hid exactly the bug that
+          // made every two-ticket hello miss. A ticket that cannot be opened
+          // (expired, another key, another server) is still just not used.
+          if (!binderOk) {
+            fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'PSK binder does not verify');
+            return;
+          }
 
           if (binderOk) {
             context.psk_accepted = true;
@@ -3035,12 +3101,6 @@ function TLSSession(options){
           return;
         }
 
-        let skePubKey = peer_leaf_public_key();
-        if (!skePubKey) {
-          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'Cannot read server certificate public key');
-          return;
-        }
-
         // Rebuild the exact signed payload: randoms in wire order (client
         // first) followed by the ServerECDHParams as they appeared.
         let ecdhParams = wire.build_server_ecdh_params(message.group, message.public_key);
@@ -3050,22 +3110,8 @@ function TLSSession(options){
           ecdhParams
         ]);
 
-        let skeOk = verify_with_scheme(
-          wire.TLS_VERSION.TLS1_2,
-          message.sig_alg,
-          skeTbs,
-          skePubKey,
-          message.signature
-        );
-
-        // Same strict test as the CertificateVerify gate: fail closed.
-        if (skeOk !== true) {
-          fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'ServerKeyExchange signature verification failed');
-          return;
-        }
-
-        context.peerSignatureVerified = true;
-        context.peerSignatureScheme = message.sig_alg;
+        let skeBad = check_peer_signature(wire.TLS_VERSION.TLS1_2, message.sig_alg, skeTbs, message.signature, 'ServerKeyExchange');
+        if (skeBad) { fatalAlert(skeBad.alert, skeBad.reason); return; }
       }
 
       if (is_ecdhe_suite(context.selected_cipher_suite)) {//ECDHE
@@ -3251,6 +3297,14 @@ function TLSSession(options){
 
     }else if(message.type=='certificate'){
 
+      // A client sends a Certificate only when asked for one (RFC 8446
+      // §4.4.2, RFC 5246 §7.4.6): unasked, unexpected_message. It was taken,
+      // checked and kept — a peer certificate the server never wanted.
+      if (context.isServer && !context.certificateRequestSent) {
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'Certificate from a client that was not asked for one');
+        return;
+      }
+
       pushTranscript(data);
 
       let entries = message.entries || [];
@@ -3307,6 +3361,12 @@ function TLSSession(options){
 
     }else if(message.type=='certificate_verify'){
 
+      // Likewise its CertificateVerify, and only after a certificate.
+      if (context.isServer && (!context.certificateRequestSent || !context.remote_cert_chain || context.remote_cert_chain.length === 0)) {
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'CertificateVerify from a client with no certificate asked for or sent');
+        return;
+      }
+
       // RFC 8446 §4.4.3 — verify the peer's handshake signature.
       //
       // This is the step that actually authenticates the peer: without it,
@@ -3337,52 +3397,32 @@ function TLSSession(options){
           return;
         }
 
-        // Note on ordering: the cryptographic check below is the SECURITY
-        // decision and must be the thing that gates acceptance. An additional
-        // "was this scheme in our signature_algorithms" policy check
-        // (RFC 8446 §4.4.3) used to run FIRST here and abort with
-        // illegal_parameter. That was wrong in two ways: it let a
-        // scheme-decoding anomaly turn into a spurious rejection before the
-        // signature was ever checked, and it reported a policy error for what
-        // may be a signature failure. verify_with_scheme already rejects any
-        // scheme it cannot map to a (hash, algorithm, padding) triple, and
-        // binds the scheme to the certificate's key type, so an unoffered or
-        // unknown scheme still cannot verify.
-
-        let peerPubKey = peer_leaf_public_key();
-        if (!peerPubKey) {
-          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'Cannot read peer certificate public key');
-          return;
-        }
-
         let cvHashName = negotiated_hash();
-        // isServer=false here means "we are the client, so the signature we
-        // are checking is the SERVER's" — the label follows the SIGNER's role,
-        // which is the opposite of ours.
-        let signerIsServer = !context.isServer;
-        let tbs = build_cert_verify_tbs_with_hash(cvHashName, signerIsServer, get_transcript_hash(cvHashName));
+        // The label follows the SIGNER's role, the opposite of ours.
+        let tbs = build_cert_verify_tbs_with_hash(cvHashName, !context.isServer, get_transcript_hash(cvHashName));
+        // DTLS 1.3 shares TLS 1.3's scheme semantics.
+        let cvBad = check_peer_signature(wire.TLS_VERSION.TLS1_3, message.scheme, tbs, message.signature, 'CertificateVerify');
+        if (cvBad) { fatalAlert(cvBad.alert, cvBad.reason); return; }
+      } else {
 
-        let sigOk = verify_with_scheme(
-          wire.TLS_VERSION.TLS1_3,     // DTLS 1.3 shares TLS 1.3 scheme semantics
-          message.scheme,
-          tbs,
-          peerPubKey,
-          message.signature
-        );
-
-        // Gate on "is exactly true", not on truthiness. verify_with_scheme
-        // already returns a strict boolean, but writing the test this way means
-        // a future refactor that lets some path fall through returning
-        // undefined fails CLOSED rather than open. The distinction matters here
-        // more than almost anywhere else in the library: this single value is
-        // what stands between us and an unauthenticated peer.
-        if (sigOk !== true) {
-          fatalAlert(wire.TLS_ALERT.DECRYPT_ERROR, 'CertificateVerify signature verification failed');
+        // TLS 1.2 / DTLS 1.2 (RFC 5246 §7.4.8): the client's signature over
+        // every handshake message up to this one — the bytes themselves, which
+        // the scheme hashes; DTLS's transcript holds its own form (the
+        // transcript hook), as for Finished. It was never checked: only the
+        // 1.3 branch above verified, and the completion gate was 1.3-only too,
+        // so a client presenting anyone's certificate — public data — with
+        // random bytes for a signature, or none, was authorized as its owner.
+        // Fail closed, as above.
+        if (!context.isServer) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'CertificateVerify from a TLS 1.2 server');
           return;
         }
-
-        context.peerSignatureVerified = true;
-        context.peerSignatureScheme = message.scheme;
+        if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) {
+          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'CertificateVerify without a preceding Certificate');
+          return;
+        }
+        let cvBad12 = check_peer_signature(wire.TLS_VERSION.TLS1_2, message.scheme, concatUint8Arrays(context.transcript), message.signature, 'CertificateVerify');
+        if (cvBad12) { fatalAlert(cvBad12.alert, cvBad12.reason); return; }
       }
 
       pushTranscript(data);
@@ -3411,7 +3451,9 @@ function TLSSession(options){
       //
       // Applies in both roles: a client checks the server's certificate, and a
       // server checks a client certificate it was offered.
-      if (is13() && context.remote_cert_chain && context.remote_cert_chain.length > 0 &&
+      // Every version: in 1.2 a client's certificate is proved by its
+      // CertificateVerify, the server's by its ServerKeyExchange signature.
+      if (context.remote_cert_chain && context.remote_cert_chain.length > 0 &&
           context.peerSignatureVerified !== true) {
         fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
           'Finished received after a certificate that was never proved by a CertificateVerify');
@@ -3511,8 +3553,16 @@ function TLSSession(options){
 
     }else if(message.type=='key_update'){
 
+      // Only once the handshake is done (RFC 8446 §4.6.3: "an
+      // unexpected_message alert" for one before Finished). It used to be
+      // passed over without a word.
+      if(context.state!=='connected' || !is13()){
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'KeyUpdate before the handshake is complete');
+        return;
+      }
+
       // Peer is updating their traffic secret (we update our read key)
-      if(context.state==='connected' && (is13())){
+      {
         let hashName = negotiated_hash();
         let hashLen = getHashLen(hashName);
         let newRemoteSecret = hkdf_expand_label(hashName, context.remote_app_traffic_secret, 'traffic upd', new Uint8Array(0), hashLen, label_prefix());
@@ -5302,6 +5352,23 @@ function TLSSession(options){
             if (context.certificateRequested && !context.clientCertSent) {
               context.clientCertSent = true;
 
+              // The client's cert / key options (tls.connect's): what the 1.3
+              // path sends. This one read only local_cert_chain, which a
+              // client's options never fill — so a TLS 1.2 client sent an
+              // empty Certificate whatever it was given.
+              if ((!context.local_cert_chain || context.local_cert_chain.length === 0) && context.clientCert && context.clientKey) {
+                let cc = { key: context.clientKey, cert: context.clientCert };
+                if (context.clientKeyPassphrase) cc.passphrase = context.clientKeyPassphrase;
+                let ccCtx;
+                // A key that is not the certificate's (or unreadable): the
+                // handshake ends here, an alert sent — it threw out of the
+                // record layer, uncaught.
+                try { ccCtx = createSecureContext(cc); }
+                catch (e) { fatalAlert(wire.TLS_ALERT.INTERNAL_ERROR, 'client certificate: ' + e.message); return; }
+                context.local_cert_chain = ccCtx.certificateChain;
+                context.cert_private_key = ccCtx.privateKey;
+              }
+
               // Build TLS 1.2 Certificate message
               let certEntries = [];
               if (context.local_cert_chain && context.local_cert_chain.length > 0) {
@@ -5571,7 +5638,9 @@ function TLSSession(options){
           // explicit null as an error rather than as "no passphrase".
           let certOpts = { key: context.clientKey, cert: context.clientCert };
           if (context.clientKeyPassphrase) certOpts.passphrase = context.clientKeyPassphrase;
-          let certCtx = createSecureContext(certOpts);
+          let certCtx;
+          try { certCtx = createSecureContext(certOpts); }
+          catch (e) { fatalAlert(wire.TLS_ALERT.INTERNAL_ERROR, 'client certificate: ' + e.message); return; }
           let cert_data = certificate_message(certCtx.certificateChain, context.certificateRequestContext || new Uint8Array(0));
           pushTranscript(cert_data);
           ev.emit('message', 1, context.message_sent_seq, 'certificate', cert_data);
@@ -6000,11 +6069,9 @@ function TLSSession(options){
           // (b) present-but-unproved. Unconditional: it applies even when the
           // certificate was optional, because the question is not "did we want
           // one" but "does this peer own the one it sent". In TLS 1.2 the
-          // client's CertificateVerify sets peerSignatureVerified the same way.
-          if (clientCertPresent &&
-              (context.selected_version === wire.TLS_VERSION.TLS1_3 ||
-               context.selected_version === wire.DTLS_VERSION.DTLS1_3) &&
-              context.peerSignatureVerified !== true) {
+          // client's CertificateVerify sets peerSignatureVerified the same way
+          // — every version, now: this was 1.3-only, whatever this said.
+          if (clientCertPresent && context.peerSignatureVerified !== true) {
             fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
               'Client sent a certificate without a valid CertificateVerify');
             return;

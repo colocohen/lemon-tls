@@ -264,6 +264,18 @@ function scheme_matches_key(version, scheme, keyObj) {
   let kt = keyObj.asymmetricKeyType;
 
   if (info.sig === 'rsa') {
+    // The key large enough for the scheme: PSS with a salt of the hash's
+    // length needs a modulus of 2·hLen + 2 bytes (RFC 8017 §9.1.1), PKCS#1
+    // v1.5 the DigestInfo plus 11. A 1024-bit key under rsa_pss_*_sha512 made
+    // node:crypto throw out of the handshake — the process with it — for a
+    // client that offered only that.
+    let bits = 0;
+    try { bits = (keyObj.asymmetricKeyDetails && keyObj.asymmetricKeyDetails.modulusLength) || 0; } catch (e) { bits = 0; }
+    if (bits > 0) {
+      let hLen = info.hash === 'sha512' ? 64 : info.hash === 'sha384' ? 48 : info.hash === 'sha256' ? 32 : 20;
+      let need = info.isPSS ? 2 * hLen + 2 : hLen + 19 + 11;
+      if (Math.ceil(bits / 8) < need) return false;
+    }
     if (info.isPSS) {
       // 0x0809-0x080b are the *_pss_pss_* family; 0x0804-0x0806 are *_pss_rsae_*.
       let wantsPssKey = (scheme === 0x0809 || scheme === 0x080a || scheme === 0x080b);
@@ -370,8 +382,92 @@ const SCHEME_NAMES = {
 };
 function scheme_name(scheme) { return SCHEME_NAMES[scheme] || null; }
 
+/**
+ * Whether a certificate lets its key sign (RFC 5280 §4.2.1.3): without a
+ * keyUsage extension, yes; with one, only if digitalSignature (bit 0) is set.
+ * Every TLS 1.3 certificate signs its CertificateVerify, and under TLS 1.2
+ * every suite we offer is (EC)DHE, where the key signs the
+ * ServerKeyExchange or the client's CertificateVerify — static RSA, the one
+ * use of keyEncipherment, is not offered. So a certificate whose keyUsage
+ * says otherwise cannot be the one that authenticates this handshake.
+ *
+ * Reads only as much DER as it needs: Certificate → tbsCertificate →
+ * [3] extensions → the keyUsage entry. Unreadable DER: null (the chain
+ * check that parses the certificate in full owns that failure).
+ */
+const OID_KEY_USAGE = [0x55, 0x1d, 0x0f];   // 2.5.29.15
+function der_item(buf, off) {
+  if (off + 2 > buf.length) return null;
+  let tag = buf[off], len = buf[off + 1], hdr = 2;
+  if (len & 0x80) {
+    let n = len & 0x7f;
+    if (n === 0 || n > 4 || off + 2 + n > buf.length) return null;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[off + 2 + i];
+    hdr = 2 + n;
+  }
+  let start = off + hdr;
+  if (start + len > buf.length) return null;
+  return { tag: tag, start: start, end: start + len };
+}
+function der_children(buf, item) {
+  let out = [], off = item.start;
+  while (off < item.end) {
+    let c = der_item(buf, off);
+    if (!c || c.end > item.end) return null;
+    out.push(c); off = c.end;
+  }
+  return out;
+}
+function cert_allows_signing(der) {
+  let buf = der instanceof Uint8Array ? der : new Uint8Array(der);
+  let cert = der_item(buf, 0);
+  if (!cert || cert.tag !== 0x30) return null;
+  let top = der_children(buf, cert);
+  if (!top || top.length < 1 || top[0].tag !== 0x30) return null;
+  let tbs = der_children(buf, top[0]);
+  if (!tbs) return null;
+  let extWrap = null;
+  for (let i = 0; i < tbs.length; i++) if (tbs[i].tag === 0xa3) extWrap = tbs[i];
+  if (!extWrap) return true;
+  let extSeqs = der_children(buf, extWrap);
+  if (!extSeqs || extSeqs.length !== 1) return null;
+  let exts = der_children(buf, extSeqs[0]);
+  if (!exts) return null;
+  for (let i = 0; i < exts.length; i++) {
+    let parts = der_children(buf, exts[i]);
+    if (!parts || parts.length < 2 || parts[0].tag !== 0x06) return null;
+    let oid = buf.subarray(parts[0].start, parts[0].end);
+    if (oid.length !== 3 || oid[0] !== OID_KEY_USAGE[0] || oid[1] !== OID_KEY_USAGE[1] || oid[2] !== OID_KEY_USAGE[2]) continue;
+    let val = parts[parts.length - 1];
+    if (val.tag !== 0x04) return null;
+    let bits = der_item(buf, val.start);
+    if (!bits || bits.tag !== 0x03 || bits.end - bits.start < 1) return null;
+    if (bits.end - bits.start === 1) return false;          // no bits set at all
+    return (buf[bits.start + 1] & 0x80) !== 0;              // digitalSignature
+  }
+  return true;
+}
+
+/**
+ * The TLS 1.2 named group of an ECDSA key, or null for any other key
+ * (RFC 8422 §5.1.1: a client's supported_groups also names the curves it
+ * accepts in an ECDSA certificate). TLS 1.3 binds the curve in the scheme
+ * instead (scheme_matches_key).
+ */
+function ec_key_group(keyObj) {
+  let curve = null;
+  try {
+    if (keyObj.asymmetricKeyType !== 'ec') return null;
+    curve = keyObj.asymmetricKeyDetails && keyObj.asymmetricKeyDetails.namedCurve;
+  } catch (e) { return null; }
+  return curve === 'prime256v1' ? 23 : curve === 'secp384r1' ? 24 : curve === 'secp521r1' ? 25 : -1;
+}
+
 export {
   scheme_name,
+  cert_allows_signing,
+  ec_key_group,
   scheme_info,
   pick_scheme,
   sign_with_scheme,

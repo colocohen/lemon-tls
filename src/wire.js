@@ -74,6 +74,7 @@ const TLS_ALERT = {
   RECORD_OVERFLOW: 22,
   HANDSHAKE_FAILURE: 40,
   BAD_CERTIFICATE: 42,
+  UNSUPPORTED_CERTIFICATE: 43,
   CERTIFICATE_EXPIRED: 45,
   CERTIFICATE_UNKNOWN: 46,
   ILLEGAL_PARAMETER: 47,
@@ -368,8 +369,29 @@ exts.STATUS_REQUEST.encode = function (value) {
   if (value && value.ocsp) return new Uint8Array([1, 0, 0, 0, 0]);
   return new Uint8Array(0);
 };
-exts.STATUS_REQUEST.decode = function (data) {
-  if (data.length === 0) return {};
+// RFC 6066 §8. In a ServerHello (TLS 1.2) the extension_data is empty: a
+// bare "a CertificateStatus follows". In a ClientHello, a
+// CertificateStatusRequest: status_type, then for ocsp(1) responder_id_list
+// <0..2^16-1> and request_extensions<0..2^16-1>, and nothing after them. Bytes
+// left over were taken as an offer all the same.
+exts.STATUS_REQUEST.decode = function (data, kind) {
+  if (kind === 'server_hello') {
+    if (data.length !== 0) throw parseError('status_request: ' + data.length + ' bytes in a ServerHello, which carries none');
+    return {};
+  }
+  // Elsewhere (a TLS 1.3 Certificate entry holds a CertificateStatus, read
+  // by parse_certificate_status; a CertificateRequest's is empty).
+  if (kind !== 'client_hello') return data.length === 0 ? {} : { status_type: data[0] };
+  if (data.length === 0) throw parseError('status_request: empty');
+  if (data[0] === 1) {
+    let off = 1;
+    for (let v = 0; v < 2; v++) {
+      if (off + 2 > data.length) throw parseError('status_request: truncated');
+      off += 2 + ((data[off] << 8) | data[off + 1]);
+      if (off > data.length) throw parseError('status_request: truncated');
+    }
+    if (off !== data.length) throw parseError('status_request: ' + (data.length - off) + ' trailing bytes');
+  }
   return { status_type: data[0] };
 };
 
@@ -1558,6 +1580,8 @@ function build_new_session_ticket(p) {
 function parse_new_session_ticket(body) {
   let off = 0;
 
+  // The two u32s were read without a bounds check: a short body read as 0s.
+  if (body.length < 8) throw parseError('NewSessionTicket: truncated');
   let lifetime = (body[off]<<24 | body[off+1]<<16 | body[off+2]<<8 | body[off+3]) >>> 0; off+=4;
   let age_add  = (body[off]<<24 | body[off+1]<<16 | body[off+2]<<8 | body[off+3]) >>> 0; off+=4;
 
@@ -1577,8 +1601,10 @@ function parse_new_session_ticket(body) {
   // format; what a session then DOES with a ticket is policy and lives above.
   if (tlen === 0) throw parseError('NewSessionTicket carries an empty ticket');
 
-  let extBuf = body.subarray(off);
-  let extensions = extBuf.length ? parse_extensions(extBuf) : [];
+  // extensions<0..2^16-2> is part of the structure (RFC 8446 §4.6.1): it
+  // must be there, and it ends the message (parse_extensions refuses bytes
+  // after it). A body that stopped after the ticket passed as "no extensions".
+  let extensions = parse_extensions(body.subarray(off));
 
   return {
     ticket_lifetime: lifetime,
@@ -1767,7 +1793,10 @@ function build_hello_retry_request(params) {
   // params: { cipher_suite, selected_version, selected_group, session_id?, cookie?, other_exts? }
   let rnd = TLS13_HRR_RANDOM;
   let sid = (params && params.session_id) ? toU8(params.session_id) : new Uint8Array(0);
-  let legacy_version = TLS_VERSION.TLS1_2;
+  // The HelloRetryRequest is a ServerHello (RFC 8446 §4.1.4), with the same
+  // legacy_version: 0x0303 over TLS, {254,253} over DTLS 1.3 (RFC 9147 §5.3).
+  let legacy_version = (params && params.selected_version === DTLS_VERSION.DTLS1_3)
+    ? DTLS_VERSION.DTLS1_2 : TLS_VERSION.TLS1_2;
 
   let extList = [];
   // supported_versions (selected)
@@ -1925,10 +1954,13 @@ function build_new_session_ticket_tls12(p) {
   off = w_bytes(out, off, ticket);
   return out;
 }
+// RFC 5077 §3.3: ticket_lifetime_hint, ticket<0..2^16-1>, nothing after.
 function parse_new_session_ticket_tls12(body) {
   let off=0;
+  if (body.length < 4) throw parseError('NewSessionTicket: truncated');
   let hint = (body[off]<<24 | body[off+1]<<16 | body[off+2]<<8 | body[off+3])>>>0; off+=4;
   let tlen; [tlen,off]=r_u16(body,off); let t; [t,off]=r_bytes(body,off,tlen);
+  if (off !== body.length) throw parseError('NewSessionTicket: ' + (body.length - off) + ' trailing bytes');
   return { ticket_lifetime_hint: hint, ticket: t };
 }
 
@@ -2067,12 +2099,15 @@ function build_hello_verify_request(params) {
  * Parse HelloVerifyRequest body.
  * Returns { server_version, cookie }.
  */
+// RFC 6347 §4.2.1: server_version, then cookie<0..2^8-1> — and nothing
+// after it (decode_error). Trailing bytes were ignored.
 function parse_hello_verify_request(body) {
   let off = 0;
   let server_version; [server_version, off] = r_u16(body, off);
   let cookieLen;      [cookieLen, off] = r_u8(body, off);
   let cookie = new Uint8Array(0);
   if (cookieLen > 0) { [cookie, off] = r_bytes(body, off, cookieLen); }
+  if (off !== body.length) throw parseError('HelloVerifyRequest: ' + (body.length - off) + ' trailing bytes');
   return { server_version, cookie };
 }
 

@@ -18,6 +18,7 @@
  */
 
 import dgram from 'node:dgram';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import DTLSSession from './dtls_session.js';
 
@@ -55,13 +56,26 @@ function DTLSSocket(udpSocket, options) {
     ticketKeys: options.ticketKeys,
     useCookies: options.useCookies,
     srtpProfiles: options.srtpProfiles,
+    session: options.session,
+    sessionTickets: options.sessionTickets,
+    initialRetransmitTimeout: options.initialRetransmitTimeout,
   });
 
   // Wire session → UDP
+  // Datagrams handed to the UDP socket and not yet sent: dgram's send() is
+  // asynchronous, and a socket closed with one queued drops it. The last
+  // datagram of a failed connection is its alert — closed at once after it,
+  // the peer never learned why (the client's illegal_parameter, BoGo
+  // FragmentMessage*Mismatch). whenFlushed() waits for them.
+  let pendingSends = 0, flushWaiters = [];
   session.on('packet', function(data) {
     if (!remoteAddress || !remotePort) return;
-    udpSocket.send(data, 0, data.length, remotePort, remoteAddress);
+    pendingSends++;
+    udpSocket.send(data, 0, data.length, remotePort, remoteAddress, function() {
+      if (--pendingSends === 0) { let w = flushWaiters; flushWaiters = []; for (let i = 0; i < w.length; i++) w[i](); }
+    });
   });
+  self.whenFlushed = function(fn) { if (pendingSends === 0) fn(); else flushWaiters.push(fn); };
 
   session.on('connect', function() {
     ev.emit('connect');
@@ -154,6 +168,14 @@ function DTLSSocket(udpSocket, options) {
     return v == null ? undefined : v;
   };
 
+  /** The last session ('session' event's Buffer) — pass it as `session` to resume. */
+  self.getSession = function() { return session.getSession(); };
+  /** The path MTU (largest datagram written); see DTLSSession.setMTU. */
+  self.setMTU = function(mtu) { session.setMTU(mtu); };
+  self.getMTU = function() { return session.getMTU(); };
+  /** Where each flight's retransmission timer starts; see DTLSSession. */
+  self.setInitialRetransmitTimeout = function(ms) { session.setInitialRetransmitTimeout(ms); };
+
   /** Whether this connection resumed an earlier session. */
   self.isSessionReused = function() {
     return session.isSessionReused ? session.isSessionReused() : false;
@@ -201,6 +223,12 @@ function createDTLSServer(options, connectionListener) {
   let udpSocket = null;
   let connections = {};  // 'addr:port' → DTLSSocket
 
+  // One ticket key for the server, not one per connection: a ticket is
+  // opened by the connection that comes back, not the one that issued it.
+  // Each DTLSSocket drew its own, so no ticket of this server could ever
+  // be used (as TLSServer: tls_socket.js keeps one per server too).
+  let ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+
   function listen(port, address, callback) {
     if (typeof address === 'function') { callback = address; address = undefined; }
 
@@ -224,9 +252,11 @@ function createDTLSServer(options, connectionListener) {
           maxVersion: options.maxVersion,
           mtu: options.mtu,
           groups: options.groups,
-          ticketKeys: options.ticketKeys,
+          ticketKeys: ticketKeys,
           useCookies: options.useCookies,
           srtpProfiles: options.srtpProfiles,
+          sessionTickets: options.sessionTickets,
+          initialRetransmitTimeout: options.initialRetransmitTimeout,
         });
 
         connections[key] = socket;
@@ -314,12 +344,16 @@ function connectDTLS(options, callback) {
     maxVersion: options.maxVersion,
     mtu: options.mtu,
     groups: options.groups,
+    session: options.session,
+    sessionTickets: options.sessionTickets,
+    initialRetransmitTimeout: options.initialRetransmitTimeout,
   });
 
   if (callback) socket.on('connect', callback);
 
+  // After what is still queued has gone — the closing alert above all.
   socket.on('close', function() {
-    try { udp.close(); } catch(e) {}
+    socket.whenFlushed(function() { try { udp.close(); } catch(e) {} });
   });
 
   return socket;

@@ -274,6 +274,11 @@ function TLSSocket(duplex, options){
     // the records are counted — not in any one message handler.
     consecutive_empty_records: 0,
     consecutive_ccs_records: 0,
+    // Warning alerts with nothing else between them, and peer KeyUpdates
+    // with no application data between them: each is legal once, and each
+    // costs us work (a KeyUpdate a key derivation) while moving nothing.
+    consecutive_warning_alerts: 0,
+    consecutive_key_updates: 0,
 
     // Buffers and queues.
     //
@@ -307,6 +312,7 @@ function TLSSocket(duplex, options){
     // OpenSSL/BoringSSL routinely pack) fed only its FIRST message to the
     // session and silently dropped the rest.
     hsBuf: null,
+    hsBufState: null,      // the read state hsBuf's bytes arrived under
 
     appWriteQueue: [],
 
@@ -563,7 +569,11 @@ function TLSSocket(duplex, options){
             // keys; in TLS 1.2 after the peer's Finished.
             // Before that, it was handed to the reader all the same.
             if (state === 'app13' || (state === 'tls12' && peerFinished())) {
-                if (content.length > 0) pushAppData(content);
+                if (content.length > 0) {
+                    context.consecutive_key_updates = 0;
+                    context.consecutive_warning_alerts = 0;
+                    pushAppData(content);
+                }
                 return;
             }
             abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'application data before the handshake is complete', 'ERR_SSL_UNEXPECTED_MESSAGE');
@@ -571,6 +581,15 @@ function TLSSocket(duplex, options){
         }
         if (contentType === CT.HANDSHAKE) {
             if (content.length === 0) { abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'empty handshake record', 'ERR_SSL_UNEXPECTED_MESSAGE'); return; }
+            context.consecutive_warning_alerts = 0;
+            // RFC 8446 §5.1: "Handshake messages MUST NOT span key changes"
+            // — a message begun under one read state and continued under
+            // another (RFC 5246's CCS has its own check, handleChangeCipherSpec).
+            if (context.hsBuf !== null && context.hsBuf.length > 0 && context.hsBufState !== state) {
+                abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'a handshake message spans a key change', 'ERR_SSL_UNEXPECTED_MESSAGE');
+                return;
+            }
+            context.hsBufState = state;
             feedHandshakeBytes(content);
             return;
         }
@@ -932,6 +951,15 @@ function TLSSocket(duplex, options){
             // A message may have fatally ended the session (alert sent,
             // transport torn down). Don't keep feeding a corpse.
             if (context.destroyed) return;
+
+            // The message changed the read keys (a ServerHello, a Finished):
+            // what follows it in the same record was protected under the old
+            // ones, and is no message of the new state (RFC 8446 §5.1).
+            if (context.hsBuf.length > 0 && readState() !== context.hsBufState) {
+                context.hsBuf = null;
+                abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'handshake data after a key change, in the record before it', 'ERR_SSL_UNEXPECTED_MESSAGE');
+                return;
+            }
         }
     }
 
@@ -1153,6 +1181,13 @@ function TLSSocket(duplex, options){
         const level = (negotiated13() === true && desc !== TLS_ALERT.CLOSE_NOTIFY && desc !== TLS_ALERT.USER_CANCELED)
             ? TLS_ALERT_LEVEL.FATAL : body[0];
         self.emit('alert', { level: body[0], description: desc });
+        // A run of warnings (BoGo: TooManyWarningAlerts) — the limit
+        // BoringSSL keeps, 4.
+        if (level === TLS_ALERT_LEVEL.WARNING && desc !== TLS_ALERT.CLOSE_NOTIFY &&
+            ++context.consecutive_warning_alerts > 4) {
+            abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'too many consecutive warning alerts', 'ERR_SSL_UNEXPECTED_MESSAGE');
+            return;
+        }
         if (desc === TLS_ALERT.CLOSE_NOTIFY) {
             // The peer is done sending: end our readable side, so 'end' is
             // emitted once what came before it is read.
@@ -1618,19 +1653,19 @@ function TLSSocket(duplex, options){
         // Clear handshake timeout
         if (context.handshakeTimer) { clearTimeout(context.handshakeTimer); context.handshakeTimer = null; }
 
-        // Certificate pinning
+        // Certificate pinning: the leaf's DER, 'sha256/' + base64 of its
+        // SHA-256. The chain is a list of { cert } entries — this check once
+        // read `.raw` off the list itself, found nothing, and let every
+        // certificate through behind a "best-effort" catch. A pin fails closed:
+        // no certificate to hash is a mismatch too.
         if (context.pins && context.pins.length > 0) {
-            try {
-                let cert = session.getPeerCertificate();
-                if (cert && cert.raw) {
-                    let hash = 'sha256/' + crypto.createHash('sha256').update(cert.raw).digest('base64');
-                    if (!context.pins.includes(hash)) {
-                        self.emit('error', new Error('Certificate pin mismatch: ' + hash));
-                        self.destroy();
-                        return;
-                    }
-                }
-            } catch(e) { /* pinning is best-effort if no raw cert */ }
+            let chain = session.getPeerCertificate();
+            let leaf = chain && chain.length > 0 ? chain[0].cert : null;
+            let hash = leaf ? 'sha256/' + crypto.createHash('sha256').update(leaf).digest('base64') : null;
+            if (hash === null || !context.pins.includes(hash)) {
+                abort(TLS_ALERT.BAD_CERTIFICATE, 'Certificate pin mismatch: ' + (hash || 'no peer certificate'), 'ERR_TLS_CERT_PIN_MISMATCH');
+                return;
+            }
         }
 
         // Emit keylog lines (SSLKEYLOGFILE compatible)
@@ -1770,6 +1805,12 @@ function TLSSocket(duplex, options){
             context.app_write_iv = d.iv;
             context.app_write_seq = 0;
         } else if (info.direction === 'receive') {
+            // A run of KeyUpdates with no data between them (BoGo:
+            // TooManyKeyUpdates) — 32, BoringSSL's limit.
+            if (++context.consecutive_key_updates > 32) {
+                abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'too many KeyUpdates without application data', 'ERR_SSL_UNEXPECTED_MESSAGE');
+                return;
+            }
             // Peer updated their send secret → derive new read keys, reset seq
             let d = tls_derive_from_tls_secrets(info.secret, session.getCipher());
             context.app_read_key = d.key;

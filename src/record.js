@@ -284,7 +284,9 @@ function decryptRecordWithAadView(aadView, ciphertext, key, nonce, algo) {
 function parseInnerPlaintext(data) {
   let j = data.length - 1;
   while (j >= 0 && data[j] === 0) j--;
-  if (j < 0) throw new Error('Malformed TLSInnerPlaintext');
+  // RFC 8446 §5.4: no non-zero octet — unexpected_message. The record was
+  // authenticated (the tag verified), so this is the peer's doing.
+  if (j < 0) throw recordError('Malformed TLSInnerPlaintext: padding only', 10);
   return { type: data[j], content: data.subarray(0, j) };
 }
 
@@ -1426,16 +1428,31 @@ function buildDtlsAck(acks) {
 }
 
 /** Parse ACK payload. Returns [{ epoch, seq }, ...]. */
+// A malformed record body from an authenticated record: decode_error (or
+// the given alert), carried as .alertDesc like wire.js's parse errors.
+function recordError(msg, alertDesc) {
+  let e = new Error(msg);
+  e.alertDesc = alertDesc === undefined ? 50 : alertDesc;
+  return e;
+}
+
+// Strict (RFC 9147 §7): the vector fills the record exactly, in 16-byte
+// RecordNumbers, each within what a DTLS record number can be (an epoch
+// carried as a u16 on the wire of every record, a 48-bit sequence number).
+// A short body, a length that does not match, a partial entry or a number
+// beyond those was read as far as it went, or past it.
 function parseDtlsAck(data) {
+  if (!data || data.length < 2) throw recordError('ACK: truncated');
   let bodyLen = readU16(data, 0);
-  let off = 2;
-  let end = off + bodyLen;
+  if (2 + bodyLen !== data.length) throw recordError('ACK: record_numbers of ' + bodyLen + ' bytes in a body of ' + (data.length - 2));
+  if (bodyLen % 16 !== 0) throw recordError('ACK: record_numbers not a whole number of entries');
   let acks = [];
-  // 16 bytes per RecordNumber — see buildDtlsAck.
-  while (off + 16 <= end && off + 16 <= data.length) {
-    let epoch = readU64(data, off); off += 8;
-    let seq   = readU64(data, off); off += 8;
-    acks.push({ epoch, seq });
+  for (let off = 2; off < data.length; off += 16) {
+    if (data[off] | data[off + 1] | data[off + 2] | data[off + 3] | data[off + 4] | data[off + 5] ||
+        data[off + 8] | data[off + 9]) {
+      throw recordError('ACK: a record number out of range');
+    }
+    acks.push({ epoch: readU64(data, off), seq: readU48(data, off + 10) });
   }
   return acks;
 }

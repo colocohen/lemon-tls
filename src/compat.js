@@ -260,6 +260,14 @@ function connect(/* ...args */) {
     // here: neither reached the socket.
     grease: options.grease,
     permuteExtensions: options.permuteExtensions,
+    // Four more documented options (index.d.ts) this list left behind, so
+    // connect() ignored them without a word: certificate pins — a client
+    // that set them was not pinned at all — the handshake timeout, raw
+    // extensions, and noTickets (the older spelling of sessionTickets: false).
+    pins: options.pins,
+    handshakeTimeout: options.handshakeTimeout,
+    customExtensions: options.customExtensions,
+    ...(options.sessionTickets === undefined && options.noTickets === true ? { sessionTickets: false } : {}),
     // 0-RTT: with `session` whose ticket allows it, what is written before
     // 'secureConnect' goes in the first flight ('earlyData' says if taken).
     earlyData: options.earlyData === true,

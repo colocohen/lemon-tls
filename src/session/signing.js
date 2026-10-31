@@ -270,8 +270,13 @@ function scheme_matches_key(version, scheme, keyObj) {
 
   if (info.sig === 'ecdsa') {
     if (kt !== 'ec') return false;
-    // The curve is part of the scheme, not a free choice: signing P-256 data
-    // with a P-384 key (or vice versa) is a type confusion the RFC forbids.
+    // The curve is part of the scheme in TLS 1.3 (RFC 8446 §4.2.3: "ecdsa_
+    // secp384r1_sha384" is P-384 with SHA-384): signing with a P-256 key under
+    // it is a confusion the RFC forbids. In TLS 1.2 the same codepoint is
+    // only {sha384, ecdsa} (RFC 5246 §7.4.1.4.1), for a key of any curve: a
+    // P-256 server asked only for sha384 had no scheme, and sent its
+    // ServerKeyExchange unsigned.
+    if (version !== TLS_VERSION_TLS1_3) return true;
     let curve = null;
     try {
       curve = keyObj.asymmetricKeyDetails && keyObj.asymmetricKeyDetails.namedCurve;

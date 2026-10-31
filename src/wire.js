@@ -87,6 +87,7 @@ const TLS_ALERT = {
   USER_CANCELED: 90,
   MISSING_EXTENSION: 109,
   UNSUPPORTED_EXTENSION: 110,
+  NO_RENEGOTIATION: 100,
   UNRECOGNIZED_NAME: 112,
   CERTIFICATE_REQUIRED: 116,
   NO_APPLICATION_PROTOCOL: 120,
@@ -295,6 +296,27 @@ function veclen(lenBytes, inner) {
   throw new Error('veclen only supports 1/2/3');
 }
 
+/**
+ * A list of fixed-size items — u8 or u16 each — in a vector that fills the
+ * extension exactly (RFC 8446 §3.4): declared length = what follows it, a
+ * whole number of items, at least `min` of them (the vector's floor:
+ * `<2..2^16-2>` is one u16 item). One reader for every such list, since each
+ * decoder had its own loop that read past the declared length, accepted an
+ * odd length, an empty list, or bytes after it.
+ */
+function readItemList(data, lenBytes, itemBytes, min, name) {
+  let n, off;
+  [n, off] = lenBytes === 1 ? r_u8(data, 0) : r_u16(data, 0);
+  if (off + n !== data.length) throw parseError(name + ': list of ' + n + ' bytes in an extension of ' + (data.length - off));
+  if (n % itemBytes !== 0) throw parseError(name + ': list of ' + n + ' bytes, not a whole number of items');
+  if (n / itemBytes < min) throw parseError(name + ': empty list');
+  let out = [];
+  for (let i = 0; i < n; i += itemBytes) {
+    out.push(itemBytes === 2 ? ((data[off + i] << 8) | data[off + i + 1]) >>> 0 : data[off + i]);
+  }
+  return out;
+}
+
 function readVec(buf, off, lenBytes) {
   let n, off2 = off;
 
@@ -484,12 +506,19 @@ exts.SERVER_NAME.decode = function (data) {
   // other half of the grammar.
   if (!data || data.length === 0) return null;
 
+  // From a client: server_name_list<1..2^16-1> filling the extension, each
+  // name non-empty (HostName<1..2^16-1>), at most one of each name_type
+  // (RFC 6066 §3). A list cut short, overrunning, with bytes after it, an
+  // empty host_name or two of them were all taken.
   let off = 0;
   let list;
   [list, off] = readVec(data, off, 2);
+  if (off !== data.length) throw parseError('server_name: bytes after the server_name_list');
+  if (list.length === 0) throw parseError('server_name: empty server_name_list');
 
   let off2 = 0;
   let host = "";
+  let seenTypes = {};
 
   while (off2 < list.length) {
     let typ;
@@ -501,7 +530,10 @@ exts.SERVER_NAME.decode = function (data) {
     let v;
     [v, off2] = r_bytes(list, off2, l);
 
+    if (seenTypes[typ]) throw parseError('server_name: two names of type ' + typ);
+    seenTypes[typ] = true;
     if (typ === 0) {
+      if (l === 0) throw parseError('server_name: empty host_name');
       host = (new TextDecoder()).decode(v);
     }
   }
@@ -533,26 +565,12 @@ exts.SUPPORTED_VERSIONS.encode = function (value) {
   return body;
 };
 
-exts.SUPPORTED_VERSIONS.decode = function (data) {
-  // ServerHello form: 2 bytes
-  if (data.length === 2) {
-    let v, off = 0;
-    [v, off] = r_u16(data, off);
-    return [v]; // return the selected version (number)
-  }
-
-  // ClientHello form: vector<1> of versions (u16 each)
-  let off2 = 0;
-  let n;
-  [n, off2] = r_u8(data, off2);
-
-  let out = [];
-  for (let i = 0; i < n; i += 2) {
-    let vv;
-    [vv, off2] = r_u16(data, off2);
-    out.push(vv);
-  }
-  return out; // return the array directly
+exts.SUPPORTED_VERSIONS.decode = function (data, kind) {
+  // ClientHello form: versions<2..254>, one u16 each.
+  if (kind === 'client_hello') return readItemList(data, 1, 2, 1, 'supported_versions');
+  // ServerHello / HelloRetryRequest form: selected_version, 2 bytes.
+  if (data.length !== 2) throw parseError('supported_versions: selected_version of ' + data.length + ' bytes');
+  return [((data[0] << 8) | data[1]) >>> 0];
 };
 
 /* ---------------------------- SUPPORTED_GROUPS (10) ---------------------------- */
@@ -570,17 +588,7 @@ exts.SUPPORTED_GROUPS.encode = function (value) {
 };
 
 exts.SUPPORTED_GROUPS.decode = function (data) {
-  let off = 0;
-  let n;
-  [n, off] = r_u16(data, off);
-
-  let out = [];
-  for (let i = 0; i < n; i += 2) {
-    let g;
-    [g, off] = r_u16(data, off);
-    out.push(g);
-  }
-  return out; // array of named groups
+  return readItemList(data, 2, 2, 1, 'supported_groups');   // named_group_list<2..2^16-1>
 };
 
 /* ---------------------------- EC_POINT_FORMATS (11) ---------------------------- */
@@ -624,17 +632,8 @@ exts.SIGNATURE_ALGORITHMS.encode = function (value) {
 };
 
 exts.SIGNATURE_ALGORITHMS.decode = function (data) {
-  let off = 0;
-  let n;
-  [n, off] = r_u16(data, off);
-
-  let out = [];
-  for (let i = 0; i < n; i += 2) {
-    let a;
-    [a, off] = r_u16(data, off);
-    out.push(a);
-  }
-  return out; // array of sigalgs (u16)
+  // supported_signature_algorithms<2..2^16-2>: an empty or odd list was taken.
+  return readItemList(data, 2, 2, 1, 'signature_algorithms');
 };
 
 /* ------------------------ PSK_KEY_EXCHANGE_MODES (45) ------------------------ */
@@ -652,17 +651,7 @@ exts.PSK_KEY_EXCHANGE_MODES.encode = function (value) {
 };
 
 exts.PSK_KEY_EXCHANGE_MODES.decode = function (data) {
-  let off = 0;
-  let n;
-  [n, off] = r_u8(data, off);
-
-  let out = [];
-  for (let i = 0; i < n; i++) {
-    let m;
-    [m, off] = r_u8(data, off);
-    out.push(m);
-  }
-  return out; // array of modes (u8)
+  return readItemList(data, 1, 1, 1, 'psk_key_exchange_modes');   // ke_modes<1..255>
 };
 
 /* ------------------------------- PRE_SHARED_KEY (41) ------------------------------- */
@@ -730,28 +719,37 @@ exts.PRE_SHARED_KEY.decode = function (data) {
     return { selected: sel };
   }
 
-  // ClientHello: identities + binders
+  // ClientHello: identities<7..2^16-1>, then binders<33..2^16-1>, which
+  // fill the rest exactly (RFC 8446 §4.2.11): PskIdentity is identity<1..>
+  // and a 4-byte age; PskBinderEntry<32..255>.
   let idLen;
   [idLen, off] = r_u16(data, off);
   let idEnd = off + idLen;
+  if (idEnd > data.length) throw parseError('pre_shared_key: identities overrun the extension');
   let identities = [];
   while (off < idEnd) {
     let idL;
     [idL, off] = r_u16(data, off);
+    if (idL === 0) throw parseError('pre_shared_key: empty identity');
+    if (off + idL + 4 > idEnd) throw parseError('pre_shared_key: an identity overruns the list');
     let identity;
     [identity, off] = r_bytes(data, off, idL);
     let age = (data[off] << 24) | (data[off+1] << 16) | (data[off+2] << 8) | data[off+3];
     off += 4;
     identities.push({ identity: identity, age: age >>> 0 });
   }
+  if (identities.length === 0) throw parseError('pre_shared_key: no identities');
 
   let binderLen;
   [binderLen, off] = r_u16(data, off);
   let binderEnd = off + binderLen;
+  if (binderEnd !== data.length) throw parseError('pre_shared_key: binders do not fill the extension');
   let binders = [];
   while (off < binderEnd) {
     let bL;
     [bL, off] = r_u8(data, off);
+    if (bL < 32) throw parseError('pre_shared_key: binder of ' + bL + ' bytes, fewer than 32');
+    if (off + bL > binderEnd) throw parseError('pre_shared_key: a binder overruns the list');
     let binder;
     [binder, off] = r_bytes(data, off, bL);
     binders.push(binder);
@@ -893,6 +891,7 @@ exts.ALPN.decode = function (data) {
   let end = off + n;
   if (end > data.length) throw parseError('ALPN list length exceeds extension body');
   if (end < data.length) throw parseError('trailing data after ALPN protocol list');
+  if (n === 0) throw parseError('ALPN: empty protocol_name_list');   // <2..2^16-1>
 
   let out = [];
 
@@ -927,6 +926,7 @@ exts.RENEGOTIATION_INFO.decode = function (data) {
   let off = 0;
   let v;
   [v, off] = readVec(data, off, 1);
+  if (off !== data.length) throw parseError('renegotiation_info: bytes after renegotiated_connection');
   return v; // return raw bytes (Uint8Array)
 };
 
@@ -940,6 +940,7 @@ exts.COOKIE.decode = function (data) {
   let off = 0;
   let v;
   [v, off] = readVec(data, off, 2);
+  if (off !== data.length || v.length === 0) throw parseError('cookie: not one non-empty cookie<1..2^16-1>');
   return v; // Uint8Array — opaque cookie
 };
 
@@ -962,6 +963,8 @@ exts.EXTENDED_MASTER_SECRET.encode = function (value) {
 };
 
 exts.EXTENDED_MASTER_SECRET.decode = function (data) {
+  // "extension_data field ... is empty" (RFC 7627 §5.1).
+  if (data && data.length !== 0) throw parseError('extended_master_secret with ' + data.length + ' bytes of data');
   return true; // presence is the signal
 };
 /* ============================= Extensions helpers ============================= */
@@ -1201,6 +1204,8 @@ function parse_hello(params) {
   let legacy_version; [legacy_version, off] = r_u16(body, off);
   let random;         [random,         off] = r_bytes(body, off, 32);
   let sidLen;         [sidLen,         off] = r_u8(body, off);
+  // legacy_session_id<0..32> (RFC 8446 §4.1.2, RFC 5246 §7.4.1.2).
+  if (sidLen > 32) throw parseError('session_id of ' + sidLen + ' bytes, more than 32');
   let session_id;     [session_id,     off] = r_bytes(body, off, sidLen);
 
   let cipher_suites = [];

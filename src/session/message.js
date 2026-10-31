@@ -93,12 +93,24 @@ function normalize_hello(hello, kind) {
     }
   }
 
+  // The versions on offer (RFC 8446 §4.2.1). With a supported_versions
+  // extension, that list is the whole offer: legacy_version "MUST" then be
+  // ignored. It was added to the list — a hello offering only SSL 3.0 there
+  // came out as TLS 1.2, from its legacy 0x0303.
+  // Without the extension, TLS 1.2's rules (RFC 5246 Appendix E.1): the
+  // legacy_version is the client's highest, so any value from TLS 1.2 up —
+  // 0x0304, 0x0305, a future (6,3) — offers TLS 1.2, and nothing that
+  // §4.2.1 lets a server negotiate as 1.3 ("MUST negotiate TLS 1.2 or prior
+  // ... even if ClientHello.legacy_version is 0x0304 or later"). They were
+  // refused (protocol_version), or read as TLS 1.3. DTLS counts down:
+  // 0xfefd is 1.2, and anything newer than it offers 1.2 too.
   if (!('supported_versions' in out)) {
-    out.supported_versions = [];
-  }
-
-  if (out.supported_versions.indexOf(out.version) < 0) {
-    out.supported_versions.push(out.version);
+    let v = out.version;
+    if (kind === 'client' && typeof v === 'number') {
+      if ((v & 0xff00) === 0xfe00) { if (v <= 0xfefd) v = 0xfefd; }
+      else if (v >= 0x0303) v = 0x0303;
+    }
+    out.supported_versions = (typeof v === 'number') ? [v] : [];
   }
 
   return out;

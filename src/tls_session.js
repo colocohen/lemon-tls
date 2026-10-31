@@ -601,6 +601,8 @@ function TLSSession(options){
     // sessionAppData, given back.
     early: { offered: false, candidate: null, pending: false, status: null, alpn: null, appData: null, clientOffered: false, eoed: false },
     psk_accepted: false,     // server accepted PSK → abbreviated handshake
+    client_secure_renegotiation: false,   // server: the client sent renegotiation_info or its SCSV (RFC 5746)
+    renegotiation_refusals: 0,            // no_renegotiation warnings sent (TLS 1.2)
     isResumed: false,        // true if PSK was accepted (1.3) or abbreviated handshake (1.2)
     hrr_hash: null,            // client: the hash of the suite a HelloRetryRequest named
     resumed_ticket_data: null, // application data of the ticket resumed with (see ticketData)
@@ -2176,6 +2178,36 @@ function TLSSession(options){
     // with no retry asked, a third — is unexpected_message. Before, it was
     // run through the handshake again: the SNI callback fired anew, and
     // with ECH the decrypted state of this connection was overwritten.
+    // Renegotiation (TLS 1.2) is not done here: a ClientHello once the
+    // handshake is over (server), a HelloRequest (client) are answered with
+    // a no_renegotiation warning and otherwise left alone (RFC 5246 §7.2.2,
+    // RFC 5746 §4.2, §4.4) — the peer decides whether to go on. A peer that
+    // keeps asking is cut off.
+    if (context.state === 'connected' && is12() &&
+        ((context.isServer && message.type === 'client_hello') ||
+         (!context.isServer && message.type === 'unknown_handshake' && message.handshake_type === 0))) {
+      if (++context.renegotiation_refusals > 3) {
+        fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE, 'Renegotiation asked for again after no_renegotiation');
+        return;
+      }
+      sendAlert(wire.TLS_ALERT_LEVEL.WARNING, wire.TLS_ALERT.NO_RENEGOTIATION);
+      return;
+    }
+
+    // renegotiation_info in a first ClientHello (RFC 5746 §3.6): empty, or
+    // "MUST abort the handshake" — handshake_failure. Whether the client
+    // speaks it (the extension or TLS_EMPTY_RENEGOTIATION_INFO_SCSV, 0x00ff)
+    // decides whether ours goes in the ServerHello.
+    if (context.isServer && message.type === 'client_hello' && context.client_hellos_received === 0) {
+      let ri = message.renegotiation_info;
+      if (ri && ri.length > 0) {
+        fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE, 'renegotiation_info not empty in an initial ClientHello');
+        return;
+      }
+      context.client_secure_renegotiation = (ri !== undefined && ri !== null) ||
+        (Array.isArray(message.cipher_suites) && message.cipher_suites.indexOf(0x00ff) >= 0);
+    }
+
     if (context.isServer && message.type === 'client_hello') {
       let n = context.client_hellos_received;
       if (!(n === 0 || (n === 1 && context.helloRetried === true && context.hello_sent === false))) {
@@ -2820,14 +2852,31 @@ function TLSSession(options){
       // a handshake in a group it had not agreed to — and of two shares for
       // one group the first was taken, the second silently ignored: two
       // implementations reading one ClientHello two ways.
-      if (context.isServer === true && message.type === 'client_hello' &&
-          Array.isArray(message.key_groups) && message.key_groups.length > 0) {
-        // §9.2: "If containing a 'key_share' extension, it MUST also contain
-        // a 'supported_groups' extension" — missing_extension otherwise.
-        if (!Array.isArray(message.supported_groups)) {
+      // §9.2: "If containing a 'supported_groups' extension, it MUST also
+      // contain a 'key_share' extension, and vice versa. An empty
+      // KeyShare.client_shares vector is permitted" — missing_extension
+      // otherwise. Present is what counts, empty included: an empty key_share
+      // with no supported_groups was answered with a HelloRetryRequest. The
+      // other way round only for a hello that offers TLS 1.3 to a server that
+      // speaks it: a TLS 1.2 client sends supported_groups alone.
+      if (context.isServer === true && message.type === 'client_hello') {
+        let hasShares = Array.isArray(message.key_groups);
+        let hasGroups = Array.isArray(message.supported_groups);
+        let sv13 = message.supported_versions || [];
+        let lv13 = context.local_supported_versions || [];
+        let both13 = (sv13.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || sv13.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0) &&
+                     (lv13.length === 0 || lv13.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || lv13.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0);
+        if (hasShares && !hasGroups) {
           fatalAlert(wire.TLS_ALERT.MISSING_EXTENSION, 'ClientHello has key_share without supported_groups');
           return;
         }
+        if (hasGroups && !hasShares && both13) {
+          fatalAlert(wire.TLS_ALERT.MISSING_EXTENSION, 'ClientHello offering TLS 1.3 has supported_groups without key_share');
+          return;
+        }
+      }
+      if (context.isServer === true && message.type === 'client_hello' &&
+          Array.isArray(message.key_groups) && message.key_groups.length > 0) {
         let offered = message.supported_groups;
         let seenShare = {};
         for (let ki = 0; ki < message.key_groups.length; ki++) {
@@ -4337,8 +4386,15 @@ function TLSSession(options){
         let storedEMS = !!context.tls12_resume_state.extended_master_secret;
         let clientEMS = !!context.use_extended_master_secret;
 
-        if (storedEMS !== clientEMS) {
-          // EMS mismatch: per RFC 7627 can't resume. Fall through to full handshake.
+        if (storedEMS && !clientEMS) {
+          // RFC 7627 §5.3: a session made with the extended master secret, a
+          // hello now without it — "the server MUST abort the abbreviated
+          // handshake": its master secret is not one this hello can be held
+          // to. handshake_failure, as OpenSSL. It went on to a full handshake.
+          fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE, 'Resumption without extended_master_secret of a session made with it');
+          return;
+        } else if (!storedEMS && clientEMS) {
+          // The other way: not resumed, a full handshake (§5.3).
           context.tls12_resume_state = null;
         } else {
           // OK, we can do abbreviated. Use params_to_set for all state flags
@@ -4872,9 +4928,13 @@ function TLSSession(options){
             // Include renegotiation_info (empty for initial handshake) and extended_master_secret.
             // ALPN (type=16) — optional, echoes selected protocol.
 
-            let ext_list = [
+            // renegotiation_info only for a client that signalled it — the
+            // extension or the SCSV (RFC 5746 §3.6: "the server MUST include
+            // an empty renegotiation_info" then; unasked, an extension the
+            // client never offered, RFC 5246 §7.4.1.4).
+            let ext_list = context.client_secure_renegotiation ? [
               { type: 'RENEGOTIATION_INFO', value: new Uint8Array(0) }
-            ];
+            ] : [];
 
             // status_request, empty: a CertificateStatus follows the
             // Certificate (RFC 6066 §8). Only when there is one to send.
@@ -5426,7 +5486,13 @@ function TLSSession(options){
               let cert_key_obj = local_private_key();
               let reqAlgs = peer_requested_sig_algs();
               let scheme = pick_scheme(wire.TLS_VERSION.TLS1_2, cert_key_obj, reqAlgs, context.local_supported_signature_algorithms);
-              let signature = sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme, transcript_data, cert_key_obj);
+              let signature = scheme === null ? null : sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme, transcript_data, cert_key_obj);
+              // As for TLS 1.3: no shared scheme is handshake_failure, not a
+              // crash on a null signature.
+              if (scheme === null || !signature) {
+                fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE, 'No signature scheme shared with server for client certificate');
+                return;
+              }
 
               // Build CertificateVerify: scheme(2) + sig_length(2) + sig
               let cvBody = new Uint8Array(2 + 2 + signature.length);
@@ -5458,8 +5524,14 @@ function TLSSession(options){
             let cert_private_key_obj = local_private_key();
 
             let scheme12 = pick_scheme(wire.TLS_VERSION.TLS1_2, cert_private_key_obj, context.remote_supported_signature_algorithms, context.local_supported_signature_algorithms);
-
-            let sig_data = sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme12, tbs_data, cert_private_key_obj);
+            let sig_data = scheme12 === null ? null : sign_with_scheme(wire.TLS_VERSION.TLS1_2, scheme12, tbs_data, cert_private_key_obj);
+            // No scheme our key can sign with that the client accepts (or the
+            // signing failed): handshake_failure. It went out with sig_alg 0
+            // and an empty signature, for the client to refuse.
+            if (scheme12 === null || !sig_data || sig_data.length === 0) {
+              fatalAlert(wire.TLS_ALERT.HANDSHAKE_FAILURE, 'No signature scheme shared with the client for ServerKeyExchange');
+              return;
+            }
 
             
             let message_data = build_tls_message({

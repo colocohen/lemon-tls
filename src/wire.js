@@ -1212,9 +1212,13 @@ function parse_hello(params) {
   let legacy_compression = [];
   let type = isClient ? 'client_hello' : 'server_hello';
 
-  // DTLS cookie — auto-detect by version (DTLS versions have 0xFE in high byte)
+  // DTLS or TLS: the transport's to say (params.dtls), not the hello's — a
+  // TLS ClientHello with legacy_version (254,254) was read as a DTLS one, a
+  // cookie field looked for where the cipher suites are: decode_error, for a
+  // hello that offers TLS 1.2. Guessed from the version only when the caller
+  // does not say.
   let dtls_cookie = null;
-  let isDTLS = (legacy_version & 0xFF00) === 0xFE00;
+  let isDTLS = (typeof params.dtls === 'boolean') ? params.dtls : (legacy_version & 0xFF00) === 0xFE00;
 
   if (isClient) {
     // --- ClientHello ---
@@ -1266,6 +1270,7 @@ function parse_hello(params) {
     random: random,                       // single (Uint8Array(32))
     session_id: session_id,               // single (Uint8Array)
     dtls_cookie: dtls_cookie,             // Uint8Array or null (DTLS only)
+    dtls: isDTLS,
     cipher_suites: cipher_suites,         // array
     legacy_compression: legacy_compression, // array
     extensions: extensions                // array

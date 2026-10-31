@@ -34,6 +34,11 @@ const SIG_SCHEMES_MODERN = [
   0x0807, 0x0808,           // ed25519, ed448
   0x0403, 0x0503, 0x0603,   // ecdsa_secp256r1/384r1/521r1
   0x0804, 0x0805, 0x0806,   // rsa_pss_rsae_sha256/384/512
+  // rsa_pss_pss_sha256/384/512: an RSASSA-PSS key (id-RSASSA-PSS) signs with
+  // these only. Verified all along, never offered — so a client certificate
+  // of that kind, held now to what the CertificateRequest offers, could not
+  // be used at all.
+  0x0809, 0x080a, 0x080b,
 ];
 
 // ML-DSA (FIPS 204), post-quantum signatures, TLS 1.3 only

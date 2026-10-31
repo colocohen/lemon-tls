@@ -619,6 +619,14 @@ function TLSSocket(duplex, options){
             return false;
         }
         if (trial) context.early.trialDone = true;
+        // TLSInnerPlaintext — content, type and padding together — is at
+        // most 2^14 + 1 bytes (RFC 8446 §5.4: "MUST NOT exceed"). Checked on
+        // the whole, not on the content once the padding is gone: 2^14 − 8
+        // bytes with 9 of padding passed.
+        if (out.length > 16384 + 1) {
+            abort(TLS_ALERT.RECORD_OVERFLOW, 'TLSInnerPlaintext of ' + out.length + ' bytes, more than 2^14 + 1', 'ERR_SSL_RECORD_OVERFLOW');
+            return true;
+        }
         // TLSInnerPlaintext: content, the type, then zeros. All zeros: no
         // type at all (§5.4: unexpected_message) — it was an 'error' event
         // and a connection left open.

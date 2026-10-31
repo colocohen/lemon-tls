@@ -735,6 +735,11 @@ function TLSSession(options){
   // here would have recreated exactly the drift it was added to remove.
   function is13() { return wire.is_tls13_wire(context.selected_version); }
   function is12() { return wire.is_tls12_wire(context.selected_version); }
+  // DTLS or TLS: a DTLSSession sets DTLS versions before the first message;
+  // a TLS session's, when set at all by then, are TLS ones.
+  function dtls_transport() {
+    return (context.local_supported_versions || []).some(function (v) { return (v & 0xff00) === 0xfe00; });
+  }
 
   /**
    * Assemble the ClientHello extension list.
@@ -2149,7 +2154,7 @@ function TLSSession(options){
     // transport's data handler (remote DoS) or be silently swallowed.
     let message;
     try {
-      message = parse_tls_message(data, context.selected_version);
+      message = parse_tls_message(data, context.selected_version, { dtls: dtls_transport() });
     } catch (e) {
       fatalAlert(e.alertDesc || wire.TLS_ALERT.DECODE_ERROR, 'Malformed handshake message: ' + e.message);
       return;
@@ -2235,7 +2240,7 @@ function TLSSession(options){
       }
       if (echResult) {
         try {
-          message = parse_tls_message(echResult.data, context.selected_version);
+          message = parse_tls_message(echResult.data, context.selected_version, { dtls: dtls_transport() });
         } catch (e) {
           fatalAlert(e.alertDesc || wire.TLS_ALERT.DECODE_ERROR, 'Malformed ClientHelloInner: ' + e.message);
           return;
@@ -4280,7 +4285,22 @@ function TLSSession(options){
           let pskHash = context.psk_offered.hash;
           let chosen = null;
 
-          for (let i = 0; i < context.local_supported_cipher_suites.length; i++) {
+          // Early data offered, and we take early data: the ticket's own
+          // suite, if the client offers it — 0-RTT is accepted only under
+          // "the same cipher suite" the ticket was issued with (RFC 8446
+          // §4.2.10), and early_decide holds to that. Chosen by our order
+          // alone, a ChaCha20 ticket resumed under AES-128-GCM (same hash,
+          // allowed) and its early data was always refused.
+          let ticketCs = context.psk_offered.cipher | 0;
+          if (context.earlyData && context.early.offered && ticketCs &&
+              context.local_supported_cipher_suites.indexOf(ticketCs) >= 0 &&
+              context.remote_supported_cipher_suites.indexOf(ticketCs) >= 0 &&
+              TLS_CIPHER_SUITES[ticketCs] && TLS_CIPHER_SUITES[ticketCs].hash === pskHash &&
+              is_usable_cipher_suite(ticketCs)) {
+            chosen = ticketCs;
+          }
+
+          for (let i = 0; chosen === null && i < context.local_supported_cipher_suites.length; i++) {
             let cs = context.local_supported_cipher_suites[i] | 0;
             if (context.remote_supported_cipher_suites.indexOf(cs) < 0) continue;
             let meta = TLS_CIPHER_SUITES[cs];

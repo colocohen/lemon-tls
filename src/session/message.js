@@ -107,7 +107,7 @@ function normalize_hello(hello, kind) {
   if (!('supported_versions' in out)) {
     let v = out.version;
     if (kind === 'client' && typeof v === 'number') {
-      if ((v & 0xff00) === 0xfe00) { if (v <= 0xfefd) v = 0xfefd; }
+      if (out.dtls) { if (v <= 0xfefd) v = 0xfefd; }
       else if (v >= 0x0303) v = 0x0303;
     }
     out.supported_versions = (typeof v === 'number') ? [v] : [];
@@ -190,13 +190,15 @@ function build_tls_message(params) {
  * @param {number}     [negotiatedVersion] — optional; 0x0303 for TLS 1.2, 0x0304 for TLS 1.3.
  *                                           Needed to disambiguate NewSessionTicket wire format.
  */
-function parse_tls_message(data, negotiatedVersion) {
+// opts.dtls: whether the transport is DTLS (the session knows; a hello's
+// version does not say it reliably).
+function parse_tls_message(data, negotiatedVersion, opts) {
   let out = {};
   let message = wire.parse_message(data);
 
   if (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO || message.type == wire.TLS_MESSAGE_TYPE.SERVER_HELLO) {
     let kind = (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO) ? 'client' : 'server';
-    let hello = wire.parse_hello({ kind: kind, body: message.body });
+    let hello = wire.parse_hello({ kind: kind, body: message.body, dtls: opts ? opts.dtls : undefined });
     out = normalize_hello(hello, kind);
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.SERVER_KEY_EXCHANGE) {

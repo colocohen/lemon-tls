@@ -18,6 +18,8 @@
  */
 
 import dgram from 'node:dgram';
+import dns from 'node:dns';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import DTLSSession from './dtls_session.js';
@@ -26,6 +28,21 @@ import DTLSSession from './dtls_session.js';
 // ============================================================
 //  DTLSSocket — single DTLS connection over UDP
 // ============================================================
+
+// connectDTLS's own UDP socket (not exported): the DTLSSocket may replace it
+// by one of the family its host name resolves to, and closes it when done.
+const kOwnsTransport = Symbol('ownsTransport');
+const kTransport = Symbol('transport');
+
+// What a DTLSSocket — or the server, for each of its connections — sets
+// itself. Every other option goes on to the DTLSSession as the caller gave
+// it: these were hand-copied lists, and what one left out did not exist —
+// createDTLSServer dropped ca, rejectUnauthorized, checkServerIdentity and
+// cipherSuites, so a server with requestCert and a ca took ANY client
+// certificate (a self-signed one included).
+function sessionOptions(options, own) {
+  return Object.assign({}, options, own);
+}
 
 function DTLSSocket(udpSocket, options) {
   if (!(this instanceof DTLSSocket)) return new DTLSSocket(udpSocket, options);
@@ -36,30 +53,41 @@ function DTLSSocket(udpSocket, options) {
 
   let remoteAddress = options.remoteAddress || null;
   let remotePort = options.remotePort || null;
+  let ownsTransport = options[kOwnsTransport] === true;
 
-  // Create DTLSSession
-  let session = new DTLSSession({
-    isServer: !!options.isServer,
-    servername: options.servername,
-    SNICallback: options.SNICallback,
-    cert: options.cert,
-    key: options.key,
-    rejectUnauthorized: options.rejectUnauthorized,
-    checkServerIdentity: options.checkServerIdentity,
-    requestCert: options.requestCert,
-    ca: options.ca,
-    alpnProtocols: options.alpnProtocols,
-    minVersion: options.minVersion,
-    maxVersion: options.maxVersion,
-    mtu: options.mtu,
-    groups: options.groups,
-    ticketKeys: options.ticketKeys,
-    useCookies: options.useCookies,
-    srtpProfiles: options.srtpProfiles,
-    session: options.session,
-    sessionTickets: options.sessionTickets,
-    initialRetransmitTimeout: options.initialRetransmitTimeout,
-  });
+  // A client given a host NAME: resolved once, here. It was used as the
+  // address as it was — every datagram sent to it paid a lookup of its own
+  // (dgram resolves a name per send), and every datagram back was dropped,
+  // its rinfo.address (an IP) never equal to the name: connectDTLS to
+  // 'localhost' never connected. What the session sends meanwhile — its
+  // ClientHello — waits for the address; what arrives meanwhile is no one's.
+  // A socket of our own (connectDTLS) resolves to IPv4 or IPv6, whichever the
+  // name has first, and gets a UDP socket of that family; a caller's socket
+  // keeps its family and the name must resolve to it.
+  let resolving = null;
+  if (!options.isServer && remoteAddress && net.isIP(remoteAddress) === 0) {
+    let name = remoteAddress;
+    remoteAddress = null;
+    resolving = [];
+    let family = ownsTransport ? 0 : (udpSocket && udpSocket.type === 'udp6' ? 6 : 4);
+    dns.lookup(name, { family: family }, function(err, address, fam) {
+      let held = resolving;
+      resolving = null;
+      // Closed meanwhile: the UDP socket may be gone, and nothing is owed.
+      if (session.state === 'closed') return;
+      if (err) { ev.emit('error', err); session.close(); return; }
+      if (ownsTransport && (fam === 6) !== (udpSocket.type === 'udp6')) {
+        detachTransport(udpSocket);
+        try { udpSocket.close(); } catch (e) {}
+        udpSocket = dgram.createSocket(fam === 6 ? 'udp6' : 'udp4');
+        attachTransport(udpSocket);
+      }
+      remoteAddress = address;
+      for (let i = 0; i < held.length; i++) transmit(held[i]);
+    });
+  }
+
+  let session = new DTLSSession(sessionOptions(options, { isServer: !!options.isServer }));
 
   // Wire session → UDP
   // Datagrams handed to the UDP socket and not yet sent: dgram's send() is
@@ -67,13 +95,25 @@ function DTLSSocket(udpSocket, options) {
   // datagram of a failed connection is its alert — closed at once after it,
   // the peer never learned why (the client's illegal_parameter, BoGo
   // FragmentMessage*Mismatch). whenFlushed() waits for them.
+  // One callback for every send, not a closure per datagram. A send error
+  // comes to it (not as the UDP socket's 'error' event): this connection's,
+  // reported on it — on a server's shared socket, not the whole server's.
   let pendingSends = 0, flushWaiters = [];
+  function onSent(err) {
+    if (err) ev.emit('error', err);
+    if (--pendingSends === 0 && flushWaiters.length > 0) {
+      let w = flushWaiters; flushWaiters = [];
+      for (let i = 0; i < w.length; i++) w[i]();
+    }
+  }
+  function transmit(data) {
+    udpSocket.send(data, 0, data.length, remotePort, remoteAddress, onSent);
+    pendingSends++;   // counted once queued: a send that throws queued nothing
+  }
   session.on('packet', function(data) {
+    if (resolving) { resolving.push(data); return; }
     if (!remoteAddress || !remotePort) return;
-    pendingSends++;
-    udpSocket.send(data, 0, data.length, remotePort, remoteAddress, function() {
-      if (--pendingSends === 0) { let w = flushWaiters; flushWaiters = []; for (let i = 0; i < w.length; i++) w[i](); }
-    });
+    transmit(data);
   });
   self.whenFlushed = function(fn) { if (pendingSends === 0) fn(); else flushWaiters.push(fn); };
 
@@ -119,13 +159,25 @@ function DTLSSocket(udpSocket, options) {
     session.feedDatagram(data);
   }
 
-  // If not server, bind to UDP messages directly
-  if (!options.isServer && udpSocket) {
-    udpSocket.on('message', function(msg, rinfo) {
-      if (remoteAddress && (rinfo.address !== remoteAddress || rinfo.port !== remotePort)) return;
-      feedDatagram(msg, rinfo);
-    });
+  // A client reads its UDP socket itself (a server's connections are fed by
+  // the server). A socket of our own also reports its errors here — it had
+  // no 'error' listener, and one (a failed bind) took the process down.
+  function onMessage(msg, rinfo) {
+    if (resolving) return;
+    if (remoteAddress && (rinfo.address !== remoteAddress || rinfo.port !== remotePort)) return;
+    feedDatagram(msg, rinfo);
   }
+  function onTransportError(err) { ev.emit('error', err); session.close(); }
+  function attachTransport(u) {
+    u.on('message', onMessage);
+    if (ownsTransport) u.on('error', onTransportError);
+  }
+  function detachTransport(u) {
+    u.removeListener('message', onMessage);
+    u.removeListener('error', onTransportError);
+  }
+  if (!options.isServer && udpSocket) attachTransport(udpSocket);
+  self[kTransport] = function() { return udpSocket; };
 
   // ---- Public API ----
 
@@ -229,74 +281,123 @@ function createDTLSServer(options, connectionListener) {
   // be used (as TLSServer: tls_socket.js keeps one per server too).
   let ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
 
-  function listen(port, address, callback) {
-    if (typeof address === 'function') { callback = address; address = undefined; }
-
-    udpSocket = dgram.createSocket('udp4');
-
-    udpSocket.on('message', function(msg, rinfo) {
-      let key = rinfo.address + ':' + rinfo.port;
-
-      if (!(key in connections)) {
-        // New client
-        let socket = new DTLSSocket(udpSocket, {
-          isServer: true,
-          remoteAddress: rinfo.address,
-          remotePort: rinfo.port,
-          cert: options.cert,
-          key: options.key,
-          requestCert: options.requestCert,
-          SNICallback: options.SNICallback,
-          alpnProtocols: options.alpnProtocols,
-          minVersion: options.minVersion,
-          maxVersion: options.maxVersion,
-          mtu: options.mtu,
-          groups: options.groups,
-          ticketKeys: ticketKeys,
-          useCookies: options.useCookies,
-          srtpProfiles: options.srtpProfiles,
-          sessionTickets: options.sessionTickets,
-          initialRetransmitTimeout: options.initialRetransmitTimeout,
-        });
-
-        connections[key] = socket;
-
-        socket.on('close', function() {
-          delete connections[key];
-        });
-
-        socket.on('connect', function() {
-          if (connectionListener) connectionListener(socket);
-          ev.emit('connection', socket);
-        });
-
-        socket.on('error', function(err) {
-          ev.emit('clientError', err, socket);
-        });
-      }
-
-      connections[key].feedDatagram(msg, rinfo);
-    });
-
-    udpSocket.on('error', function(err) {
-      ev.emit('error', err);
-    });
-
-    udpSocket.bind(port, address, function() {
-      if (callback) callback();
-      ev.emit('listening');
-    });
+  // A ClientHello: an unprotected (epoch 0) handshake record whose message
+  // is type 1 — the first record of the datagram, as a ClientHello comes.
+  function isClientHello(msg) {
+    return msg.length > 25 && msg[0] === 22 && msg[3] === 0 && msg[4] === 0 && msg[13] === 1;
   }
 
+  function newConnection(key, rinfo) {
+    let socket = new DTLSSocket(udpSocket, sessionOptions(options, {
+      isServer: true,
+      remoteAddress: rinfo.address,
+      remotePort: rinfo.port,
+      ticketKeys: ticketKeys,
+    }));
+
+    socket.on('close', function() {
+      if (connections[key] === socket) delete connections[key];
+      if (replacing[key] === socket) delete replacing[key];
+    });
+
+    socket.on('connect', function() {
+      // A new association from the address of an existing one (below): it
+      // has completed its handshake — the client is there — and takes the
+      // old one's place.
+      if (replacing[key] === socket) {
+        let old = connections[key];
+        connections[key] = socket;
+        delete replacing[key];
+        if (old) old.close();
+      }
+      if (connectionListener) connectionListener(socket);
+      ev.emit('connection', socket);
+    });
+
+    socket.on('error', function(err) {
+      ev.emit('clientError', err, socket);
+    });
+    return socket;
+  }
+
+  // RFC 6347 §4.2.8 (and RFC 9147 §5.9 the same): a ClientHello from the
+  // address of an established association is a new one — the client
+  // restarted, or a NAT gave its port to another — and the server "SHOULD
+  // proceed with a new handshake but MUST NOT destroy the existing
+  // association until the client has demonstrated reachability", by
+  // completing the handshake. It went to the old session, which took it for
+  // a stray retransmission: the client was never answered while that entry
+  // lived — for good, if its close_notify was lost (a dtls_loss_test
+  // handshake in ~150 hung so, with no loss at all).
+  // So the new handshake runs beside the old association (replacing), and
+  // replaces it when it connects. Meanwhile every other datagram goes to
+  // both: a protected record opens only under the keys it was made with,
+  // and each session drops what it cannot open — and a spoofed ClientHello
+  // never touches the old one.
+  let replacing = {};   // 'addr:port' → the DTLSSocket of a new handshake there
+
+  function onDatagram(msg, rinfo) {
+    let key = rinfo.address + ':' + rinfo.port;
+    let conn = connections[key];
+
+    if (!conn) {
+      conn = connections[key] = newConnection(key, rinfo);
+      conn.feedDatagram(msg, rinfo);
+      return;
+    }
+    if (isClientHello(msg) && conn.state === 'connected') {
+      if (!replacing[key]) replacing[key] = newConnection(key, rinfo);
+      replacing[key].feedDatagram(msg, rinfo);
+      return;
+    }
+    conn.feedDatagram(msg, rinfo);
+    if (replacing[key]) replacing[key].feedDatagram(msg, rinfo);
+  }
+
+  // listen(port[, address][, callback]). The address's family decides the
+  // socket's: an IPv6 one, an IPv6 socket. No address: '::', dual-stack —
+  // IPv4 clients too (as '::ffff:a.b.c.d'), as node:net and node:tls listen
+  // — or, on a host without IPv6, 0.0.0.0. It was IPv4 only, whatever the
+  // address: an IPv6 client could never reach a DTLS server.
+  function listen(port, address, callback) {
+    if (typeof address === 'function') { callback = address; address = undefined; }
+    let open = function(type, bindAddress, fallback) {
+      let u = dgram.createSocket({ type: type, ipv6Only: false });
+      let onBindError = function(err) {
+        u.removeListener('error', onBindError);
+        try { u.close(); } catch (e) {}
+        if (fallback && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL' || err.code === 'EPROTONOSUPPORT' || err.code === 'EINVAL')) { fallback(); return; }
+        ev.emit('error', err);
+      };
+      u.on('error', onBindError);
+      u.bind(port, bindAddress, function() {
+        u.removeListener('error', onBindError);
+        udpSocket = u;
+        u.on('message', onDatagram);
+        u.on('error', function(err) { ev.emit('error', err); });
+        if (callback) callback();
+        ev.emit('listening');
+      });
+    };
+    if (address !== undefined && address !== null) open(net.isIP(address) === 6 ? 'udp6' : 'udp4', address, null);
+    else open('udp6', '::', function() { open('udp4', undefined, null); });
+  }
+
+  // Every connection's close_notify first, then the socket — once they have
+  // gone (whenFlushed): closed at once, it dropped them.
   function close(callback) {
-    for (let key in connections) {
-      connections[key].close();
-    }
+    let open = Object.keys(connections).map(function(k) { return connections[k]; })
+      .concat(Object.keys(replacing).map(function(k) { return replacing[k]; }));
     connections = {};
-    if (udpSocket) {
-      udpSocket.close(callback);
-      udpSocket = null;
-    }
+    replacing = {};
+    let sock = udpSocket;
+    udpSocket = null;
+    for (let i = 0; i < open.length; i++) open[i].close();
+    if (!sock) return;
+    let waiting = open.length + 1;
+    let done = function() { if (--waiting === 0) sock.close(callback); };
+    for (let i = 0; i < open.length; i++) open[i].whenFlushed(done);
+    done();
   }
 
   function address() {
@@ -322,38 +423,26 @@ function connectDTLS(options, callback) {
   let host = options.host || options.hostname || '127.0.0.1';
   let port = options.port || 4433;
 
-  let udp = dgram.createSocket('udp4');
+  // An IPv6 literal needs an IPv6 socket; for a name, the DTLSSocket picks
+  // the family it resolves to (kOwnsTransport).
+  let udp = dgram.createSocket(net.isIP(host) === 6 ? 'udp6' : 'udp4');
 
-  let socket = new DTLSSocket(udp, {
+  // Every option goes on to the session (sessionOptions), as given: the
+  // client's certificate, ca, cipherSuites, ... — this list too had dropped
+  // whatever it did not name.
+  let socket = new DTLSSocket(udp, sessionOptions(options, {
     isServer: false,
     remoteAddress: host,
     remotePort: port,
     servername: options.servername || host,
-    // The client's own certificate (a server that asks for one — WebRTC
-    // always does) and its SRTP profiles: they were not passed on, so a
-    // connectDTLS client presented nothing.
-    cert: options.cert,
-    key: options.key,
-    srtpProfiles: options.srtpProfiles,
-    rejectUnauthorized: options.rejectUnauthorized,
-    checkServerIdentity: options.checkServerIdentity,
-    requestCert: options.requestCert,
-    ca: options.ca,
-    alpnProtocols: options.alpnProtocols,
-    minVersion: options.minVersion,
-    maxVersion: options.maxVersion,
-    mtu: options.mtu,
-    groups: options.groups,
-    session: options.session,
-    sessionTickets: options.sessionTickets,
-    initialRetransmitTimeout: options.initialRetransmitTimeout,
-  });
+    [kOwnsTransport]: true,
+  }));
 
   if (callback) socket.on('connect', callback);
 
   // After what is still queued has gone — the closing alert above all.
   socket.on('close', function() {
-    socket.whenFlushed(function() { try { udp.close(); } catch(e) {} });
+    socket.whenFlushed(function() { try { socket[kTransport]().close(); } catch(e) {} });
   });
 
   return socket;

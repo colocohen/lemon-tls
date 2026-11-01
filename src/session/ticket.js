@@ -109,11 +109,13 @@ function decrypt_session_blob(blob, ticketKeys) {
  * User is responsible for secure storage (this contains the master_secret).
  *
  * @param {Object} state
- * @returns {Uint8Array} — utf-8 encoded JSON
+ * @returns {Buffer} — utf-8 encoded JSON. A Buffer, as node:tls's 'session'
+ *   gives (and what the socket's getSession() returned already): it was
+ *   copied into a plain Uint8Array, so 'session' handed out one type and
+ *   getSession() another.
  */
 function encode_client_session(state) {
-    let serialized = JSON.stringify(serialize_state(state));
-    return new Uint8Array(Buffer.from(serialized, 'utf8'));
+    return Buffer.from(JSON.stringify(serialize_state(state)), 'utf8');
 }
 
 /**

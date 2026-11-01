@@ -52,7 +52,7 @@ import { x25519_get_public_key, SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, gener
 import { build_tls_message, parse_tls_message } from './session/message.js';
 import { encrypt_session_blob, decrypt_session_blob, encode_client_session, decode_client_session } from './session/ticket.js';
 import { parse_cert_compression, supported_cert_compression, compress_certificate_body, decompress_certificate_body, cert_compression_name } from './session/cert_compression.js';
-import { prepare_ech_server, server_process_client_hello, accept_confirmation, EXT_ECH,
+import { prepare_ech_server, server_process_client_hello, backend_client_hello, accept_confirmation, EXT_ECH,
          parse_ech_config_list, prepare_ech_client, client_hpke_setup, client_outer_ext_data, client_encode_inner,
          client_seal_outer, grease_ech_state, grease_ech_ext_data, hrr_ech_offset } from './session/ech.js';
 
@@ -135,11 +135,25 @@ function _x509(x) {
 const ANCHOR_CACHE_MAX = 1024;
 const _anchorByPem = new Map();
 const _anchorByObj = new WeakMap();
-function _anchorX509(a) {
+// One `ca` entry: a PEM string or Buffer may hold a whole BUNDLE — many
+// certificates, as node:tls takes them (and as a CA file is). X509Certificate
+// reads the first and stops, so only the first CA of a bundle was trusted,
+// over TLS and DTLS alike. A DER Buffer (or anything else) is one certificate.
+const PEM_CERT_RE = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+function _parseAnchors(a) {
+  let pem = typeof a === 'string' ? a
+    : (Buffer.isBuffer(a) || a instanceof Uint8Array) && a.length > 10 && a[0] === 0x2d /* '-' */ ? Buffer.from(a).toString('latin1')
+    : null;
+  if (pem === null) { let x = _x509(a); return x ? [x] : []; }
+  let out = [], m = pem.match(PEM_CERT_RE) || [];
+  for (let i = 0; i < m.length; i++) { let x = _x509(m[i]); if (x) out.push(x); }
+  return out;
+}
+function _anchorX509s(a) {
   if (typeof a === 'string') {
     let hit = _anchorByPem.get(a);
     if (hit !== undefined) return hit;
-    hit = _x509(a);
+    hit = _parseAnchors(a);
     if (_anchorByPem.size >= ANCHOR_CACHE_MAX) _anchorByPem.clear();
     _anchorByPem.set(a, hit);
     return hit;
@@ -147,11 +161,11 @@ function _anchorX509(a) {
   if (a && typeof a === 'object') {
     let hit = _anchorByObj.get(a);
     if (hit !== undefined) return hit;
-    hit = _x509(a);
+    hit = _parseAnchors(a);
     _anchorByObj.set(a, hit);
     return hit;
   }
-  return null;
+  return [];
 }
 function _sameCert(a, b) { return a.raw.length === b.raw.length && a.raw.equals(b.raw); }
 function _validNow(x509, now) {
@@ -210,8 +224,8 @@ function verify_cert_chain(chainDer, anchors, now) {
 
   const trusted = [];
   for (let i = 0; i < (anchors || []).length; i++) {
-    const x = _anchorX509(anchors[i]);
-    if (x) trusted.push(x);
+    const xs = _anchorX509s(anchors[i]);
+    for (let k = 0; k < xs.length; k++) trusted.push(xs[k]);
   }
   if (trusted.length === 0) return { ok: false, error: 'NO_TRUST_ANCHORS' };
 
@@ -882,20 +896,16 @@ function TLSSession(options){
   }
 
   // DTLS or TLS: a DTLSSession sets DTLS versions before the first message;
-  // a TLS session's, when set at all by then, are TLS ones.
-  // This side's hello is a DTLS one (its version list is DTLS), and offers
-  // DTLS 1.3.
-  function isDtlsHello() {
-    return !!(context.local_supported_versions &&
-              context.local_supported_versions.some(function (v) { return (v & 0xFF00) === 0xFE00; }));
+  // a TLS session's, when set at all by then, are TLS ones. So: this session
+  // runs over DTLS when its version list is DTLS. (One test — three copies
+  // of it had grown here: isDtlsHello, an inline one, and this.)
+  function dtls_transport() {
+    return (context.local_supported_versions || []).some(function (v) { return (v & 0xff00) === 0xfe00; });
   }
+  // This side's hello offers DTLS 1.3.
   function offersDtls13() {
     return !!(context.local_supported_versions &&
               context.local_supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0);
-  }
-
-  function dtls_transport() {
-    return (context.local_supported_versions || []).some(function (v) { return (v & 0xff00) === 0xfe00; });
   }
 
   /**
@@ -1027,8 +1037,7 @@ function TLSSession(options){
     // It was left out of DTLS after an interop failure with s_server
     // -dtls1_2 that was ours: the DTLS server echoed the client's session_id
     // in every full handshake, which says "resumed" (fixed in r90).
-    let isDtlsProfile = context.local_supported_versions &&
-                        context.local_supported_versions.some(function (v) { return (v & 0xFF00) === 0xFE00; });
+    let isDtlsProfile = dtls_transport();
     if (!tls13Only && context.sessionTickets) {
       if (opts.sessionTicket) {
         extensions.push({ type: 'SESSION_TICKET', value: opts.sessionTicket });
@@ -1073,18 +1082,14 @@ function TLSSession(options){
     // Encrypted Client Hello (RFC 9849). With a config: this list is the
     // inner hello's, marked as such (§5: the inner extension, type 1) — the
     // outer one is made from it (ech_split). Without one, and echGrease:
-    // a GREASE extension (§6.2) — in a second hello, the first's again,
-    // byte for byte: "the client copies the entire 'encrypted_client_hello'
-    // extension from the first ClientHello" (RFC 9849 §6.2). A fresh one
-    // with an empty enc was made for CH2 — the real-ECH rule (§6.1.5), which
-    // GREASE does not follow; BoGo saw the extension change.
+    // a GREASE extension (§6.2) — the same bytes in a second hello
+    // (grease_ech_ext_data).
     if (!context.isServer && offers13 && !isDtlsProfile) {
       if (ech_on()) {
         extensions.push({ type: EXT_ECH, data: new Uint8Array([1]) });
       } else if (context.ech_grease) {
         if (!context.ech.grease) { context.ech.grease = grease_ech_state(); context.ech.status = 'grease'; }
-        if (!context.ech.grease_ext) context.ech.grease_ext = grease_ech_ext_data(context.ech.grease, false);
-        extensions.push({ type: EXT_ECH, data: context.ech.grease_ext });
+        extensions.push({ type: EXT_ECH, data: grease_ech_ext_data(context.ech.grease) });
       }
     }
 
@@ -2228,8 +2233,50 @@ function TLSSession(options){
     return data;
   }
 
+  /**
+   * The peer authentication gate (see "Authentication gate" where the
+   * handshake completes): null, or { alert, reason } — what the handshake
+   * fails with. One function, asked at completion and, by a TLS 1.2 server,
+   * before its own ChangeCipherSpec and Finished go out: there it ran only
+   * after them, so a server that required a client certificate and got none
+   * finished its side first and then sent certificate_required — a TLS 1.3
+   * alert (DTLS-Fuzzer D4; OpenSSL answers handshake_failure at once).
+   */
+  function authentication_failure() {
+    // Client: the server must have proved possession of its certificate
+    // key — TLS 1.3 CertificateVerify, or the TLS 1.2 ServerKeyExchange
+    // signature. PSK/abbreviated handshakes authenticate via the binder /
+    // resumed master secret instead.
+    if (!context.isServer && !context.psk_accepted && !context.tls12_abbreviated &&
+        context.peerSignatureVerified !== true) {
+      return { alert: wire.TLS_ALERT.UNEXPECTED_MESSAGE, reason: 'Handshake completed without a verified server signature' };
+    }
+    // Server-side client authentication: (a) must a certificate arrive at
+    // all — policy; (b) one that did arrive must be proved — always.
+    if (context.isServer && !context.psk_accepted && !context.tls12_abbreviated) {
+      let clientCertPresent = !!(context.remote_cert_chain && context.remote_cert_chain.length > 0);
+      // (a) required-but-absent: certificate_required is TLS 1.3's (RFC
+      // 8446 §4.4.2.4); TLS 1.2 says handshake_failure (RFC 5246 §7.4.6).
+      if (context.requestCert && context.rejectUnauthorized && !clientCertPresent) {
+        return { alert: is13() ? wire.TLS_ALERT.CERTIFICATE_REQUIRED : wire.TLS_ALERT.HANDSHAKE_FAILURE,
+                 reason: 'Client certificate was required but none was provided' };
+      }
+      // (b) present-but-unproved.
+      if (clientCertPresent && context.peerSignatureVerified !== true) {
+        return { alert: wire.TLS_ALERT.UNEXPECTED_MESSAGE, reason: 'Client sent a certificate without a valid CertificateVerify' };
+      }
+    }
+    return null;
+  }
+
+  // The (D)TLS 1.3 key schedule's label prefix: "dtls13" over DTLS (RFC 9147
+  // §5.9), "tls13 " otherwise — by the TRANSPORT, not the version chosen.
+  // By selected_version, every derivation before the version is known took
+  // "tls13 ": the PSK binder a DTLS client sends with its ClientHello, and the
+  // server's check of it. Two lemon peers agreed with each other, and DTLS
+  // 1.3 resumption with anyone else failed. (Only 1.3 derivations ask.)
   function label_prefix() {
-    return label_prefix_for(context.selected_version);
+    return dtls_transport() ? LABEL_PREFIX_DTLS13 : LABEL_PREFIX_TLS13;
   }
 
   // For a version chosen in this pass but not yet committed to context
@@ -2510,43 +2557,21 @@ function TLSSession(options){
     }
 
     // Encrypted Client Hello, split mode (RFC 9849 §7.2): a server with no
-    // ECH keys of its own that receives a ClientHello carrying the INNER
-    // encrypted_client_hello extension is the backend behind a client-facing
-    // server that decrypted it — this is the ClientHelloInner. It confirms
-    // ECH acceptance (the last 8 bytes of the ServerHello random, and the
-    // HelloRetryRequest's extension, §7.2.1) like a server that decrypted it
-    // itself: same state, same code. It was ignored, so a backend never
-    // confirmed — and a client using ECH through it took ECH as rejected
-    // (BoGo TLS-ECH-Server-ECHInner*). A server WITH keys refuses an inner
-    // extension from the network (server_process_client_hello).
-    // ECH is TLS 1.3's alone (§6.1: a ClientHelloInner offers nothing older):
-    // in a hello that does not offer 1.3 the extension means nothing here.
+    // ECH keys is the backend behind a client-facing server, and confirms a
+    // ClientHelloInner it was passed (backend_client_hello). It ignored the
+    // inner extension, so a client using ECH through a backend took ECH as
+    // rejected (BoGo TLS-ECH-Server-ECHInner*). ECH is TLS 1.3's alone (§6.1):
+    // in a hello that does not offer 1.3 the extension means nothing — and a
+    // handshake that settles on an older version takes the acceptance back
+    // (selected_version, set_context).
     if (context.isServer && message.type === 'client_hello' && !context.ech_server &&
         Array.isArray(message.supported_versions) && message.supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0) {
-      let innerExt = null;
-      if (Array.isArray(message.extensions)) {
-        for (let xi = 0; xi < message.extensions.length; xi++) {
-          let xe = message.extensions[xi];
-          if (xe && xe.type === EXT_ECH) { innerExt = xe; break; }
-        }
-      }
-      let xd = innerExt && (innerExt.data || new Uint8Array(0));
-      let isInner = !!xd && xd.length >= 1 && xd[0] === 1;
-      if (isInner && xd.length !== 1) {
-        fatalAlert(wire.TLS_ALERT.DECODE_ERROR, 'inner encrypted_client_hello extension is not empty');
+      try {
+        backend_client_hello(context.ech, Array.isArray(message.extensions) ? message.extensions : [],
+                             message.random, context.client_hellos_received === 2);
+      } catch (e) {
+        fatalAlert(e.alertDesc || wire.TLS_ALERT.ILLEGAL_PARAMETER, e.message);
         return;
-      }
-      if (context.client_hellos_received === 1 && isInner) {
-        context.ech.status = 'accepted';
-        context.ech.backend = true;
-        context.ech.inner_random = message.random;
-      } else if (context.client_hellos_received === 2 && context.ech.backend) {
-        // §7.2.1: the second ClientHelloInner carries it too.
-        if (!isInner) {
-          fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'second ClientHello without the inner encrypted_client_hello extension');
-          return;
-        }
-        context.ech.inner_random = message.random;
       }
     }
 
@@ -4309,6 +4334,12 @@ function TLSSession(options){
         if(options.selected_version!==context.selected_version){
           context.selected_version=options.selected_version;
           has_changed=true;
+          // A split-mode backend (backend_client_hello) accepted ECH for a
+          // TLS 1.3 handshake; one on an older version has no ECH at all.
+          if (context.ech.backend && options.selected_version != null && options.selected_version !== wire.TLS_VERSION.TLS1_3) {
+            context.ech.status = null;
+            context.ech.backend = false;
+          }
         }
       }
 
@@ -6331,6 +6362,13 @@ function TLSSession(options){
 
           if (can_send_finished) {
 
+            // A full-handshake server's Finished answers the client's flight:
+            // it is not sent for a client that has not authenticated.
+            if (context.isServer && !context.tls12_abbreviated) {
+              let authFail = authentication_failure();
+              if (authFail) { fatalAlert(authFail.alert, authFail.reason); return; }
+            }
+
             let finishedHashName = negotiated_hash();
             let transcript_hash = get_transcript_hash(finishedHashName);
 
@@ -6471,7 +6509,7 @@ function TLSSession(options){
                   ' hash=' + remoteFinHashName);
                 console.log('[lemon-fin] transcript(' + _t.length + '): ' + _list.join(' → '));
                 console.log('[lemon-fin] transcriptHash=' +
-                  _hex(get_transcript_hash(remoteFinHashName, label_prefix())));
+                  _hex(get_transcript_hash(remoteFinHashName)));
                 console.log('[lemon-fin] remoteSecret=' + _hex(context.remote_handshake_traffic_secret));
                 console.log('[lemon-fin] peerSent=' + _hex(context.remote_finished));
                 console.log('[lemon-fin] weExpect=' + _hex(params_to_set['expected_remote_finished']));
@@ -6579,52 +6617,8 @@ function TLSSession(options){
         // the durable place for a MUST-have-happened invariant is the state
         // transition it guards, not the event that usually satisfies it.
 
-        // Client: the server must have proved possession of its certificate
-        // key — TLS 1.3 CertificateVerify, or the TLS 1.2 ServerKeyExchange
-        // signature. PSK/abbreviated handshakes authenticate via the binder /
-        // resumed master secret instead.
-        if (!context.isServer && !context.psk_accepted && !context.tls12_abbreviated &&
-            context.peerSignatureVerified !== true) {
-          fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
-            'Handshake completed without a verified server signature');
-          return;
-        }
-
-        // Server-side client authentication. Two DIFFERENT questions, which
-        // were previously collapsed into one condition:
-        //
-        //   (a) Must a client certificate arrive at all?  -> policy, and only
-        //       when we both asked for one and refuse to proceed without it.
-        //   (b) If a certificate DID arrive, must it be proved?  -> ALWAYS.
-        //
-        // Collapsing them meant a server with requestCert but without
-        // rejectUnauthorized skipped the whole block, so a client could send a
-        // certificate — any certificate, including one it does not own — and
-        // never prove possession, because the CertificateVerify check lived
-        // behind the (a) policy flag. Presenting someone else's certificate is
-        // an impersonation, not a policy preference, so (b) cannot be optional.
-        if (context.isServer && !context.psk_accepted && !context.tls12_abbreviated) {
-
-          let clientCertPresent = !!(context.remote_cert_chain && context.remote_cert_chain.length > 0);
-
-          // (a) required-but-absent
-          if (context.requestCert && context.rejectUnauthorized && !clientCertPresent) {
-            fatalAlert(wire.TLS_ALERT.CERTIFICATE_REQUIRED,
-              'Client certificate was required but none was provided');
-            return;
-          }
-
-          // (b) present-but-unproved. Unconditional: it applies even when the
-          // certificate was optional, because the question is not "did we want
-          // one" but "does this peer own the one it sent". In TLS 1.2 the
-          // client's CertificateVerify sets peerSignatureVerified the same way
-          // — every version, now: this was 1.3-only, whatever this said.
-          if (clientCertPresent && context.peerSignatureVerified !== true) {
-            fatalAlert(wire.TLS_ALERT.UNEXPECTED_MESSAGE,
-              'Client sent a certificate without a valid CertificateVerify');
-            return;
-          }
-        }
+        let authFail = authentication_failure();
+        if (authFail) { fatalAlert(authFail.alert, authFail.reason); return; }
 
         context.state='connected';
         context.handshakeEndTime = Date.now();
@@ -6638,8 +6632,11 @@ function TLSSession(options){
         // TLS 1.3: compute resumption_master_secret (both client and server need it)
         if ((is13()) && context.tls13_master_secret && !context.resumption_master_secret) {
           let hashName = negotiated_hash();
+          // The prefix is derive_resumption_master_secret_with_hash's fourth
+          // argument. It went to get_transcript_hash, which takes one, so
+          // "res master" was derived with "tls13 " over DTLS too.
           context.resumption_master_secret = derive_resumption_master_secret_with_hash(
-            hashName, context.tls13_master_secret, get_transcript_hash(hashName, label_prefix())
+            hashName, context.tls13_master_secret, get_transcript_hash(hashName), label_prefix()
           );
         }
 
@@ -7255,7 +7252,7 @@ function TLSSession(options){
         // DTLS 1.3 is not offered as well, since RFC 9147 §5.3 allows a DTLS
         // 1.3 ClientHello only a session_id a pre-1.3 server set. Offering
         // 1.3 too, the ticket stays home: a full handshake (and a new one).
-        let dtlsTicket = isDtlsHello() && sessionData.ticket && sessionData.ticket.length > 0 &&
+        let dtlsTicket = dtls_transport() && sessionData.ticket && sessionData.ticket.length > 0 &&
                          !(sessionData.session_id && sessionData.session_id.length > 0);
         let presentTicket = !!(sessionData.ticket && sessionData.ticket.length > 0) &&
                             !(dtlsTicket && offersDtls13());
@@ -7364,9 +7361,8 @@ function TLSSession(options){
    * The narrower `(v & 0x0f0f) === 0x0a0a` test used before also matched
    * non-GREASE values such as 0x1a2a, so it is not a safe stand-in.
    */
-  function fp_is_grease(v) {
-    return (v & 0x0f0f) === 0x0a0a && ((v >>> 8) & 0xff) === (v & 0xff);
-  }
+  // (is_grease_u16, above: one test for the whole session.)
+  const fp_is_grease = is_grease_u16;
 
   function fp_no_grease(list) {
     let out = [];
@@ -7404,6 +7400,14 @@ function TLSSession(options){
   }
 
   function fp_hello() { return fp_parse('client'); }
+  // JA4 / JA4S / JA5 alike: a DTLS hello (by its legacy_version) or session,
+  // and the protocol letter — 'd' or 't', unless the caller names one.
+  function fp_is_dtls(hello) {
+    return ((hello.legacy_version & 0xFF00) === 0xFE00) || ((context.selected_version & 0xFF00) === 0xFE00);
+  }
+  function fp_proto(opts, isDTLS) {
+    return (opts && opts.protocol) ? String(opts.protocol).charAt(0) : (isDTLS ? 'd' : 't');
+  }
   function fp_shello() { return fp_parse('server'); }
 
   /** Signature schemes in WIRE ORDER (JA4 deliberately does not sort these). */
@@ -7537,11 +7541,7 @@ function TLSSession(options){
     let hello = fp_hello();
     if (!hello) return null;
     try {
-        let isDTLS = ((hello.legacy_version & 0xFF00) === 0xFE00) ||
-                     ((context.selected_version & 0xFF00) === 0xFE00);
-
-        let proto = (opts && opts.protocol) ? String(opts.protocol).charAt(0)
-                                            : (isDTLS ? 'd' : 't');
+        let isDTLS = fp_is_dtls(hello), proto = fp_proto(opts, isDTLS);
 
         let verStr = fp_version_string(hello, isDTLS);
 
@@ -7598,10 +7598,7 @@ function TLSSession(options){
     let hello = fp_shello();
     if (!hello) return null;
     try {
-      let isDTLS = ((hello.legacy_version & 0xFF00) === 0xFE00) ||
-                   ((context.selected_version & 0xFF00) === 0xFE00);
-      let proto = (opts && opts.protocol) ? String(opts.protocol).charAt(0)
-                                          : (isDTLS ? 'd' : 't');
+      let isDTLS = fp_is_dtls(hello), proto = fp_proto(opts, isDTLS);
 
       // Extensions here are NOT GREASE-filtered, unlike every list in JA4.
       // The reference implementations filter GREASE only out of the server's
@@ -7671,10 +7668,7 @@ function TLSSession(options){
     let hello = fp_hello();
     if (!hello) return null;
     try {
-      let isDTLS = ((hello.legacy_version & 0xFF00) === 0xFE00) ||
-                   ((context.selected_version & 0xFF00) === 0xFE00);
-      let proto = (opts && opts.protocol) ? String(opts.protocol).charAt(0)
-                                          : (isDTLS ? 'd' : 't');
+      let isDTLS = fp_is_dtls(hello), proto = fp_proto(opts, isDTLS);
       let verStr = fp_version_string(hello, isDTLS);
 
       let allExts = (hello.extensions || []).map(function(e){ return e.type; });

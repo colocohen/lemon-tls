@@ -1657,8 +1657,9 @@ function TLSSocket(duplex, options){
         // SHA-256. The chain is a list of { cert } entries — this check once
         // read `.raw` off the list itself, found nothing, and let every
         // certificate through behind a "best-effort" catch. A pin fails closed:
-        // no certificate to hash is a mismatch too.
-        if (context.pins && context.pins.length > 0) {
+        // no certificate to hash is a mismatch too. A client's option (the
+        // server's certificate), as documented.
+        if (!context.isServer && context.pins && context.pins.length > 0) {
             let chain = session.getPeerCertificate();
             let leaf = chain && chain.length > 0 ? chain[0].cert : null;
             let hash = leaf ? 'sha256/' + crypto.createHash('sha256').update(leaf).digest('base64') : null;

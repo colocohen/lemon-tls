@@ -424,6 +424,41 @@ function check_inner(innerBody) {
 //  The server's side (§7.1, §7.1.1)
 // ============================================================
 
+// RFC 8446 §4.1.2: a second ClientHello repeats the first one's random —
+// for ECH the inner one's, over which the confirmation (§7.2) is computed.
+function same_inner_random(state, random) {
+  if (!Buffer.from(random).equals(Buffer.from(state.inner_random))) {
+    throw eccError('second ClientHelloInner changed its random');
+  }
+}
+
+/**
+ * Split mode, the backend's side (§7.2): a server with no ECH keys of its
+ * own. A ClientHello carrying the INNER extension is a ClientHelloInner a
+ * client-facing server decrypted and passed on; the backend confirms ECH
+ * acceptance as a server that decrypted it itself would (§7.2, §7.2.1), so
+ * it takes the same state: status 'accepted', inner_random.
+ * `extensions` is the parsed hello's list ({ type, data }). Only the inner
+ * type is the backend's business; an outer extension, which only a holder of
+ * the keys could open, is left alone. A second ClientHello (after a
+ * HelloRetryRequest) of an accepted one is a ClientHelloInner again (§7.2.1)
+ * with the first one's random (RFC 8446 §4.1.2). Throws an eccError.
+ */
+function backend_client_hello(state, extensions, random, isSecond) {
+  var ext = null;
+  for (var i = 0; i < extensions.length; i++) if (extensions[i] && extensions[i].type === EXT_ECH) { ext = extensions[i]; break; }
+  var data = ext ? (ext.data || new Uint8Array(0)) : null;
+  var inner = !!data && data.length >= 1 && data[0] === 1;
+  if (inner) parse_ech_ext(data);                     // not empty: decode_error
+  if (!isSecond) {
+    if (inner) { state.status = 'accepted'; state.backend = true; state.inner_random = new Uint8Array(random); }
+    return;
+  }
+  if (!state.backend) return;
+  if (!inner) throw eccError('second ClientHello without the inner encrypted_client_hello extension');
+  same_inner_random(state, random);
+}
+
 /**
  * A ClientHello as it arrived (handshake header included) → what the
  * handshake should continue with. `state` is per connection, `{}` at
@@ -454,9 +489,7 @@ function server_process_client_hello(server, state, data, isSecond) {
     var scan2 = check_inner(inner2);
     // RFC 8446 §4.1.2: the second hello repeats the first one's random; the
     // ServerHello's confirmation (§7.2) is computed over it.
-    if (!Buffer.from(scan2.random).equals(Buffer.from(state.inner_random))) {
-      throw eccError('second ClientHelloInner changed its random');
-    }
+    same_inner_random(state, scan2.random);
     return { data: wrap_client_hello(inner2) };
   }
 
@@ -644,18 +677,23 @@ function client_seal_outer(outerMsg, hpkeContext, encoded) {
  * §6.2: GREASE ECH — an encrypted_client_hello extension that decrypts
  * under no key, from a client with no config, so that one with a config
  * does not stand out. `g` is fixed per connection (config_id, payload
- * length); after a HelloRetryRequest, `enc` is empty and the payload new
- * random bytes of the same length.
+ * length), and so is the extension: made once, the same bytes every time —
+ * in a second ClientHello too, which "copies the entire
+ * 'encrypted_client_hello' extension from the first ClientHello" (§6.2).
+ * (An empty enc and a fresh payload after a HelloRetryRequest is real ECH's
+ * rule, §6.1.5, which GREASE does not follow; BoGo saw the change.)
  */
 function grease_ech_state() {
   var lens = [144, 176, 208, 240];
-  return { config_id: crypto.randomBytes(1)[0], payload_len: lens[crypto.randomBytes(1)[0] & 3] + 16 };
+  return { config_id: crypto.randomBytes(1)[0], payload_len: lens[crypto.randomBytes(1)[0] & 3] + 16, ext: null };
 }
-function grease_ech_ext_data(g, second) {
-  var enc = second ? new Uint8Array(0) : new Uint8Array(crypto.randomBytes(32));
-  var d = client_outer_ext_data(0x0001, 0x0001, g.config_id, enc, g.payload_len);
-  d.set(crypto.randomBytes(g.payload_len), d.length - g.payload_len);
-  return d;
+function grease_ech_ext_data(g) {
+  if (!g.ext) {
+    var d = client_outer_ext_data(0x0001, 0x0001, g.config_id, new Uint8Array(crypto.randomBytes(32)), g.payload_len);
+    d.set(crypto.randomBytes(g.payload_len), d.length - g.payload_len);
+    g.ext = d;
+  }
+  return g.ext;
 }
 
 /**
@@ -709,6 +747,7 @@ export {
   generate_ech_key,
   prepare_ech_server,
   server_process_client_hello,
+  backend_client_hello,
   accept_confirmation,
   scan_client_hello,
   parse_ech_ext,

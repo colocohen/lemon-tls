@@ -812,9 +812,9 @@ function decryptDtls12(fragment, key, ivSalt, epoch, seq, type) {
     decipher.setAuthTag(tag);
     let pt = decipher.update(ct);
     decipher.final();
-    // A view, not a copy: pt is a fresh Buffer that owns its whole
-    // ArrayBuffer and nothing else holds it. Same Uint8Array type as before.
-    return new Uint8Array(pt.buffer, pt.byteOffset, pt.byteLength);
+    // The decipher's fresh Buffer itself (a Uint8Array): handed on as it is,
+    // up to 'data' — no copy, and no second view of it either.
+    return pt;
   }
 
   // AES-GCM: strip the 8-byte explicit nonce.
@@ -830,8 +830,8 @@ function decryptDtls12(fragment, key, ivSalt, epoch, seq, type) {
   decipher.setAuthTag(tag);
   let pt = decipher.update(ct);
   decipher.final();
-  // A view, not a copy — see the ChaCha branch above.
-  return new Uint8Array(pt.buffer, pt.byteOffset, pt.byteLength);
+  // As it is — see the ChaCha branch above.
+  return pt;
 }
 
 /** Build complete encrypted DTLS 1.2 record (header + encrypted payload). */
@@ -1223,8 +1223,9 @@ function decryptEncryptedDtls13(data, keys, fullEpoch) {
   seq = acceptedSeq;
 
   {
-    // A view, not a copy: pt is the decipher's fresh Buffer, owned by no one else.
-    let inner = parseInnerPlaintext(new Uint8Array(pt.buffer, pt.byteOffset, pt.byteLength));
+    // pt is the decipher's fresh Buffer, owned by no one else: the content is
+    // a subarray of it — a Buffer, all the way up to 'data', with no copy.
+    let inner = parseInnerPlaintext(pt);
 
     // RFC 9147 §4.5.1 anti-replay: only AFTER the tag verifies do we consult
     // and update the sliding window. Checking before deprotection would let a

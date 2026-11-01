@@ -751,6 +751,11 @@ function TLSSession(options){
   // Introducing is_tls13_wire there and leaving a second copy of the same test
   // here would have recreated exactly the drift it was added to remove.
   function is13() { return wire.is_tls13_wire(context.selected_version); }
+  // A version list with TLS 1.3 or DTLS 1.3 in it. One test: written out
+  // by hand in a dozen places, two of them (the ECH backend's) knew TLS 1.3
+  // only, so over DTLS a backend never confirmed ECH (BoGo
+  // DTLS-ECH-Server-ECHInner*).
+  function lists13(list) { return Array.isArray(list) && list.some(wire.is_tls13_wire); }
   function is12() { return wire.is_tls12_wire(context.selected_version); }
 
   // ── What the peer may send next (RFC 8446 §2, §4; RFC 5246 §7.3) ──
@@ -2564,8 +2569,7 @@ function TLSSession(options){
     // in a hello that does not offer 1.3 the extension means nothing — and a
     // handshake that settles on an older version takes the acceptance back
     // (selected_version, set_context).
-    if (context.isServer && message.type === 'client_hello' && !context.ech_server &&
-        Array.isArray(message.supported_versions) && message.supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0) {
+    if (context.isServer && message.type === 'client_hello' && !context.ech_server && lists13(message.supported_versions)) {
       try {
         backend_client_hello(context.ech, Array.isArray(message.extensions) ? message.extensions : [],
                              message.random, context.client_hellos_received === 2);
@@ -2646,10 +2650,9 @@ function TLSSession(options){
         // compression method: null. Enforced when 1.3 is on the table for
         // this negotiation (client offers it and we support it — an empty
         // local list means "not configured yet", which defaults to 1.3+1.2).
-        let sv = message.supported_versions || [];
-        let offers13 = sv.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || sv.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+        let offers13 = lists13(message.supported_versions);
         let lv = context.local_supported_versions || [];
-        let we13 = lv.length === 0 || lv.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || lv.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+        let we13 = lv.length === 0 || lists13(lv);
         if (offers13 && we13 && comp.length !== 1) {
           fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'TLS 1.3 ClientHello must offer exactly the null compression method');
           return;
@@ -3050,11 +3053,9 @@ function TLSSession(options){
       // the decision on the message itself, which is authoritative.
       let sh_is_13 = false;
       if (Array.isArray(message.supported_versions)) {
-        sh_is_13 = message.supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
-                   message.supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+        sh_is_13 = lists13(message.supported_versions);
       } else if (typeof message.supported_versions === 'number') {
-        sh_is_13 = message.supported_versions === wire.TLS_VERSION.TLS1_3 ||
-                   message.supported_versions === wire.DTLS_VERSION.DTLS1_3;
+        sh_is_13 = wire.is_tls13_wire(message.supported_versions);
       }
 
       // ── Second ServerHello must honour the HelloRetryRequest ──
@@ -3236,10 +3237,8 @@ function TLSSession(options){
       if (context.isServer === true && message.type === 'client_hello') {
         let hasShares = Array.isArray(message.key_groups);
         let hasGroups = Array.isArray(message.supported_groups);
-        let sv13 = message.supported_versions || [];
         let lv13 = context.local_supported_versions || [];
-        let both13 = (sv13.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || sv13.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0) &&
-                     (lv13.length === 0 || lv13.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 || lv13.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0);
+        let both13 = lists13(message.supported_versions) && (lv13.length === 0 || lists13(lv13));
         if (hasShares && !hasGroups) {
           fatalAlert(wire.TLS_ALERT.MISSING_EXTENSION, 'ClientHello has key_share without supported_groups');
           return;
@@ -3451,8 +3450,7 @@ function TLSSession(options){
       // active attacker forced the downgrade. HRR was already handled and
       // returned above, so `message` here is a genuine ServerHello.
       if (!context.isServer && message.type === 'server_hello' &&
-          (context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
-           context.local_supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0) &&
+          lists13(context.local_supported_versions) &&
           context.selected_version !== null &&
           context.selected_version !== wire.TLS_VERSION.TLS1_3 &&
           context.selected_version !== wire.DTLS_VERSION.DTLS1_3 &&
@@ -4336,7 +4334,7 @@ function TLSSession(options){
           has_changed=true;
           // A split-mode backend (backend_client_hello) accepted ECH for a
           // TLS 1.3 handshake; one on an older version has no ECH at all.
-          if (context.ech.backend && options.selected_version != null && options.selected_version !== wire.TLS_VERSION.TLS1_3) {
+          if (context.ech.backend && options.selected_version != null && !wire.is_tls13_wire(options.selected_version)) {
             context.ech.status = null;
             context.ech.backend = false;
           }
@@ -5348,8 +5346,7 @@ function TLSSession(options){
             // Only meaningful for a real ServerHello (not HRR, which reuses the
             // magic HRR random). DTLS the same way (RFC 9147 §5.3 keeps
             // §4.1.3): a DTLS 1.3 server that settles on DTLS 1.2 stamps it too.
-            if (context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
-                context.local_supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0) {
+            if (lists13(context.local_supported_versions)) {
               if (context.selected_version === wire.TLS_VERSION.TLS1_2 ||
                   context.selected_version === wire.DTLS_VERSION.DTLS1_2) {
                 context.local_random.set(DOWNGRADE_SENTINEL_TLS12, 24);
@@ -6984,9 +6981,7 @@ function TLSSession(options){
       // a 1.2 handshake — so the hello claimed capabilities the profile had
       // ruled out. The asymmetry was invisible because only the 1.3-only case
       // had ever been considered.
-      let offers13 = context.local_supported_versions.length === 0 ||
-                     context.local_supported_versions.indexOf(wire.TLS_VERSION.TLS1_3) >= 0 ||
-                     context.local_supported_versions.indexOf(wire.DTLS_VERSION.DTLS1_3) >= 0;
+      let offers13 = context.local_supported_versions.length === 0 || lists13(context.local_supported_versions);
       let offers12 = context.local_supported_versions.length === 0 ||
                      context.local_supported_versions.some(v => v !== wire.TLS_VERSION.TLS1_3 &&
                                                                 v !== wire.DTLS_VERSION.DTLS1_3);

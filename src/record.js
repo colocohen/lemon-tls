@@ -273,6 +273,52 @@ function decryptRecordWithAadView(aadView, ciphertext, key, nonce, algo) {
   return pt;
 }
 
+/**
+ * Anti-replay (RFC 6347 §4.1.2.6, RFC 9147 §4.5.1): has a record with this
+ * sequence number been accepted in this epoch before? `win` is the epoch's
+ * receive state — its read-key object — which this keeps: maxReadSeq and a
+ * 64-record window below it (replayLo = bits 0..31, replayHi = 32..63, bit k
+ * = maxReadSeq - k; no BigInt per record). True, and recorded, for a new one;
+ * false for a replay or one older than the window.
+ *
+ * Asked only AFTER the record authenticated: a forged record number must not
+ * move the window. DTLS 1.3 and DTLS 1.2 alike — 1.2 had no window at all,
+ * so a record received twice (replayed, or duplicated on the way) counted as
+ * the peer retransmitting its flight, and ours went out again (BoGo
+ * DTLS-Replay-TLS12: the cookie ClientHello resent).
+ */
+function acceptRecordSeq(win, seq) {
+  if (win.maxReadSeq === undefined || win.maxReadSeq < 0) {
+    // First accepted record in this epoch: seed the window with this seq as
+    // the high-water mark (bit 0 set), so an immediate replay of it is
+    // caught rather than sailing through an unset window.
+    win.maxReadSeq = seq;
+    win.replayLo = 1; win.replayHi = 0;
+    return true;
+  }
+  if (seq > win.maxReadSeq) {
+    // Advance: shift the window up by the gap, then set bit 0.
+    let shift = seq - win.maxReadSeq;
+    let lo = win.replayLo, hi = win.replayHi;
+    if (shift >= 64) { lo = 0; hi = 0; }
+    else if (shift >= 32) { hi = (lo << (shift - 32)) >>> 0; lo = 0; }
+    else { hi = ((hi << shift) | (lo >>> (32 - shift))) >>> 0; lo = (lo << shift) >>> 0; }
+    win.replayLo = (lo | 1) >>> 0; win.replayHi = hi;
+    win.maxReadSeq = seq;
+    return true;
+  }
+  let back = win.maxReadSeq - seq;
+  if (back >= 64) return false;                     // too old — outside window
+  if (back < 32) {
+    if ((win.replayLo >>> back) & 1) return false;  // already seen — replay
+    win.replayLo = (win.replayLo | (1 << back)) >>> 0;
+  } else {
+    if ((win.replayHi >>> (back - 32)) & 1) return false;
+    win.replayHi = (win.replayHi | (1 << (back - 32))) >>> 0;
+  }
+  return true;
+}
+
 /** Strip trailing zeros and extract content_type from TLSInnerPlaintext. */
 /**
  * Strip trailing zeros and extract content_type from TLSInnerPlaintext.
@@ -1227,42 +1273,9 @@ function decryptEncryptedDtls13(data, keys, fullEpoch) {
     // a subarray of it — a Buffer, all the way up to 'data', with no copy.
     let inner = parseInnerPlaintext(pt);
 
-    // RFC 9147 §4.5.1 anti-replay: only AFTER the tag verifies do we consult
-    // and update the sliding window. Checking before deprotection would let a
-    // forged record number poison the window; checking after means only
-    // genuine records move it. The window lives on the per-epoch key object,
-    // next to maxReadSeq, because both are per-epoch receive state.
-    //   replayWindow: bitmask of the 64 seqs at or below maxReadSeq that have
-    //   been accepted. Bit 0 = maxReadSeq, bit k = maxReadSeq - k.
-    //   The 64-bit window is kept as two 32-bit numbers (replayLo = bits
-    //   0..31, replayHi = 32..63): same window, no BigInt allocations per
-    //   record.
-    if (keys.maxReadSeq === undefined || keys.maxReadSeq < 0) {
-      // First accepted record in this epoch: seed the window with this seq as
-      // the high-water mark (bit 0 set), so an immediate replay of it is
-      // caught below rather than sailing through an unset window.
-      keys.maxReadSeq = seq;
-      keys.replayLo = 1; keys.replayHi = 0;
-    } else if (seq > keys.maxReadSeq) {
-      // Advance: shift the window up by the gap, then set bit 0.
-      let shift = seq - keys.maxReadSeq;
-      let lo = keys.replayLo, hi = keys.replayHi;
-      if (shift >= 64) { lo = 0; hi = 0; }
-      else if (shift >= 32) { hi = (lo << (shift - 32)) >>> 0; lo = 0; }
-      else { hi = ((hi << shift) | (lo >>> (32 - shift))) >>> 0; lo = (lo << shift) >>> 0; }
-      keys.replayLo = (lo | 1) >>> 0; keys.replayHi = hi;
-      keys.maxReadSeq = seq;
-    } else {
-      let back = keys.maxReadSeq - seq;
-      if (back >= 64) return null;                  // too old — outside window
-      if (back < 32) {
-        if ((keys.replayLo >>> back) & 1) return null;   // already seen — replay
-        keys.replayLo = (keys.replayLo | (1 << back)) >>> 0;
-      } else {
-        if ((keys.replayHi >>> (back - 32)) & 1) return null;
-        keys.replayHi = (keys.replayHi | (1 << (back - 32))) >>> 0;
-      }
-    }
+    // RFC 9147 §4.5.1 anti-replay: only AFTER the tag verifies (see
+    // acceptRecordSeq).
+    if (!acceptRecordSeq(keys, seq)) return null;
 
     return {
       // The caller resolves the full epoch (resolveReadEpoch); hdr.epoch is
@@ -1374,6 +1387,8 @@ function parseDtlsDatagram(data, keysByEpoch) {
         } catch(e) {
           // Decryption failed — return raw
         }
+        // Authenticated, and seen before: a replay — dropped, as in 1.3.
+        if (encrypted && !acceptRecordSeq(keys, seq)) { off += 13 + length; continue; }
       }
       if (payload === null) payload = data.slice(off + 13, off + 13 + length);
 
@@ -1502,6 +1517,7 @@ export {
 
   // DTLS 1.2 encrypted records
   buildDtlsAad12,
+  acceptRecordSeq,
   encryptDtls12,
   decryptDtls12,
   buildEncryptedDtls12,

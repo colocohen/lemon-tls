@@ -57,6 +57,7 @@ import {
   deriveKeys,
   deriveKeys12,
   decryptDtls12,
+  acceptRecordSeq,
   buildDtlsPlaintext,
   buildEncryptedDtls12,
   buildEncryptedDtls13,
@@ -197,7 +198,12 @@ function DTLSSession(options) {
   let isServer = !!options.isServer;
 
   // ---- Internal TLSSession ----
-  let tls = new TLSSession({
+  // Every option goes on to the TLS session as the caller gave it — the
+  // TLS options (customExtensions, ALPNCallback, ticketData, signature and
+  // group choices, ...) mean the same over DTLS — and DTLS sets only these.
+  // A hand-picked list here left out whatever it did not name, as
+  // createDTLSServer's did (r96, A6).
+  let tls = new TLSSession(Object.assign({}, options, {
     isServer: isServer,
     // RFC 9147 §5.3: the DTLS ClientHello's legacy_session_id "MUST be
     // set to a zero-length vector" — the 32-byte compatibility sid is a
@@ -209,16 +215,10 @@ function DTLSSession(options) {
     // byte and never the body, so any non-empty sid shears its whole
     // ClientHello parse.)
     sessionId: new Uint8Array(0),
-    srtpProfiles: options.srtpProfiles,
-    servername: options.servername,
-    SNICallback: options.SNICallback,
-    rejectUnauthorized: options.rejectUnauthorized,
-    checkServerIdentity: options.checkServerIdentity,
     // DTLS peers in WebRTC present self-signed certificates by design and are
     // authenticated by the SDP fingerprint, not by a CA chain. Falling back to
     // the platform trust store here would mark every such peer unauthorized.
     useDefaultCA: options.useDefaultCA === true,
-    ca: options.ca,
     // Resumption, as over TCP (TLSSocket): a 'session' Buffer from an
     // earlier connection — a DTLS 1.3 PSK ticket, or a DTLS 1.2 RFC 5077
     // ticket — and whether this side issues / asks for tickets (default
@@ -226,11 +226,9 @@ function DTLSSession(options) {
     session: options.session || null,
     sessionTickets: options.sessionTickets !== undefined ? options.sessionTickets !== false
                                                          : options.noTickets !== true,
-    requestCert: options.requestCert,
-    cert: options.cert,
-    key: options.key,
-    ticketKeys: options.ticketKeys,
-  });
+    // No 0-RTT over DTLS here: early data has no DTLS record path.
+    earlyData: false,
+  }));
 
   // ---- DTLS context ----
   let ctx = {
@@ -328,6 +326,9 @@ function DTLSSession(options) {
     pendingWriteEpoch: null,
     postHandshake: [],         // DTLS 1.3 post-handshake messages awaiting their ACK
     deferredKeyUpdate: null,   // DTLS 1.3: our KeyUpdate held back while one is unACKed (§8)
+    feeding: 0,                // inside feedDatagram: post-handshake messages wait for its end
+    seenPlainSeqs: [],         // the last epoch-0 record numbers received (duplicates dropped)
+    heldPostHandshake: [],     // ...these (sendPostHandshake)
     lastAckResend: 0,          // when an ACK that confirmed nothing new last caused a resend
     finalFlightPending: false, // DTLS 1.3 client: final flight not yet confirmed (see secureConnect)
 
@@ -662,6 +663,36 @@ function DTLSSession(options) {
     }
   });
 
+  // ── Datagrams ──
+  // Records go out packed: those made in one pass (a flight, an ACK and the
+  // tickets after it, a burst of send()s) share datagrams up to the MTU — one
+  // datagram per record left a 44-byte tail of a ServerHello alone where the
+  // EncryptedExtensions fitted beside it (BoGo MTU-DTLS13 / -DTLS12-AEAD:
+  // "previous packet had 212 bytes available"); fewer datagrams, fewer to
+  // lose. Both versions frame every record with its length (the DTLS 1.3
+  // unified header's L bit is always set here), so they can follow one
+  // another (RFC 9147 §4.3, RFC 6347 §4.1.1). The pass ends at the next
+  // microtask — or at once when the session ends, so its last alert is out
+  // before 'close'.
+  let outRecords = [], outBytes = 0, outScheduled = false;
+  function emitRecord(record) {
+    if (outBytes > 0 && outBytes + record.length > ctx.mtu) flushOut();
+    outRecords.push(record);
+    outBytes += record.length;
+    if (!outScheduled) { outScheduled = true; queueMicrotask(function () { outScheduled = false; flushOut(); }); }
+  }
+  function flushOut() {
+    if (outRecords.length === 0) return;
+    let dg;
+    if (outRecords.length === 1) dg = outRecords[0];
+    else {
+      dg = new Uint8Array(outBytes);
+      for (let i = 0, o = 0; i < outRecords.length; o += outRecords[i].length, i++) dg.set(outRecords[i], o);
+    }
+    outRecords = []; outBytes = 0;
+    ev.emit('packet', dg);
+  }
+
   // Our next write epoch's keys, from a KeyUpdate we sent: installed now, used
   // from its ACK on (§8). ctx.keys[next] may already carry a .read half from
   // the peer's own update — merge, never overwrite.
@@ -679,12 +710,30 @@ function DTLSSession(options) {
   // NewSessionTicket was simply lost (BoGo DTLS-Retransmit-*NewSessionTicket*).
   // KeyUpdate's ACK also switches our write epoch (§8) — on the ACK that
   // covers it, not on any ACK, as before.
+  // One made while a datagram is being taken in (feedDatagram) waits for its
+  // end — for the ACK that datagram may call for (§7.1). The server's
+  // NewSessionTickets come of the client's Finished: they went out ahead of
+  // its ACK, and a peer that waits for the ACK first (BoringSSL's runner)
+  // read the first ticket as renegotiation and the second as out of order
+  // (BoGo N1). A KeyUpdate answering the peer's follows its ACK the same way.
   function sendPostHandshake(kind, frags, epoch) {
     let item = { kind: kind, entries: [], attempts: 0, timeout: ctx.initialRetransmitTimeout, timer: null };
     for (let i = 0; i < frags.length; i++) item.entries.push({ epoch: epoch, contentType: CT.HANDSHAKE, payload: frags[i] });
-    transmitUnacked(item.entries, kind, false);
     ctx.postHandshake.push(item);
+    if (ctx.feeding > 0) { ctx.heldPostHandshake.push(item); return; }
+    transmitPostHandshake(item);
+  }
+  function transmitPostHandshake(item) {
+    transmitUnacked(item.entries, item.kind, false);
     schedulePostHandshake(item);
+  }
+  function flushHeldPostHandshake() {
+    let held = ctx.heldPostHandshake;
+    ctx.heldPostHandshake = [];
+    for (let i = 0; i < held.length; i++) {
+      if (ctx.state === 'closed' || ctx.postHandshake.indexOf(held[i]) < 0) continue;
+      transmitPostHandshake(held[i]);
+    }
   }
 
   function schedulePostHandshake(item) {
@@ -716,6 +765,7 @@ function DTLSSession(options) {
 
   // The session is over: every timer it runs stops with it.
   function shutDown() {
+    flushOut();
     ctx.state = 'closed';
     cancelRetransmit();
     cancelPostHandshake();
@@ -727,6 +777,7 @@ function DTLSSession(options) {
       if (ctx.postHandshake[i].timer) clearTimeout(ctx.postHandshake[i].timer);
     }
     ctx.postHandshake = [];
+    ctx.heldPostHandshake = [];
     ctx.deferredKeyUpdate = null;
   }
 
@@ -804,18 +855,8 @@ function DTLSSession(options) {
       return;
     }
 
-    // DTLS 1.2: derive keys before first encrypted message
-    if (ctx.selectedVersion !== DTLS_VERSION.DTLS1_3 && tlsEpoch === 1 && !ctx.keys[1]) {
-      let ts = tls.getTrafficSecrets();
-      if (ts.masterSecret) {
-        let d12 = deriveKeys12(ts.masterSecret, ts.localRandom, ts.remoteRandom, tls.getCipher(), isServer);
-        ctx.keys[1] = {
-          write: { key: d12.writeKey, iv: d12.writeIv },
-          read:  { key: d12.readKey,  iv: d12.readIv },
-        };
-        ctx.writeSeq[1] = 0;
-      }
-    }
+    // DTLS 1.2: keys before the first encrypted message
+    if (ctx.selectedVersion !== DTLS_VERSION.DTLS1_3 && tlsEpoch === 1) installKeys12();
 
     // Flight boundary: first outgoing record after accepting peer data
     // starts a fresh flight (clears the previous flight's records and
@@ -938,7 +979,7 @@ function DTLSSession(options) {
       let record = buildFlightRecord(entry);
       ctx.currentFlight.push(entry);
       if (record) {
-        _ldbgTx(record, 'flight'); ev.emit('packet', record);
+        _ldbgTx(record, 'flight'); emitRecord(record);
       } else {
         // buildRecord refused to build (no keys for an encrypted epoch).
         // Dropping the record here without a word is how a key-epoch mismatch
@@ -1010,6 +1051,21 @@ function DTLSSession(options) {
    * (a DTLSPlaintext record). DTLS 1.2: epoch 1 once our ChangeCipherSpec
    * has gone, else 0.
    */
+  // DTLS 1.2: epoch 1's keys, once there is a master secret to make them of
+  // (one place: they were derived in two). True when they are there.
+  function installKeys12() {
+    if (ctx.keys[1]) return true;
+    let ts = tls.getTrafficSecrets();
+    if (!ts.masterSecret) return false;
+    let d12 = deriveKeys12(ts.masterSecret, ts.localRandom, ts.remoteRandom, tls.getCipher(), isServer);
+    ctx.keys[1] = {
+      write: { key: d12.writeKey, iv: d12.writeIv },
+      read:  { key: d12.readKey,  iv: d12.readIv },
+    };
+    ctx.writeSeq[1] = 0;
+    return true;
+  }
+
   // DTLS 1.3: the application epoch we write — 3 until a KeyUpdate moves it on.
   function appEpoch() { return ctx.writeEpoch !== null ? ctx.writeEpoch : 3; }
 
@@ -1032,7 +1088,7 @@ function DTLSSession(options) {
     // packet pushes `null` into the transport; drop it instead — we already
     // surfaced the reason through 'error'.
     if (!record) return;
-    _ldbgTx(record, 'L664'); ev.emit('packet', record);
+    _ldbgTx(record, 'L664'); emitRecord(record);
   }
 
   /**
@@ -1056,7 +1112,7 @@ function DTLSSession(options) {
     // the peer could never decrypt the accompanying Finished — an
     // unrecoverable stall under single-datagram loss.
     ctx.currentFlight.push({ epoch: 0, contentType: CT.CHANGE_CIPHER_SPEC, payload: new Uint8Array([1]) });
-    _ldbgTx(record, 'L688'); ev.emit('packet', record);
+    _ldbgTx(record, 'L688'); emitRecord(record);
   }
 
 
@@ -1102,6 +1158,12 @@ function DTLSSession(options) {
   }
 
   function feedDatagramUnguarded(data) {
+    ctx.feeding++;
+    try { takeDatagram(data); }
+    finally { if (--ctx.feeding === 0) flushHeldPostHandshake(); }
+  }
+
+  function takeDatagram(data) {
     if (ctx.state === 'closed') return;
     if (ctx.state === 'idle') ctx.state = 'handshaking';
 
@@ -1146,6 +1208,20 @@ function DTLSSession(options) {
     ctx.dgDuplicate = false;
 
     for (let i = 0; i < records.length; i++) {
+      // An unprotected record received before — same epoch-0 sequence number
+      // — is the same record again (replayed, or duplicated on the way), not
+      // the peer retransmitting: a retransmission is a new record, with a new
+      // number. Taken as one, it had us resend our flight (BoGo
+      // DTLS-Replay-TLS12). Not a sliding window, as for protected records
+      // (acceptRecordSeq): an unauthenticated number must not move one — a
+      // forged high one would make every real record "too old". Just the
+      // last numbers seen.
+      if (records[i].epoch === 0 && !records[i].encrypted) {
+        if (ctx.seenPlainSeqs.indexOf(records[i].seq) >= 0) continue;
+        ctx.seenPlainSeqs.push(records[i].seq);
+        if (ctx.seenPlainSeqs.length > 64) ctx.seenPlainSeqs.shift();
+      }
+      if (records[i].replayed) continue;
       // A record we could not decrypt when the datagram was parsed. Keys may
       // have arrived since — processing an earlier record in THIS datagram
       // (the ServerHello) is exactly what installs them. Retry now, in order,
@@ -1182,16 +1258,22 @@ function DTLSSession(options) {
         ackable.push({ epoch: records[i].epoch, seq: records[i].seq });
       }
 
+      let hadKeys12 = !!ctx.keys[1];
       processRecord(records[i]);
+      if (ctx.state === 'closed') break;
+      if (ctx.selectedVersion === DTLS_VERSION.DTLS1_2 && !ctx.keys[1]) installKeys12();
 
-      // After CCS, keys are newly available — re-decrypt remaining epoch>0 records
-      if (records[i].type === CT.CHANGE_CIPHER_SPEC && ctx.keys[1]) {
+      // DTLS 1.2 keys just installed: what of this datagram came protected
+      // under them can be read now.
+      if (!hadKeys12 && ctx.keys[1]) {
         let readKeys = ctx.keys[1].read;
         for (let j = i + 1; j < records.length; j++) {
           if (!records[j].encrypted && records[j].epoch > 0 && readKeys) {
             try {
               records[j].content = decryptDtls12(records[j].content, readKeys.key, readKeys.iv, records[j].epoch, records[j].seq, records[j].type);
               records[j].encrypted = true;
+              // Through the replay window, as the datagram parser does.
+              if (!acceptRecordSeq(readKeys, records[j].seq)) records[j].replayed = true;
             } catch(e) {
             }
           }
@@ -1327,21 +1409,14 @@ function DTLSSession(options) {
       // unprotected record that does not read as one: dropped (§4.1.2.7).
       if (ctx.selectedVersion === DTLS_VERSION.DTLS1_3) return;
       if (!record.content || record.content.length !== 1 || record.content[0] !== 1) return;
-      // DTLS 1.2: the peer's key change. Only with keys to change to: a CCS
-      // ahead of the key exchange is dropped — over UDP a reordered one
-      // (RFC 6347 §4.1: records may arrive out of order), and the peer
-      // resends its flight; an alert would end a good handshake on one
-      // reordered datagram (DTLS-Fuzzer D5).
-      let ts = tls.getTrafficSecrets();
-      if (!ts.masterSecret) return;
-      if (!ctx.keys[1]) {
-        let d12 = deriveKeys12(ts.masterSecret, ts.localRandom, ts.remoteRandom, tls.getCipher(), isServer);
-        ctx.keys[1] = {
-          write: { key: d12.writeKey, iv: d12.writeIv },
-          read:  { key: d12.readKey,  iv: d12.readIv },
-        };
-        ctx.writeSeq[1] = 0;
-      }
+      // DTLS 1.2: the peer's key change. The keys come of the master
+      // secret, and are installed when it exists (installKeys12, after each
+      // record) — a CCS ahead of the key exchange (reordered: RFC 6347 §4.1),
+      // or one lost, changes nothing: no alert that would end a good
+      // handshake on one reordered datagram, and no flight resent for it
+      // either (DTLS-Fuzzer D5). A Finished must still come protected
+      // (epochFitsHandshake): the key change is proved by it, not by this.
+      installKeys12();
     } else if (record.type === CT.ACK) {
       // DTLS 1.3 only (RFC 9147 §7). One that does not parse: protected, the
       // peer's (decode_error, thrown to the boundary); unprotected, dropped.
@@ -1497,7 +1572,7 @@ function DTLSSession(options) {
       ctx._lastDupElicitedResend = Date.now();
       for (let i = 0; i < ctx.lastFlight12.length; i++) {
         let record = buildFlightRecord(ctx.lastFlight12[i]);
-        if (record) { _ldbgTx(record, 'lastFlight12'); ev.emit('packet', record); }
+        if (record) { _ldbgTx(record, 'lastFlight12'); emitRecord(record); }
       }
     }
   }
@@ -1892,7 +1967,7 @@ function DTLSSession(options) {
     // HVR always uses msg_seq 0 and is sent in the clear (epoch 0).
     let hvrMsg = build_dtls_handshake(build_message(3, build_hello_verify_request({ cookie: cookie })), 0);
     let record = buildDtlsPlaintext(CT.HANDSHAKE, 0, nextWriteSeq(0), hvrMsg);
-    _ldbgTx(record, 'L1194'); ev.emit('packet', record);
+    _ldbgTx(record, 'L1194'); emitRecord(record);
   }
 
   /**
@@ -2002,7 +2077,7 @@ function DTLSSession(options) {
       let f = entries[i];
       if (f.acked || (skipPlaintext && f.epoch === 0)) continue;
       let record = buildFlightRecord(f);
-      if (record) { _ldbgTx(record, label); ev.emit('packet', record); }
+      if (record) { _ldbgTx(record, label); emitRecord(record); }
     }
   }
 
@@ -2190,7 +2265,7 @@ function DTLSSession(options) {
     if (ctx.state === 'closed') return;
     let payload = buildDtlsAck(recordsToAck);
     let record = buildRecord(epoch, CT.ACK, payload);
-    _ldbgTx(record, 'L1334'); ev.emit('packet', record);
+    _ldbgTx(record, 'L1334'); emitRecord(record);
   }
 
 
@@ -2267,7 +2342,7 @@ function DTLSSession(options) {
       ? appEpoch()
       : 1;
     let record = buildRecord(epoch, CT.APPLICATION_DATA, data);
-    _ldbgTx(record, 'L1383'); ev.emit('packet', record);
+    _ldbgTx(record, 'L1383'); emitRecord(record);
   }
 
 

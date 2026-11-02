@@ -284,11 +284,18 @@ function within(n, c) {
 // certificates. Bounded as OpenSSL bounds it — NAME_CHECK_MAX (2^20)
 // comparisons of one certificate's names against one CA's constraints, the
 // names counted as OpenSSL counts them (each subject attribute, each
-// subjectAltName) — and over the whole path too: four CAs of 1,024 subtrees
-// each, a leaf of 1,023 names under every one, kept each pair under the
-// bound and cost a second. Past either: X509_V_ERR_UNSPECIFIED, node:tls's
-// 'UNSPECIFIED' (x509-limbo nc-dos).
+// subjectAltName) — and over the whole path by NAME_CHECK_PATH_MAX:
+// five times one pair's. OpenSSL bounds each pair alone, so CAs stacked
+// under one another multiply the cost: four of 1,024 subtrees, a leaf of
+// 1,023 names under each, kept every pair under 2^20 and cost them all.
+// Five pairs' worth takes that path still — four maximal pairs and the CAs'
+// own names under one another (2^22 refused it by a few thousand
+// comparisons, where OpenSSL takes it) — and is the most the
+// constraints of any path can cost now (~100 ms); a path past it is refused
+// (x509-limbo nc-dos). Past either bound: X509_V_ERR_UNSPECIFIED,
+// node:tls's 'UNSPECIFIED'.
 const NAME_CHECK_MAX = 1 << 20;
+const NAME_CHECK_PATH_MAX = 5 * NAME_CHECK_MAX;
 
 // A CA's nameConstraints, prepared once for the names checked against them:
 // by name type, DNS bases lowercased and without a trailing dot (each
@@ -375,7 +382,7 @@ function check_path(path, purpose) {
   } catch (e) { return e.code || 'CERTIFICATE_PARSE_ERROR'; }
   let want = purpose === 'client' ? OID.CLIENT_AUTH : OID.SERVER_AUTH;
   let last = path.length - 1;
-  let budget = { left: NAME_CHECK_MAX };   // the path's name-constraint comparisons
+  let budget = { left: NAME_CHECK_PATH_MAX };   // the path's name-constraint comparisons
 
   for (let i = 0; i <= last; i++) {
     let p = parsed[i];

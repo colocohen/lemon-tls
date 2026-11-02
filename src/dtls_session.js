@@ -2475,6 +2475,13 @@ function DTLSSession(options) {
           ctx.lastAckResend = now;
           ctx.flightResent = true;
           transmitUnacked(ctx.currentFlight, 'partial-ack', protectedAcked > 0);
+          // The records just resent start their wait again: the timer, left
+          // as it was, fired soon after and sent the same records a second
+          // time — wasted on a real path, and packed with the first copy
+          // where both go out in one pass (BoGo DTLS-Retransmit-Server-
+          // ACKMatchingEpoch-TLS13: "excess data"). Its value is kept: this
+          // was no timeout.
+          startRetransmitTimer();
         }
         return;
       }

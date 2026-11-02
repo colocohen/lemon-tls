@@ -18,11 +18,25 @@ function reject_all_zero(secret, name) {
   return secret;
 }
 
+// The native key behind a private key this module generated, by the bytes
+// it handed out. Importing a raw private key is not cheap — for X25519
+// node:crypto computes the public key on import, ~50 µs, as much as the
+// Diffie-Hellman itself — and every handshake imported its own key twice:
+// once to derive the public key, once for the shared secret. The key made by
+// generate() is kept here and used by shared(); a private key from anywhere
+// else (HPKE's, a test vector's) is imported as before. Keyed by the
+// Uint8Array's identity, so the entry goes with the key: nothing outlives it.
+const NATIVE_PRIVATE = new WeakMap();
+
+const b64u = (s) => new Uint8Array(Buffer.from(s, 'base64url'));
+
 // A Montgomery curve, through node:crypto's raw-key DER wrapping: the PKCS#8
 // and SPKI prefixes before the raw private and public keys.
 function montgomery(name, len, pkcs8Hex, spkiHex) {
   let pkcs8 = Buffer.from(pkcs8Hex, 'hex'), spki = Buffer.from(spkiHex, 'hex');
-  let priv = (sk) => crypto.createPrivateKey({ key: Buffer.concat([pkcs8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
+  let type = name.toLowerCase();
+  let priv = (sk) => NATIVE_PRIVATE.get(sk) ||
+    crypto.createPrivateKey({ key: Buffer.concat([pkcs8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
   let c = {
     kind: 'montgomery', len: len, privLen: len,
     public_key: function (sk) {
@@ -32,9 +46,15 @@ function montgomery(name, len, pkcs8Hex, spkiHex) {
       let pub = crypto.createPublicKey({ key: Buffer.concat([spki, Buffer.from(pk)]), format: 'der', type: 'spki' });
       return reject_all_zero(new Uint8Array(crypto.diffieHellman({ privateKey: priv(sk), publicKey: pub })), name);
     },
+    // Made natively (the same CSPRNG as randomBytes), and read back as JWK —
+    // the raw scalar and public key, without a DER round trip.
     generate: function () {
-      let sk = new Uint8Array(crypto.randomBytes(len));
-      return { private_key: sk, public_key: c.public_key(sk) };
+      let kp = crypto.generateKeyPairSync(type);
+      let jwk = kp.privateKey.export({ format: 'jwk' });
+      let sk = b64u(jwk.d), pk = b64u(jwk.x);
+      if (sk.length !== len || pk.length !== len) throw new Error(name + ': unexpected key size from node:crypto');
+      NATIVE_PRIVATE.set(sk, kp.privateKey);
+      return { private_key: sk, public_key: pk };
     },
   };
   return c;
@@ -42,21 +62,30 @@ function montgomery(name, len, pkcs8Hex, spkiHex) {
 // A NIST prime curve: shares are uncompressed points (0x04 || X || Y,
 // RFC 8446 §4.2.8.2), the shared secret the x-coordinate.
 function nist(curve, coordLen) {
+  let ecdh = (sk) => {
+    let e = NATIVE_PRIVATE.get(sk);
+    if (e) return e;
+    e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
+    return e;
+  };
   return {
     kind: 'nist', len: 1 + 2 * coordLen, coordLen: coordLen, privLen: coordLen,
     public_key: function (sk) {
-      let e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
-      return new Uint8Array(e.getPublicKey(null, 'uncompressed'));
+      return new Uint8Array(ecdh(sk).getPublicKey(null, 'uncompressed'));
     },
     // computeSecret validates the peer point (on the curve, not infinity)
     // before any secret exists.
     shared: function (sk, pk) {
-      let e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
-      return new Uint8Array(e.computeSecret(Buffer.from(pk)));
+      return new Uint8Array(ecdh(sk).computeSecret(Buffer.from(pk)));
     },
     generate: function () {
       let e = crypto.createECDH(curve); e.generateKeys();
-      return { private_key: new Uint8Array(e.getPrivateKey()), public_key: new Uint8Array(e.getPublicKey(null, 'uncompressed')) };
+      // getPrivateKey drops leading zero bytes — half of all P-521 scalars,
+      // 1 in 256 of P-256's — and a private key is privLen bytes.
+      let raw = e.getPrivateKey(), sk = new Uint8Array(coordLen);
+      sk.set(raw, coordLen - raw.length);
+      NATIVE_PRIVATE.set(sk, e);
+      return { private_key: sk, public_key: new Uint8Array(e.getPublicKey(null, 'uncompressed')) };
     },
   };
 }

@@ -1453,73 +1453,49 @@ function parse_compressed_certificate(body) {
   return { algorithm: algorithm, uncompressed_length: uncompressed_length, compressed: body.subarray(8) };
 }
 
-function parse_certificate(body) {
-  // always returns:
-  // {
-  //   version: TLS_VERSION.TLS1_2 | TLS_VERSION.TLS1_3,
-  //   request_context?: Uint8Array,         // רק ב-1.3
-  //   entries: [ { cert: Uint8Array, extensions?: any[] } ]  // ב-1.2 אין extensions
-  // }
-
-  // Try to detect TLS 1.3: rc(vec<1>) ואז list(vec<3> של [cert(vec<3>) || exts(vec<2>)]*)
-  if (body && body.length >= 4) {
-    let off = 0;
-    let rcLen; [rcLen, off] = r_u8(body, off);              // 1 byte
-    const afterCtx = off + rcLen;                           // off מצביע אחרי rcLen (כלומר 1)
-    if (afterCtx + 3 <= body.length) {
-      let listLen, off2 = afterCtx;                         // התחלת certificate_list
-      [listLen, off2] = r_u24(body, off2);                  // 3 bytes
-      if (afterCtx + 3 + listLen === body.length) {
-        // looks like valid TLS 1.3
-        const request_context = body.subarray(off, off + rcLen);
-        off = off2;
-        const end = off2 + listLen;
-
-        const entries = [];
-        while (off < end) {
-          let certLen; [certLen, off] = r_u24(body, off);   // cert_data vec<3>
-          let cert;    [cert,    off] = r_bytes(body, off, certLen);
-
-          let extLen;  [extLen,  off] = r_u16(body, off);   // extensions vec<2>
-          let extRaw;  [extRaw,  off] = r_bytes(body, off, extLen);
-
-          // extRaw is the list body (prefix already consumed above), so use
-          // the list parser — parse_extensions() would misread the first two
-          // bytes of the first extension as a vector length.
-          const extensions = parse_extension_list(extRaw);
-          entries.push({ cert, extensions });
-        }
-
-        return {
-          version: TLS_VERSION.TLS1_3,
-          request_context,
-          entries
-        };
-      }
-    }
+/**
+ * A Certificate message's body, as the version negotiated has it:
+ *   TLS 1.3 (RFC 8446 §4.4.2): certificate_request_context<0..2^8-1>, then
+ *     certificate_list<0..2^24-1> of { cert_data<1..2^24-1>,
+ *     extensions<0..2^16-1> };
+ *   TLS 1.2 (RFC 5246 §7.4.2): certificate_list<0..2^24-1> of
+ *     ASN.1Cert<1..2^24-1>.
+ * Every length exact — the list ends the message, each entry inside the
+ * list — or decode_error.
+ *
+ * The version was guessed from the bytes: a body that read as 1.3 was
+ * taken as 1.3, and anything else as 1.2 with its list length unchecked
+ * ("graceful recovery") — a TLS 1.2 Certificate whose length was wrong was
+ * taken (tlsfuzzer). The session always knows which it negotiated.
+ *
+ * Returns { version, request_context? (1.3), entries: [{ cert,
+ * extensions? (1.3) }] }.
+ */
+function parse_certificate(body, tls13) {
+  let off = 0, request_context;
+  if (tls13) {
+    let rcLen; [rcLen, off] = r_u8(body, off);
+    [request_context, off] = r_bytes(body, off, rcLen);
   }
-
-  // otherwise: TLS 1.2 — certificate_list(vec<3>) של cert(vec<3>)* ללא הרחבות
-  let off3 = 0;
-  let listLen2; [listLen2, off3] = r_u24(body, off3);
-
-  const end2 = off3 + listLen2;
-  if (end2 !== body.length) {
-    // graceful recovery: אם האורך לא תואם, ננסה לפחות לא לקרוס (אפשר גם לזרוק שגיאה)
-    // throw new Error('Bad TLS1.2 Certificate length');
+  let listLen; [listLen, off] = r_u24(body, off);
+  if (off + listLen !== body.length) {
+    throw parseError('Certificate: certificate_list of ' + listLen + ' bytes in ' + (body.length - off));
   }
-
-  const entries12 = [];
-  while (off3 < Math.min(end2, body.length)) {
-    let len3; [len3, off3] = r_u24(body, off3);
-    let cert; [cert, off3] = r_bytes(body, off3, len3);
-    entries12.push({ cert }); // no per-entry extensions in 1.2
+  const entries = [];
+  while (off < body.length) {
+    let certLen; [certLen, off] = r_u24(body, off);
+    if (certLen === 0) throw parseError('Certificate: an empty certificate in the list');
+    let cert; [cert, off] = r_bytes(body, off, certLen);
+    if (!tls13) { entries.push({ cert }); continue; }
+    let extLen; [extLen, off] = r_u16(body, off);
+    let extRaw; [extRaw, off] = r_bytes(body, off, extLen);
+    // extRaw is the list body (prefix already consumed above), so use
+    // the list parser — parse_extensions() would misread the first two
+    // bytes of the first extension as a vector length.
+    entries.push({ cert, extensions: parse_extension_list(extRaw) });
   }
-
-  return {
-    version: TLS_VERSION.TLS1_2,
-    entries: entries12
-  };
+  return tls13 ? { version: TLS_VERSION.TLS1_3, request_context, entries }
+               : { version: TLS_VERSION.TLS1_2, entries };
 }
 
 
@@ -1556,7 +1532,9 @@ function parse_certificate_verify(body) {
 
   // The signature vector ends the message; anything after it is framing junk.
   if (off !== body.length) throw parseError('trailing data after CertificateVerify signature');
-  if (slen === 0) throw parseError('empty CertificateVerify signature');
+  // An empty signature is well formed (signature<0..2^16-1>, RFC 8446
+  // §4.4.3; RFC 5246 §4.7) and does not verify: decrypt_error, from the
+  // check — not decode_error here (tlsfuzzer).
 
   return { scheme: alg, signature: sig };
 }
@@ -2129,6 +2107,11 @@ function parse_hello_verify_request(body) {
 // (BoGo TooManyWarningAlerts).
 const MAX_WARNING_ALERTS = 4;
 
+// The most plaintext a record carries (RFC 8446 §5.1, RFC 5246 §6.2.1):
+// 2^14 — TLS and DTLS, both directions. One constant for every layer that
+// cuts or checks records (TLSSession, TLSSocket, DTLSSession).
+const MAX_RECORD_PLAINTEXT = 16384;
+
 /**
  * What an alert record from the peer says — one reading for TLS over TCP and
  * DTLS, which each had their own and disagreed (an empty alert, a level that
@@ -2194,6 +2177,7 @@ export {
   peer_alert_error,
   read_peer_alert,
   MAX_WARNING_ALERTS,
+  MAX_RECORD_PLAINTEXT,
   HANDSHAKE_MESSAGE_MAX,
   TLS_VERSION,
   DTLS_VERSION,

@@ -793,6 +793,17 @@ function parseDtlsPlaintext(data) {
 // the inner plaintext. `cid` below: that CID — null or empty, no CID.
 
 const TLS12_CID = 25;
+// The longest a record's body may be on the wire: TLSCiphertext's
+// 2^14 + 256 in (D)TLS 1.3 (RFC 8446 §5.2), 2^14 + 2048 in 1.2 (RFC 5246
+// §6.2.3) — and 1.2's for an unprotected record too, the most anything
+// before the version is known can be. A DTLS record past it is dropped
+// before anything is done with it: it is not the peer's, or the peer is
+// broken, and which cannot be told before it is authenticated — RFC 9147
+// §4.5.2, RFC 6347 §4.1.2.7: invalid records are discarded. It was
+// decrypted, and its plaintext handed on whatever its size (BoGo
+// LargeCiphertext-DTLS).
+const DTLS13_MAX_CIPHERTEXT = 16384 + 256;
+const DTLS12_MAX_RECORD = 16384 + 2048;
 const SEQ_NUM_PLACEHOLDER = new Uint8Array(8).fill(0xff);
 
 function hasCid(cid) { return !!cid && cid.length > 0; }
@@ -1209,6 +1220,7 @@ function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
   }
 
   if (off + ctLen > data.length) return null;
+  if (ctLen > DTLS13_MAX_CIPHERTEXT) return null;
   // A view: only read here (record-number mask, AEAD input); the plaintext
   // comes out of the decipher as a fresh buffer.
   let ciphertext = data.subarray(off, off + ctLen);
@@ -1403,6 +1415,7 @@ function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
       let fragment = data.subarray(off + hdrLen, off + hdrLen + length);
       let at = off;
       off += hdrLen + length;
+      if (length > DTLS12_MAX_RECORD) continue;
 
       // Ours, by its CID — or not. And with a CID asked for, every protected
       // record carries it (§3: "MUST send with the record format"); one

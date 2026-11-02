@@ -40,6 +40,24 @@ const kTransport = Symbol('transport');
 const kAddressMoved = Symbol('addressMoved');
 
 
+// The UDP sockets this module binds itself (createDTLSServer, connectDTLS):
+// 4 MB receive and send buffers, or socketBufferSize (bytes; 0 or false, the
+// OS default). The default (208 KB on Linux) holds some 180 datagrams, and a
+// burst bigger than one event-loop turn drains is dropped in the kernel,
+// silently: a retransmission, and a cut in the peer's sending rate.
+// The kernel caps the size at net.core.rmem_max / wmem_max. A socket handed
+// in (new DTLSSocket(udp, ...)) is the caller's, and keeps its own.
+const DEFAULT_SOCKET_BUFFER_SIZE = 4 << 20;
+function checkedSocketBufferSize(v) {
+  if (v === undefined || v === null) return DEFAULT_SOCKET_BUFFER_SIZE;
+  if (v === 0 || v === false) return 0;
+  if (!Number.isInteger(v) || v < 0 || v > 0x7fffffff) throw new RangeError('socketBufferSize must be a positive integer (bytes), 0 or false, got ' + v);
+  return v;
+}
+function createUdpSocket(base, size) {
+  return dgram.createSocket(size > 0 ? Object.assign({}, base, { recvBufferSize: size, sendBufferSize: size }) : base);
+}
+
 // What a DTLSSocket — or the server, for each of its connections — sets
 // itself. Every other option goes on to the DTLSSession as the caller gave
 // it: these were hand-copied lists, and what one left out did not exist —
@@ -85,7 +103,7 @@ function DTLSSocket(udpSocket, options) {
       if (ownsTransport && (fam === 6) !== (udpSocket.type === 'udp6')) {
         detachTransport(udpSocket);
         try { udpSocket.close(); } catch (e) {}
-        udpSocket = dgram.createSocket(fam === 6 ? 'udp6' : 'udp4');
+        udpSocket = createUdpSocket({ type: fam === 6 ? 'udp6' : 'udp4' }, checkedSocketBufferSize(options.socketBufferSize));
         attachTransport(udpSocket);
       }
       remoteAddress = address;
@@ -317,6 +335,7 @@ function createDTLSServer(options, connectionListener) {
     throw new TypeError('createDTLSServer: connectionId is true or false (each connection is given its own)');
   }
   let cidOn = options.connectionId === true;
+  let socketBufferSize = checkedSocketBufferSize(options.socketBufferSize);
   let byCid = {};       // CID (hex) → DTLSSocket
 
   let ev = new EventEmitter();
@@ -435,7 +454,7 @@ function createDTLSServer(options, connectionListener) {
   function listen(port, address, callback) {
     if (typeof address === 'function') { callback = address; address = undefined; }
     let open = function(type, bindAddress, fallback) {
-      let u = dgram.createSocket({ type: type, ipv6Only: false });
+      let u = createUdpSocket({ type: type, ipv6Only: false }, socketBufferSize);
       let onBindError = function(err) {
         u.removeListener('error', onBindError);
         try { u.close(); } catch (e) {}
@@ -499,7 +518,7 @@ function connectDTLS(options, callback) {
 
   // An IPv6 literal needs an IPv6 socket; for a name, the DTLSSocket picks
   // the family it resolves to (kOwnsTransport).
-  let udp = dgram.createSocket(net.isIP(host) === 6 ? 'udp6' : 'udp4');
+  let udp = createUdpSocket({ type: net.isIP(host) === 6 ? 'udp6' : 'udp4' }, checkedSocketBufferSize(options.socketBufferSize));
 
   // Every option goes on to the session (sessionOptions), as given: the
   // client's certificate, ca, cipherSuites, ... — this list too had dropped

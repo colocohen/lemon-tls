@@ -181,6 +181,58 @@ function _selfSigned(x509) {
   try { return !!x509.checkIssued(x509) && x509.verify(x509.publicKey); } catch (e) { return false; }
 }
 
+// The trust anchors of one `ca` (or the platform bundle), parsed and indexed
+// by subject name. Each handshake used to try every anchor against the peer's
+// chain — ~150 checkIssued calls against the platform bundle — where only the
+// ones named as the issuer can be it.
+//
+// Cached by the anchors array's identity, and checked entry by entry on every
+// use (a pointer compare each): an application that changes the array in
+// place — removes a CA — must not keep trusting it from a stale index. A
+// single anchor (not an array) is indexed afresh each time: there is little
+// to index.
+const _storeByAnchors = new WeakMap();
+function _nameKey(name) { return String(name).toLowerCase().replace(/\s+/g, ' ').trim(); }
+const NO_ANCHORS = [];
+function _trustStore(anchors) {
+  let entries = anchors == null ? [] : Array.isArray(anchors) ? anchors : [anchors];
+  let cacheable = Array.isArray(anchors);
+  if (cacheable) {
+    let hit = _storeByAnchors.get(anchors);
+    if (hit && hit.entries.length === entries.length && hit.entries.every((e, i) => e === entries[i])) return hit;
+  }
+  let list = [], bySubject = new Map();
+  for (let i = 0; i < entries.length; i++) {
+    let xs = _anchorX509s(entries[i]);
+    for (let k = 0; k < xs.length; k++) {
+      let key = _nameKey(xs[k].subject), b = bySubject.get(key);
+      if (b) b.push(xs[k]); else bySubject.set(key, [xs[k]]);
+      list.push(xs[k]);
+    }
+  }
+  let store = {
+    entries: entries.slice(), list: list,
+    named: (name) => bySubject.get(_nameKey(name)) || NO_ANCHORS,
+  };
+  if (cacheable) _storeByAnchors.set(anchors, store);
+  return store;
+}
+// The first of `candidates` (anchors) that issued `current` and signed it:
+// true when found and in its validity window (pushed onto `path`), the error
+// when found and outside it, null when none did.
+function _anchorIssuer(current, candidates, now, path) {
+  for (const a of candidates) {
+    try {
+      if (current.checkIssued(a) && current.verify(a.publicKey)) {
+        if (!_validNow(a, now)) return { ok: false, error: _validityError(a, now) };
+        path.push(a);
+        return true;
+      }
+    } catch (e) { /* try next anchor */ }
+  }
+  return null;
+}
+
 /**
  * Build and verify a certificate chain from `chainDer` (leaf first) up to one
  * of `anchors`.
@@ -213,13 +265,14 @@ function _selfSigned(x509) {
  *   CERT_HAS_EXPIRED / CERT_NOT_YET_VALID   a certificate in the path
  *   and check_path's: INVALID_CA, INVALID_PURPOSE, PATH_LENGTH_EXCEEDED,
  *   PERMITTED_VIOLATION, EXCLUDED_VIOLATION, UNHANDLED_CRITICAL_EXTENSION,
- *   UNSUPPORTED_CONSTRAINT_SYNTAX, UNSUPPORTED_NAME_SYNTAX
+ *   UNSUPPORTED_CONSTRAINT_SYNTAX, UNSUPPORTED_NAME_SYNTAX, and UNSPECIFIED
+ *   (name constraints too costly to check — OpenSSL's NAME_CHECK_MAX)
  */
-function verify_cert_chain(chainDer, anchors, now, purpose) {
+function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
   if (!chainDer || chainDer.length === 0) return { ok: false, error: 'NO_PEER_CERTIFICATE' };
   now = now || new Date();
 
-  const leaf = _x509(chainDer[0].cert || chainDer[0]);
+  leaf = leaf || _x509(chainDer[0].cert || chainDer[0]);
   if (!leaf) return { ok: false, error: 'CERTIFICATE_PARSE_ERROR' };
 
   const pool = [];
@@ -228,11 +281,8 @@ function verify_cert_chain(chainDer, anchors, now, purpose) {
     if (x) pool.push(x);
   }
 
-  const trusted = [];
-  for (let i = 0; i < (anchors || []).length; i++) {
-    const xs = _anchorX509s(anchors[i]);
-    for (let k = 0; k < xs.length; k++) trusted.push(xs[k]);
-  }
+  const store = _trustStore(anchors);
+  const trusted = store.list;
   if (trusted.length === 0) return { ok: false, error: 'NO_TRUST_ANCHORS' };
 
   let current = leaf;
@@ -250,17 +300,13 @@ function verify_cert_chain(chainDer, anchors, now, purpose) {
     // Explicitly trusted certificate (pinned leaf, or a self-signed cert the
     // caller deliberately placed in the trust store). The leaf itself: the
     // caller's trust in that very certificate, nothing to check above it.
-    for (const a of trusted) if (_sameCert(current, a)) return depth === 0 ? { ok: true, depth: 0 } : done(depth);
+    // Only anchors whose subject is the name in question can match (the
+    // same certificate has the same subject; an issuer's subject is the
+    // issuer name) — a lookup, where every anchor was tried in turn.
+    for (const a of store.named(current.subject)) if (_sameCert(current, a)) return depth === 0 ? { ok: true, depth: 0 } : done(depth);
 
-    for (const a of trusted) {
-      try {
-        if (current.checkIssued(a) && current.verify(a.publicKey)) {
-          if (!_validNow(a, now)) return { ok: false, error: _validityError(a, now) };
-          path.push(a);
-          return done(depth + 1);
-        }
-      } catch (e) { /* try next anchor */ }
-    }
+    let r = _anchorIssuer(current, store.named(current.issuer), now, path);
+    if (r) return r === true ? done(depth + 1) : r;
 
     let next = null;
     for (let i = 0; i < pool.length; i++) {
@@ -272,6 +318,17 @@ function verify_cert_chain(chainDer, anchors, now, purpose) {
         if (!_validNow(cand, now)) return { ok: false, error: _validityError(cand, now) };
         used.add(i); next = cand; path.push(cand); break;
       } catch (e) { /* try next candidate */ }
+    }
+
+    // The name index found no anchor and the peer's chain no issuer: try
+    // every anchor, as before. Names are matched by OpenSSL on their
+    // canonical form; the key here is the printed one, normalized the same
+    // way for case and spacing, but an exotic encoding could still print
+    // differently and must not turn a valid chain into a failure. Only a
+    // chain that is about to fail pays for this.
+    if (!next) {
+      let r = _anchorIssuer(current, trusted, now, path);
+      if (r) return r === true ? done(depth + 1) : r;
     }
 
     if (!next) {
@@ -287,8 +344,8 @@ function verify_cert_chain(chainDer, anchors, now, purpose) {
 }
 
 
-// The most content a record carries (RFC 8446 §5.1, RFC 5246 §6.2.1).
-const MAX_RECORD_PLAINTEXT = 16384;
+// The most content a record carries (wire.js).
+const MAX_RECORD_PLAINTEXT = wire.MAX_RECORD_PLAINTEXT;
 
 // The recordSizeLimit option: 64 to 2^14 + 1 (RFC 8449 §4), or undefined.
 function checked_record_size_limit(v) {
@@ -1332,9 +1389,9 @@ function TLSSession(options){
    *
    * What it changes, for anyone reaching for it as evasion: nothing this
    * library computes. JA4 and JA5 sort extensions before hashing, so both are
-   * byte-for-byte identical with this on or off. It defeats only JA3, the 2017
-   * fingerprint, which hashed extensions in wire order — and a client whose
-   * JA3 differs on every connection is itself a distinctive pattern.
+   * byte-for-byte identical with this on or off. Only a fingerprint that
+   * hashes extensions in wire order changes — and one that differs on every
+   * connection is itself a distinctive pattern.
    *
    * Two ordering rules are preserved:
    *
@@ -1507,12 +1564,24 @@ function TLSSession(options){
    * turn that into the appropriate alert for their context.
    */
   function peer_leaf_public_key() {
-    if (!context.remote_cert_chain || context.remote_cert_chain.length === 0) return null;
-    try {
-      return new crypto.X509Certificate(Buffer.from(context.remote_cert_chain[0].cert)).publicKey;
-    } catch (e) {
-      return null;
-    }
+    let x509 = peer_leaf_x509();
+    return x509 ? x509.publicKey : null;
+  }
+
+  // The peer's leaf, parsed once per certificate received. Three places read
+  // it in one handshake — the chain check, the identity check, and the
+  // signature over the handshake (CertificateVerify, or TLS 1.2's
+  // ServerKeyExchange) — and each parsed it from the DER again. Keyed by the
+  // bytes object itself: a new Certificate message (a new chain) is a new
+  // object, and is parsed afresh. null when there is no leaf or it does not
+  // parse.
+  let peer_leaf = { der: null, x509: null };
+  function peer_leaf_x509() {
+    let chain = context.remote_cert_chain;
+    if (!chain || chain.length === 0) return null;
+    let der = chain[0].cert;
+    if (peer_leaf.der !== der) peer_leaf = { der: der, x509: _x509(der) };
+    return peer_leaf.x509;
   }
 
   /**
@@ -1908,6 +1977,14 @@ function TLSSession(options){
   }
 
   // A ClientHello as §4.1.2 compares two: what may not change between them.
+  // The extensions as a set, by type: §4.1.2 lists what the second hello may
+  // change, and their order is not a field of the hello — RFC 8446 §4.2
+  // leaves it free ("may appear in any order", pre_shared_key last), and
+  // wolfSSL does send its second hello in another order. Taking a new order
+  // for a change refused every wolfSSL client after a HelloRetryRequest —
+  // after every one, in DTLS 1.3, where the cookie always asks for one. A
+  // type twice is refused when the hello is parsed (§4.2), so sorted by type
+  // they compare one to one.
   const CH2_MAY_CHANGE = {};
   for (const t of [wire.TLS_EXT.KEY_SHARE, wire.TLS_EXT.COOKIE, wire.TLS_EXT.EARLY_DATA, wire.TLS_EXT.PRE_SHARED_KEY, wire.TLS_EXT.PADDING]) CH2_MAY_CHANGE[t] = 1;
   function ch_shape(m) {
@@ -1915,7 +1992,8 @@ function TLSSession(options){
       suites: (m.cipher_suites || []).join(','),
       sid: m.session_id ? Buffer.from(m.session_id).toString('hex') : '',
       exts: (m.extensions || []).filter(function (e) { return !CH2_MAY_CHANGE[e.type]; })
-                                .map(function (e) { return { type: e.type, data: Buffer.from(e.data || []) }; }),
+                                .map(function (e) { return { type: e.type, data: Buffer.from(e.data || []) }; })
+                                .sort(function (x, y) { return x.type - y.type; }),
     };
   }
   function ch_shape_differs(a, b) {
@@ -1923,7 +2001,7 @@ function TLSSession(options){
     if (a.sid !== b.sid) return 'legacy_session_id changed';
     if (a.exts.length !== b.exts.length) return 'extensions added or removed';
     for (let i = 0; i < a.exts.length; i++) {
-      if (a.exts[i].type !== b.exts[i].type) return 'extensions reordered (' + a.exts[i].type + ' where ' + b.exts[i].type + ' was)';
+      if (a.exts[i].type !== b.exts[i].type) return 'extensions changed (' + b.exts[i].type + ' where ' + a.exts[i].type + ' was)';
       if (!a.exts[i].data.equals(b.exts[i].data)) return 'extension ' + a.exts[i].type + ' changed';
     }
     return null;
@@ -3097,7 +3175,8 @@ function TLSSession(options){
         return;
       }
       let algorithm = message.algorithm;
-      try { message = wire.parse_certificate(body); }
+      // CompressedCertificate is TLS 1.3's alone (RFC 8879 §4).
+      try { message = wire.parse_certificate(body, true); }
       catch (e) { fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'CompressedCertificate: ' + e.message); return; }
       message.type = 'certificate';
       message.compressed = true;
@@ -4838,6 +4917,17 @@ function TLSSession(options){
             context.ech.status = null;
             context.ech.backend = false;
           }
+          // A server on (D)TLS 1.2: the key shares of the ClientHello are
+          // TLS 1.3's (key_share, RFC 8446 §4.2.8) and not this handshake's.
+          // The client's key comes in its ClientKeyExchange. Kept, the
+          // ClientHello's share for the group chosen was taken for the
+          // client's key — the secret computed with it at once, and the
+          // ClientKeyExchange's key then ignored (a share already there is
+          // not replaced): bad_record_mac on the first record, with any
+          // client that offers 1.3 too and sends a share for that group.
+          if (context.isServer && options.selected_version != null && !wire.is_tls13_wire(options.selected_version)) {
+            context.remote_key_groups = {};
+          }
         }
       }
 
@@ -5472,7 +5562,14 @@ function TLSSession(options){
         let fallback = [0x0017, 0x001d].filter(function (g) { return context.local_supported_groups.indexOf(g) >= 0 && is_supported_group(g); });
         if (fallback.length > 0) params_to_set['selected_group'] = fallback[0];
       }
-      if (context.selected_group == null && !('selected_group' in params_to_set)){
+      // A server chooses once the version is known — which group, and how,
+      // depends on it (a KEM group, or a key share, only in TLS 1.3). It
+      // chose before: with `groups` configured (so its list was there before
+      // 'hello'), a TLS 1.2 server picked the group by the client's TLS 1.3
+      // key share, and computed the secret with that share before the
+      // version was even chosen.
+      if (context.selected_group == null && !('selected_group' in params_to_set) &&
+          (!context.isServer || pending('selected_version') != null)){
         if(context.local_supported_groups.length > 0 && context.remote_supported_groups.length > 0) {
           // Two passes over our preference order. First: a group the client
           // already sent a key share for — the handshake goes on in one round
@@ -5517,7 +5614,7 @@ function TLSSession(options){
             let g = context.local_supported_groups[i];
             if (context.remote_supported_groups.indexOf(g) < 0) continue;
             if (!is_supported_group(g)) continue;
-            if (is_kem_group(g) && !selIs13) continue;
+            if (!selIs13) break;   // key shares are TLS 1.3's
             let rk = context.remote_key_groups[g];
             if (!rk || !rk.public_key) continue;
             params_to_set['selected_group'] = g;
@@ -7349,9 +7446,13 @@ function TLSSession(options){
     }
 
     try {
-      // Parse the leaf certificate (first in chain)
-      let certDer = context.remote_cert_chain[0].cert;
-      let x509 = new crypto.X509Certificate(certDer);
+      // The leaf certificate (first in chain)
+      let x509 = peer_leaf_x509();
+      if (!x509) {
+        context.authorizationError = 'CERTIFICATE_PARSE_ERROR';
+        context.peerAuthorized = false;
+        return;
+      }
 
       // Check validity dates
       let now = new Date();
@@ -7406,8 +7507,7 @@ function TLSSession(options){
         return;
       }
 
-      let cas = Array.isArray(anchors) ? anchors : [anchors];
-      let chainResult = verify_cert_chain(context.remote_cert_chain, cas, now, context.isServer ? 'client' : 'server');
+      let chainResult = verify_cert_chain(context.remote_cert_chain, anchors, now, context.isServer ? 'client' : 'server', x509);
       if (!chainResult.ok) {
         context.authorizationError = chainResult.error;
         context.peerAuthorized = false;
@@ -8037,7 +8137,7 @@ function TLSSession(options){
    *
    * Ciphers and extensions are sorted before hashing, so a client that
    * shuffles extension order per connection still produces a stable
-   * fingerprint — the main reason to prefer this over JA3. Signature
+   * fingerprint. Signature
    * algorithms are appended in WIRE ORDER, unsorted, which is what preserves
    * uniqueness after that sort.
    *

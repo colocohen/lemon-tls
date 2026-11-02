@@ -227,7 +227,7 @@ function parse_tls_message(data, negotiatedVersion, opts) {
     out.type = 'encrypted_extensions';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CERTIFICATE) {
-    out = wire.parse_certificate(message.body);
+    out = wire.parse_certificate(message.body, wire.is_tls13_wire(negotiatedVersion));
     out.type = 'certificate';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.COMPRESSED_CERTIFICATE) {

@@ -45,6 +45,7 @@ import {
   local_alert_error,
   read_peer_alert,
   MAX_WARNING_ALERTS,
+  MAX_RECORD_PLAINTEXT,
   TLS_ALERT,
   TLS_MESSAGE_TYPE,
   parseError,
@@ -148,6 +149,8 @@ function checkedMtu(v, dflt) {
   if (!Number.isInteger(v) || v < 128 || v > 65507) throw new RangeError('DTLS mtu must be an integer in [128, 65507], got ' + v);
   return v;
 }
+// The least a timer from a round-trip estimate starts at (currentRto).
+const RTO_MIN_MS = 100;
 function checkedRetransmitTimeout(v, dflt) {
   if (v === undefined || v === null) {
     if (dflt !== undefined) return dflt;
@@ -366,6 +369,8 @@ function DTLSSession(options) {
     retransmitCount: 0,
     retransmitTimeout: checkedRetransmitTimeout(options.initialRetransmitTimeout, 1000),
     initialRetransmitTimeout: checkedRetransmitTimeout(options.initialRetransmitTimeout, 1000),   // where each flight's timer starts (RFC 9147 §5.8.2: 1 s)
+    // Given, the schedule is the caller's: no round-trip estimate moves it.
+    fixedRto: options.initialRetransmitTimeout !== undefined && options.initialRetransmitTimeout !== null,
     lastSession: undefined,   // the last 'session' Buffer (getSession)
     // Giving up (RFC 9147 §5.8.2 leaves it to us): after at least this many
     // retransmissions AND this much time since the flight first went out.
@@ -786,6 +791,8 @@ function DTLSSession(options) {
         // an ACK, application data, a HelloVerifyRequest.
         let e = item.kind === 'entry' ? item.entry : null;
         if (e && e.acked) continue;
+        // A new entry (sendCCS): it joins its list here, in sending order.
+        if (e && item.join && e.list) e.list.push(e);
         let epoch = e ? e.epoch : item.epoch, contentType = e ? e.contentType : item.contentType;
         let payload = e ? e.payload : item.payload;
         closeRec();
@@ -1218,9 +1225,16 @@ function DTLSSession(options) {
     // retransmitted final flight arrived WITHOUT the cipher-spec change and
     // the peer could never decrypt the accompanying Finished — an
     // unrecoverable stall under single-datagram loss.
+    //
+    // Into the flight where it goes out, as the messages' fragments are
+    // (flushOut): the messages queued before it — the ClientKeyExchange, a
+    // Certificate — are cut into entries only then, and a CCS put in the
+    // list here, at once, went ahead of them. Every retransmission then
+    // opened with the CCS (BoGo DTLS-RetransmitFinished-Fragmented: "record
+    // of type 20 in retransmit, but expected 22"); a peer that reads in
+    // order takes it before the key exchange it follows.
     let ccs = { epoch: 0, contentType: CT.CHANGE_CIPHER_SPEC, payload: new Uint8Array([1]), list: ctx.currentFlight };
-    ctx.currentFlight.push(ccs);
-    queueOut({ kind: 'entry', entry: ccs, label: 'ccs' });
+    queueOut({ kind: 'entry', entry: ccs, label: 'ccs', join: true });
   }
 
 
@@ -1519,11 +1533,19 @@ function DTLSSession(options) {
 
     if (record.type !== CT.ALERT) ctx.consecutiveWarnings = 0;
 
-    // Ours, once negotiated (RFC 8449 §4: record_overflow) — for a record
-    // that opened under its keys; an unprotected one is anyone's.
-    let rsl = record.encrypted ? tls.getRecordSizeLimit() : null;
-    if (rsl && record.content && record.content.length > rsl.receive) {
-      throw parseError('DTLS record of ' + record.content.length + ' bytes, more than our record_size_limit (' + rsl.receive + ')', TLS_ALERT.RECORD_OVERFLOW);
+    // A record that opened under its keys is the peer's: more plaintext
+    // than a record may carry — 2^14 (RFC 8446 §5.1, RFC 5246 §6.2.1), or
+    // our record_size_limit once negotiated (RFC 8449 §4) — is
+    // record_overflow, as in TLS. Without a limit agreed, nothing was
+    // checked at all (BoGo LargePlaintext-DTLS). An unprotected one is
+    // anyone's: what arrives too long is dropped as the datagram is parsed
+    // (record.js).
+    if (record.encrypted && record.content) {
+      let rsl = tls.getRecordSizeLimit(), max = rsl ? rsl.receive : MAX_RECORD_PLAINTEXT;
+      if (record.content.length > max) {
+        throw parseError('DTLS record of ' + record.content.length + ' bytes, more than ' +
+          (rsl ? 'our record_size_limit (' + max + ')' : '2^14'), TLS_ALERT.RECORD_OVERFLOW);
+      }
     }
 
     if (record.type === CT.HANDSHAKE) {
@@ -1542,9 +1564,19 @@ function DTLSSession(options) {
       processHandshakeRecord(record.content, record.epoch, record.encrypted);
     } else if (record.type === CT.APPLICATION_DATA) {
       if (ctx.state === 'connected') {
-        // Protected data from the peer means it completed the handshake,
-        // so it has our Finished.
-        if (ctx.finalFlightPending) finalFlightDone();
+        // DTLS 1.2: protected data from the peer means it has our final
+        // flight — nothing more to answer its retransmissions with.
+        //
+        // NOT DTLS 1.3's final flight (finalFlightPending): that one is
+        // acknowledged by an ACK alone (RFC 9147 §7.1: it is the one flight
+        // not implicitly acknowledged, and "flights MUST be ACKed unless
+        // they are implicitly acknowledged"). A server sends data before it
+        // has our Finished — half-RTT data, its tickets — so its data said
+        // nothing of our Finished, and taken for it, a lost Finished was
+        // never resent: the server's handshake never ended (BoGo
+        // DTLS-Retransmit-Client-NoImplictACKFinished). A peer that never
+        // ACKs costs only the retransmissions: when they run out the flight
+        // is let go, the connection kept (startRetransmitTimer).
         ctx.lastFlight12 = null;
         // A Buffer, as node:tls gives (and every other buffer this API hands
         // out): a view of the decrypted record, not a copy.
@@ -2347,12 +2379,22 @@ function DTLSSession(options) {
     ctx.flightResent = false;
   }
 
-  // Where a timer starts: the configured initial value until there is a
-  // round-trip sample, then SRTT + 4·RTTVAR (RFC 6298 §2) — not under 50 ms
-  // (a timer and a loopback can measure 0), not over 60 s.
+  // Where a timer starts: the initial value until there is a round-trip
+  // sample, then SRTT + 4·RTTVAR (RFC 6298 §2) — not under RTO_MIN_MS, not
+  // over 60 s. An initialRetransmitTimeout given (the option, or
+  // setInitialRetransmitTimeout) is a schedule the caller chose: it is kept
+  // — from it, doubling — and no round trip changes it (fixedRto).
+  //
+  // The floor was 50 ms. A loopback, or a peer that answers within the same
+  // tick, measures a round trip of 0, and a real path that once measured
+  // short then lost its next flight to a 50 ms timer. RFC 9147 sets no
+  // floor; 100 ms is WebRTC's own initial timer. And a fixed schedule
+  // matters to a peer that times itself by one (BoGo advances its clock by
+  // BoringSSL's 400 ms, 800 ms …: an adaptive 50 ms timer fired several
+  // times in each step).
   function currentRto() {
-    if (ctx.srtt === null) return ctx.initialRetransmitTimeout;
-    return Math.max(50, Math.min(60000, Math.round(ctx.srtt + 4 * ctx.rttvar)));
+    if (ctx.fixedRto || ctx.srtt === null) return ctx.initialRetransmitTimeout;
+    return Math.max(RTO_MIN_MS, Math.min(60000, Math.round(ctx.srtt + 4 * ctx.rttvar)));
   }
   function sampleRtt(r) {
     if (ctx.srtt === null) { ctx.srtt = r; ctx.rttvar = r / 2; }
@@ -2735,8 +2777,9 @@ function DTLSSession(options) {
      */
     setInitialRetransmitTimeout: function(ms) {
       ctx.initialRetransmitTimeout = checkedRetransmitTimeout(ms);
-      // Said explicitly: it starts the next flight's timer, over whatever
-      // round trip was measured so far (the estimate starts again).
+      // Said explicitly: the schedule from now on — every flight's timer
+      // starts there, whatever round trip is measured (currentRto).
+      ctx.fixedRto = true;
       ctx.srtt = null; ctx.rttvar = null;
       if (ctx.retransmitTimer === null) ctx.retransmitTimeout = ctx.initialRetransmitTimeout;
     },

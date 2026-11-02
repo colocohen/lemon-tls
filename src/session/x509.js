@@ -253,8 +253,16 @@ function within(n, c) {
 // refused — whether the name is within it is unknown. A subtree with a
 // minimum or maximum, or an iPAddress constraint that is no address and
 // mask, is malformed (§4.2.1.10): the certificate carrying it is refused.
+// The most name-against-constraint comparisons one certificate may cost
+// under one CA's name constraints: OpenSSL's NAME_CHECK_MAX (2^20), and
+// its answer past it, X509_V_ERR_UNSPECIFIED — node:tls's 'UNSPECIFIED'.
+// The check is names × constraints, both the certificates' to choose: a CA
+// with 1024 permitted subtrees and a leaf with 1024 names cost 225 ms of
+// blocking CPU per handshake, and more of each, more (x509-limbo nc-dos).
+const NAME_CHECK_MAX = 1 << 20;
 function checkNames(names, nc) {
   let all = (nc.permitted || []).concat(nc.excluded || []), unread = false;
+  if (names.length > NAME_CHECK_MAX || (all.length > 0 && names.length > NAME_CHECK_MAX / all.length)) return 'UNSPECIFIED';
   for (const c of all) {
     if (c.type === 'bad') return 'UNSUPPORTED_CONSTRAINT_SYNTAX';
     if (c.type === 'ip' && (!(c.value.length === 8 || c.value.length === 32) || !ipMaskOk(c.value.subarray(c.value.length / 2)))) {

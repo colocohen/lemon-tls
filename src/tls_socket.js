@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { Duplex } from 'node:stream';
 
 import { TLS_CIPHER_SUITES } from './crypto.js';
-import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT, peer_alert_error, read_peer_alert, MAX_WARNING_ALERTS, local_alert_error, version_name } from './wire.js';
+import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT, peer_alert_error, read_peer_alert, MAX_WARNING_ALERTS, MAX_RECORD_PLAINTEXT, local_alert_error, version_name } from './wire.js';
 import { group_name as ecdh_group_name, dh_group_info } from './session/ecdh.js';
 import { certificateObject } from './utils.js';
 import { versionsInRange, localLists, pskOptions } from './node_options.js';
@@ -31,10 +31,6 @@ import {
 // not for an upload — what does not fit goes after the handshake.
 const EARLY_DATA_MAX_TCP = 16384;
 
-// The most plaintext a record carries (RFC 8446 §5.1, RFC 5246 §6.2.1):
-// 2^14. A protected one's ciphertext may be 256 bytes over it (1.3), 2048
-// (1.2).
-const MAX_RECORD_PLAINTEXT = 16384;
 
 // legacy_record_version (TLS 1.3 uses 0x0303 in record header)
 const REC_VERSION = 0x0303;

@@ -199,12 +199,22 @@ function parseTlsVersion(v, name) {
 // Only what the options say: what they leave out, TLSSession fills by its
 // role (fill_default_lists). The names are TLSSocket's; DTLS's older ones —
 // cipherSuites, alpnProtocols — taken as the same.
-function chooseCipherSuites(ciphers, prioritizeChaCha, allowed) {
+// The suites to negotiate with, in preference order: those of `allowed`
+// (allowedCipherSuites, cipherSuites, or `ciphers` parsed) that the versions
+// in range can use, IN THE ORDER GIVEN — the order is the preference, as
+// node:tls takes `ciphers`; or, without a list, `defaults`. Then
+// prioritizeChaCha moves the ChaCha20-Poly1305 suites to the front.
+//
+// The list only filtered the defaults, and kept their order: a server could
+// not prefer AES-256 to AES-128 (honorCipherOrder took our order, and ours
+// was always the default one — BoGo TLS13-Server-StrictPreference), and a
+// client offered its suites in the default order, whatever it listed.
+function chooseCipherSuites(defaults, prioritizeChaCha, allowed) {
+  var ciphers = allowed ? allowed.filter(function (c) { return defaults.indexOf(c) >= 0; }) : defaults.slice();
   if (prioritizeChaCha) {
     var isChaCha = function (c) { return !!TLS_CIPHER_SUITES[c] && TLS_CIPHER_SUITES[c].cipher === 'CHACHA20_POLY1305'; };
     ciphers = ciphers.filter(isChaCha).concat(ciphers.filter(function (c) { return !isChaCha(c); }));
   }
-  if (allowed) ciphers = ciphers.filter(function (c) { return allowed.indexOf(c) >= 0; });
   return ciphers;
 }
 function localLists(options, versions) {

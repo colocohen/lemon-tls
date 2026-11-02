@@ -21,9 +21,11 @@
 //                      constraint of a kind not read here refuses a name of
 //                      that kind (§4.2.1.10: "MUST" be able to process)
 //   critical           an extension marked critical that is not one of these
-//                      (or of those that need no processing here) refuses
-//                      the certificate (§4.2) — the CT precertificate poison
-//                      among them
+//                      (or of the policy ones, which need no processing here)
+//                      refuses the certificate (§4.2) — the CT precertificate
+//                      poison among them; OpenSSL's list
+//   signature          a certificate below the anchor signed with MD5 or
+//                      SHA-1 is refused (CA_MD_TOO_WEAK, OpenSSL's level 1)
 //
 // None of this was checked: a sub-CA limited to one domain could issue for
 // any (x509-limbo: 2,384 cases; CVE-2025-61727's class), a certificate
@@ -38,19 +40,31 @@ const OID = {
   KU: '2.5.29.15', SAN: '2.5.29.17', BC: '2.5.29.19', NC: '2.5.29.30', EKU: '2.5.29.37',
   ANY_EKU: '2.5.29.37.0', SERVER_AUTH: '1.3.6.1.5.5.7.3.1', CLIENT_AUTH: '1.3.6.1.5.5.7.3.2',
 };
-// Extensions understood well enough to be marked critical: those processed
-// here, and those whose meaning asks nothing of a TLS path check (key
-// identifiers, where to find CRLs and issuers, policies — this verifier
-// requires no policy, so a policy extension restricts nothing it relies on).
+// Extensions that may be marked critical: OpenSSL's list
+// (X509_supported_extension) — those processed here, the policy ones (this
+// verifier requires no policy, so a policy extension restricts nothing it
+// relies on), and CRL distribution points. Any other critical:
+// UNHANDLED_CRITICAL_EXTENSION, as OpenSSL answers (error 34). The key
+// identifiers, freshest CRL, AIA, SIA, issuer alt name, subject directory
+// attributes and TLS feature were taken critical too — RFC 5280 has the
+// key identifiers and AIA non-critical ("MUST", §4.2.1.1, .2, §4.2.2.1),
+// and a certificate that marks AIA critical says a verifier that does not
+// fetch from it must not use it (x509-limbo; BoringSSL refuses them too).
 const KNOWN = new Set([
   OID.KU, OID.SAN, OID.BC, OID.NC, OID.EKU,
-  '2.5.29.14', '2.5.29.35',                 // subject / authority key identifier
-  '2.5.29.31', '2.5.29.46',                 // CRL distribution points, freshest CRL
-  '2.5.29.18', '2.5.29.9',                  // issuer alt name, subject directory attributes
   '2.5.29.32', '2.5.29.33', '2.5.29.36', '2.5.29.54',   // policies, mappings, constraints, inhibitAnyPolicy
-  '1.3.6.1.5.5.7.1.1', '1.3.6.1.5.5.7.1.11', // AIA, SIA
-  '1.3.6.1.5.5.7.1.24',                     // TLS feature (OCSP must-staple)
+  '2.5.29.31',                              // CRL distribution points
 ]);
+// Signature algorithms too weak to sign a certificate: MD2, MD4, MD5, SHA-1
+// — under RSA (and the old OIW OID), DSA, ECDSA, and RSASSA-PSS whose hash
+// is SHA-1 (its default). OpenSSL refuses them from security level 1 —
+// node:tls's default: "CA signature digest algorithm too weak" — as does
+// BoringSSL's libpki. They were taken (x509-limbo, bettertls).
+const WEAK_SIG = new Set([
+  '1.2.840.113549.1.1.2', '1.2.840.113549.1.1.3', '1.2.840.113549.1.1.4', '1.2.840.113549.1.1.5',
+  '1.3.14.3.2.29', '1.3.14.3.2.27', '1.2.840.10040.4.3', '1.2.840.10045.4.1',
+]);
+const RSA_PSS = '1.2.840.113549.1.1.10', SHA1 = '1.3.14.3.2.26';
 const KU_DIGITAL_SIGNATURE = 0x80, KU_KEY_ENCIPHERMENT = 0x20, KU_KEY_AGREEMENT = 0x08, KU_KEY_CERT_SIGN = 0x04;
 
 // ---- DER ----
@@ -117,10 +131,27 @@ function rdns(buf, nameT) {
  * Throws CERTIFICATE_PARSE_ERROR on DER that does not hold one, and on an
  * extension present twice (§4.2: "MUST NOT include more than one instance").
  */
+// Whether a certificate's signatureAlgorithm (an AlgorithmIdentifier TLV)
+// is one of WEAK_SIG, or RSASSA-PSS over SHA-1.
+function weakSignature(der, algT) {
+  if (!algT || algT.tag !== 0x30) throw DerError('no signatureAlgorithm');
+  let a = children(der, algT), oid = oidString(der, a[0]);
+  if (WEAK_SIG.has(oid)) return true;
+  if (oid !== RSA_PSS) return false;
+  // RSASSA-PSS-params: hashAlgorithm [0] DEFAULT sha1 (RFC 4055 §3.1).
+  let params = a[1];
+  if (!params || params.tag !== 0x30) return true;
+  let h = children(der, params).find(function (t) { return t.tag === 0xa0; });
+  if (!h) return true;
+  let hAlg = children(der, h)[0];
+  return !!hAlg && oidString(der, children(der, hAlg)[0]) === SHA1;
+}
+
 function parse_extensions(der) {
   let cert = tlv(der, 0);
   if (cert.tag !== 0x30 || cert.end !== der.length) throw DerError('not a certificate');
-  let tbs = children(der, cert)[0];
+  let top = children(der, cert);
+  let tbs = top[0];
   if (!tbs || tbs.tag !== 0x30) throw DerError('no tbsCertificate');
   let f = children(der, tbs), i = 0;
   let version = 1;
@@ -135,8 +166,10 @@ function parse_extensions(der) {
     version: version,
     subject: rdns(der, subjectT),
     subjectEmpty: subjectT.end === subjectT.start,
+    subjectAttrs: children(der, subjectT).reduce(function (n, r) { return n + children(der, r).length; }, 0),
     selfIssued: der.subarray(subjectT.hdr, subjectT.end).equals(der.subarray(issuerT.hdr, issuerT.end)),
     critical: [], bc: null, ku: null, eku: null, san: null, nc: null,
+    weakSig: weakSignature(der, top[1]),
   };
   let extT = null;
   for (; i < f.length; i++) if (f[i].tag === 0xa3) extT = f[i];
@@ -247,22 +280,56 @@ function within(n, c) {
   }
   return false;
 }
-// Whether `names` (of one certificate) stand within `nc`; null when they do,
-// else the error code. A constraint this check cannot read (otherName,
+// The cost of name constraints: names × constraints, both chosen by the
+// certificates. Bounded as OpenSSL bounds it — NAME_CHECK_MAX (2^20)
+// comparisons of one certificate's names against one CA's constraints, the
+// names counted as OpenSSL counts them (each subject attribute, each
+// subjectAltName) — and over the whole path too: four CAs of 1,024 subtrees
+// each, a leaf of 1,023 names under every one, kept each pair under the
+// bound and cost a second. Past either: X509_V_ERR_UNSPECIFIED, node:tls's
+// 'UNSPECIFIED' (x509-limbo nc-dos).
+const NAME_CHECK_MAX = 1 << 20;
+
+// A CA's nameConstraints, prepared once for the names checked against them:
+// by name type, DNS bases lowercased and without a trailing dot (each
+// comparison lowercased both again).
+function preparedConstraints(nc) {
+  if (nc._prepared) return nc._prepared;
+  let byType = function (list) {
+    let out = {};
+    for (const c of list || []) {
+      let v = c.type === 'dns' ? lower(c.value).replace(/\.$/, '') : c.value;
+      (out[c.type] || (out[c.type] = [])).push({ type: c.type, value: v });
+    }
+    return out;
+  };
+  let all = (nc.permitted || []).concat(nc.excluded || []);
+  nc._prepared = { all: all, permitted: byType(nc.permitted), excluded: byType(nc.excluded),
+                   hasUri: all.some(function (c) { return c.type === 'uri'; }) };
+  return nc._prepared;
+}
+// A DNS name within a prepared base (dnsWithin, with the base normalized).
+function dnsWithinPrepared(name, base) {
+  if (base === '') return true;
+  if (base[0] === '.') return name.endsWith(base);
+  return name === base || (name.length > base.length && name.endsWith(base) && name[name.length - base.length - 1] === '.');
+}
+function withinPrepared(n, nv, c) {
+  return n.type === 'dns' ? dnsWithinPrepared(nv, c.value) : within(n, c);
+}
+
+// Whether `names` (of one certificate, namesOf) stand within `nc`; null
+// when they do, else the error code. `budget` ({ left }) is what is left of
+// the path's comparisons. A constraint this check cannot read (otherName,
 // x400Address, ediPartyName, registeredID) and a name of such a kind meet:
 // refused — whether the name is within it is unknown. A subtree with a
 // minimum or maximum, or an iPAddress constraint that is no address and
 // mask, is malformed (§4.2.1.10): the certificate carrying it is refused.
-// The most name-against-constraint comparisons one certificate may cost
-// under one CA's name constraints: OpenSSL's NAME_CHECK_MAX (2^20), and
-// its answer past it, X509_V_ERR_UNSPECIFIED — node:tls's 'UNSPECIFIED'.
-// The check is names × constraints, both the certificates' to choose: a CA
-// with 1024 permitted subtrees and a leaf with 1024 names cost 225 ms of
-// blocking CPU per handshake, and more of each, more (x509-limbo nc-dos).
-const NAME_CHECK_MAX = 1 << 20;
-function checkNames(names, nc) {
-  let all = (nc.permitted || []).concat(nc.excluded || []), unread = false;
-  if (names.length > NAME_CHECK_MAX || (all.length > 0 && names.length > NAME_CHECK_MAX / all.length)) return 'UNSPECIFIED';
+function checkNames(names, nc, budget) {
+  let pc = preparedConstraints(nc), all = pc.all, unread = false;
+  let count = names.count, cost = count * all.length;
+  if (count > NAME_CHECK_MAX || (all.length > 0 && count > NAME_CHECK_MAX / all.length)) return 'UNSPECIFIED';
+  if (budget) { if (cost > budget.left) return 'UNSPECIFIED'; budget.left -= cost; }
   for (const c of all) {
     if (c.type === 'bad') return 'UNSUPPORTED_CONSTRAINT_SYNTAX';
     if (c.type === 'ip' && (!(c.value.length === 8 || c.value.length === 32) || !ipMaskOk(c.value.subarray(c.value.length / 2)))) {
@@ -272,19 +339,27 @@ function checkNames(names, nc) {
   }
   for (const n of names) {
     if (n.type === 'other') { if (unread) return 'UNSUPPORTED_NAME_SYNTAX'; continue; }
-    if (n.type === 'uri' && uriHost(n.value) === null && all.some(function (c) { return c.type === 'uri'; })) return 'UNSUPPORTED_NAME_SYNTAX';
-    for (const c of nc.excluded || []) if (c.type === n.type && within(n, c)) return 'EXCLUDED_VIOLATION';
-    let perm = (nc.permitted || []).filter(function (c) { return c.type === n.type; });
-    if (perm.length > 0 && !perm.some(function (c) { return within(n, c); })) return 'PERMITTED_VIOLATION';
+    if (n.type === 'uri' && uriHost(n.value) === null && pc.hasUri) return 'UNSUPPORTED_NAME_SYNTAX';
+    let nv = n.type === 'dns' ? lower(n.value).replace(/\.$/, '') : n.value;
+    for (const c of pc.excluded[n.type] || []) if (withinPrepared(n, nv, c)) return 'EXCLUDED_VIOLATION';
+    let perm = pc.permitted[n.type];
+    if (perm && perm.length > 0) {
+      let ok = false;
+      for (let k = 0; k < perm.length && !ok; k++) ok = withinPrepared(n, nv, perm[k]);
+      if (!ok) return 'PERMITTED_VIOLATION';
+    }
   }
   return null;
 }
 // The names a certificate is checked under: its subjectAltName, and its
 // subject (a directoryName). Its common name is not a name here — a host is
 // matched against the subjectAltName only (checkHost subject: 'never').
+// `count`: as OpenSSL counts them for NAME_CHECK_MAX — the subject's
+// attributes one by one, and each subjectAltName.
 function namesOf(p) {
   let names = (p.san || []).slice();
   if (!p.subjectEmpty) names.push({ type: 'dn', value: p.subject });
+  names.count = (p.san ? p.san.length : 0) + p.subjectAttrs;
   return names;
 }
 
@@ -300,10 +375,14 @@ function check_path(path, purpose) {
   } catch (e) { return e.code || 'CERTIFICATE_PARSE_ERROR'; }
   let want = purpose === 'client' ? OID.CLIENT_AUTH : OID.SERVER_AUTH;
   let last = path.length - 1;
+  let budget = { left: NAME_CHECK_MAX };   // the path's name-constraint comparisons
 
   for (let i = 0; i <= last; i++) {
     let p = parsed[i];
     for (const oid of p.critical) if (!KNOWN.has(oid)) return 'UNHANDLED_CRITICAL_EXTENSION';
+    // Its signature, unless it is the anchor (whose own signature nothing
+    // checks — the caller trusts it as it is): not by a weak digest.
+    if (i < last && p.weakSig) return 'CA_MD_TOO_WEAK';
     // extendedKeyUsage, where present, on the leaf and the intermediates
     // (the anchor's is the caller's to trust).
     if (i < last && p.eku && p.eku.indexOf(want) < 0 && p.eku.indexOf(OID.ANY_EKU) < 0) return 'INVALID_PURPOSE';
@@ -329,7 +408,7 @@ function check_path(path, purpose) {
     if (p.nc) {
       for (let j = 0; j < i; j++) {
         if (j > 0 && parsed[j].selfIssued) continue;
-        let err = checkNames(namesOf(parsed[j]), p.nc);
+        let err = checkNames(namesOf(parsed[j]), p.nc, budget);
         if (err) return err;
       }
     }

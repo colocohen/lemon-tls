@@ -217,20 +217,22 @@ function _trustStore(anchors) {
   if (cacheable) _storeByAnchors.set(anchors, store);
   return store;
 }
-// The first of `candidates` (anchors) that issued `current` and signed it:
-// true when found and in its validity window (pushed onto `path`), the error
-// when found and outside it, null when none did.
+// The first of `candidates` (anchors) that issued `current`, signed it and
+// is inside its validity window: true (pushed onto `path`). None: the
+// validity error of the first that issued it but is outside its window, or
+// null when none issued it.
 function _anchorIssuer(current, candidates, now, path) {
+  let expired = null;
   for (const a of candidates) {
     try {
       if (current.checkIssued(a) && current.verify(a.publicKey)) {
-        if (!_validNow(a, now)) return { ok: false, error: _validityError(a, now) };
+        if (!_validNow(a, now)) { if (!expired) expired = { ok: false, error: _validityError(a, now) }; continue; }
         path.push(a);
         return true;
       }
     } catch (e) { /* try next anchor */ }
   }
-  return null;
+  return expired;
 }
 
 /**
@@ -265,8 +267,9 @@ function _anchorIssuer(current, candidates, now, path) {
  *   CERT_HAS_EXPIRED / CERT_NOT_YET_VALID   a certificate in the path
  *   and check_path's: INVALID_CA, INVALID_PURPOSE, PATH_LENGTH_EXCEEDED,
  *   PERMITTED_VIOLATION, EXCLUDED_VIOLATION, UNHANDLED_CRITICAL_EXTENSION,
- *   UNSUPPORTED_CONSTRAINT_SYNTAX, UNSUPPORTED_NAME_SYNTAX, and UNSPECIFIED
- *   (name constraints too costly to check — OpenSSL's NAME_CHECK_MAX)
+ *   UNSUPPORTED_CONSTRAINT_SYNTAX, UNSUPPORTED_NAME_SYNTAX, CA_MD_TOO_WEAK
+ *   (signed with MD5 or SHA-1), and UNSPECIFIED (name constraints too costly
+ *   to check — OpenSSL's NAME_CHECK_MAX)
  */
 function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
   if (!chainDer || chainDer.length === 0) return { ok: false, error: 'NO_PEER_CERTIFICATE' };
@@ -305,8 +308,14 @@ function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
     // issuer name) — a lookup, where every anchor was tried in turn.
     for (const a of store.named(current.subject)) if (_sameCert(current, a)) return depth === 0 ? { ok: true, depth: 0 } : done(depth);
 
+    // A candidate outside its validity window does not end the search:
+    // another may issue the same certificate (a renewed intermediate, or
+    // CA, of the same name and key — OpenSSL takes the valid one). Its
+    // error is the answer only when no valid issuer is found.
+    let expired = null;
     let r = _anchorIssuer(current, store.named(current.issuer), now, path);
-    if (r) return r === true ? done(depth + 1) : r;
+    if (r === true) return done(depth + 1);
+    if (r) expired = r;
 
     let next = null;
     for (let i = 0; i < pool.length; i++) {
@@ -315,7 +324,7 @@ function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
       try {
         if (!current.checkIssued(cand)) continue;
         if (!current.verify(cand.publicKey)) continue;
-        if (!_validNow(cand, now)) return { ok: false, error: _validityError(cand, now) };
+        if (!_validNow(cand, now)) { if (!expired) expired = { ok: false, error: _validityError(cand, now) }; continue; }
         used.add(i); next = cand; path.push(cand); break;
       } catch (e) { /* try next candidate */ }
     }
@@ -328,8 +337,10 @@ function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
     // chain that is about to fail pays for this.
     if (!next) {
       let r = _anchorIssuer(current, trusted, now, path);
-      if (r) return r === true ? done(depth + 1) : r;
+      if (r === true) return done(depth + 1);
+      if (r && !expired) expired = r;
     }
+    if (!next && expired) return expired;
 
     if (!next) {
       let selfSigned = _selfSigned(current);
@@ -4392,6 +4403,19 @@ function TLSSession(options){
         context.peerAuthorized = false;   // no set_context setter for this field
         set_context({ remote_cert_chain: [] });
       } else {
+        // The leaf must be a certificate at all: bad_certificate (RFC 8446
+        // §6.2, RFC 5246 §7.2.2), whatever rejectUnauthorized says — there
+        // is no key to verify the handshake's signature with. A leaf of a
+        // byte or two of junk was taken without rejectUnauthorized, and the
+        // handshake then failed at the CertificateVerify, as
+        // unexpected_message (tlsfuzzer test-certificate-malformed). Parsed
+        // here once, and kept for the checks after it (peer_leaf_x509).
+        let leafX509 = _x509(entries[0].cert);
+        if (!leafX509) {
+          fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'The peer\'s certificate is not an X.509 certificate');
+          return;
+        }
+        peer_leaf = { der: entries[0].cert, x509: leafX509 };
         set_context({
           remote_cert_chain: entries,
         });

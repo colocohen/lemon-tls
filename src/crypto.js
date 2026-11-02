@@ -128,101 +128,6 @@ const TLS_CIPHER_SUITES = {
     ivlen:        12,
     hash:         'sha256'
   },
-  0xCCAA: { // TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-    name: 'DHE-RSA-CHACHA20-POLY1305', standardName: 'TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
-    tls:          12,
-    kex:          'DHE_RSA',
-    sig:          'RSA',
-    cipher:       'CHACHA20_POLY1305',
-    aead:         true,
-    keylen:       32,
-    fixed_ivlen:  12,  // RFC 7905: ChaCha20 uses a full 12-byte IV, no explicit nonce
-    record_ivlen: 0,
-    ivlen:        12,
-    hash:         'sha256'
-  },
-  0x009C: { // TLS_RSA_WITH_AES_128_GCM_SHA256
-    name: 'AES128-GCM-SHA256', standardName: 'TLS_RSA_WITH_AES_128_GCM_SHA256',
-    tls:          12,
-    kex:          'RSA',
-    sig:          'RSA',
-    cipher:       'AES_128_GCM',
-    aead:         true,
-    keylen:       16,
-    fixed_ivlen:  4,
-    record_ivlen: 8,
-    ivlen:        12,
-    hash:         'sha256'
-  },
-  0x009D: { // TLS_RSA_WITH_AES_256_GCM_SHA384
-    name: 'AES256-GCM-SHA384', standardName: 'TLS_RSA_WITH_AES_256_GCM_SHA384',
-    tls:          12,
-    kex:          'RSA',
-    sig:          'RSA',
-    cipher:       'AES_256_GCM',
-    aead:         true,
-    keylen:       32,
-    fixed_ivlen:  4,
-    record_ivlen: 8,
-    ivlen:        12,
-    hash:         'sha384'
-  },
-
-  // ----------------------
-  // TLS 1.2 CBC (Legacy)
-  // ----------------------
-  0xC013: { // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
-    name: 'ECDHE-RSA-AES128-SHA', standardName: 'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA',
-    tls:    12,
-    kex:    'ECDHE_RSA',
-    sig:    'RSA',
-    cipher: 'AES_128_CBC',
-    aead:   false,
-    keylen: 16,
-    ivlen:  16,
-    mac:    'sha1',
-    maclen: 20,
-    hash:   'sha256'
-  },
-  0xC014: { // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
-    name: 'ECDHE-RSA-AES256-SHA', standardName: 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA',
-    tls:    12,
-    kex:    'ECDHE_RSA',
-    sig:    'RSA',
-    cipher: 'AES_256_CBC',
-    aead:   false,
-    keylen: 32,
-    ivlen:  16,
-    mac:    'sha1',
-    maclen: 20,
-    hash:   'sha256'
-  },
-  0x003C: { // TLS_RSA_WITH_AES_128_CBC_SHA256
-    name: 'AES128-SHA256', standardName: 'TLS_RSA_WITH_AES_128_CBC_SHA256',
-    tls:    12,
-    kex:    'RSA',
-    sig:    'RSA',
-    cipher: 'AES_128_CBC',
-    aead:   false,
-    keylen: 16,
-    ivlen:  16,
-    mac:    'sha256',
-    maclen: 32,
-    hash:   'sha256'
-  },
-  0x003D: { // TLS_RSA_WITH_AES_256_CBC_SHA256
-    name: 'AES256-SHA256', standardName: 'TLS_RSA_WITH_AES_256_CBC_SHA256',
-    tls:    12,
-    kex:    'RSA',
-    sig:    'RSA',
-    cipher: 'AES_256_CBC',
-    aead:   false,
-    keylen: 32,
-    ivlen:  16,
-    mac:    'sha256',
-    maclen: 32,
-    hash:   'sha256'
-  }
 };
 
 
@@ -282,6 +187,11 @@ function hkdf_extract(hashName, saltU8, ikmU8) {
 function hkdf_expand(hashName, prkU8, infoU8, length) {
   let hashLen = getHashLen(hashName);
   let N = Math.ceil(length / hashLen);
+  // RFC 5869 §2.3: L <= 255*HashLen. The one-byte counter wrapped past it,
+  // and the output repeated its own blocks (Wycheproof).
+  if (!Number.isInteger(length) || length < 0 || N > 255) {
+    throw new RangeError('HKDF-Expand: length ' + length + ' is more than 255 × ' + hashLen);
+  }
   // allocUnsafe is safe here: every byte is overwritten by prev.copy() below.
   let output = Buffer.allocUnsafe(N * hashLen);
   let prev = Buffer.alloc(0);
@@ -607,10 +517,13 @@ function tls_derive_from_master_secret_tls12(master_secret, server_random, clien
   let p = TLS_CIPHER_SUITES[cipher_suite];
   if (!p || p.tls !== 12) throw new Error('cipher suite not TLS 1.2 or not mapped');
 
+  // AEAD suites only (is_usable_cipher_suite): no MAC keys in the block —
+  // client_write_key, server_write_key, then the implicit IVs (RFC 5246 §6.3,
+  // RFC 5288 §3, RFC 7905 §2).
+  if (!p.aead) throw new Error('cipher suite 0x' + cipher_suite.toString(16) + ' is not an AEAD suite');
   let hashName = p.hash;
-  let macLen       = p.aead ? 0 : (p.maclen || 0);
-  let ivFromKbLen  = p.aead ? (p.fixed_ivlen || 0) : 0;
-  let need = (2 * macLen) + (2 * p.keylen) + (2 * ivFromKbLen);
+  let ivFromKbLen  = p.fixed_ivlen || 0;
+  let need = (2 * p.keylen) + (2 * ivFromKbLen);
 
   let key_block = tls12_prf(
     master_secret,
@@ -621,13 +534,6 @@ function tls_derive_from_master_secret_tls12(master_secret, server_random, clien
   );
 
   let off = 0;
-  let c_mac = null, s_mac = null;
-
-  if (!p.aead && macLen > 0) {
-    c_mac = key_block.slice(off, off + macLen); off += macLen;
-    s_mac = key_block.slice(off, off + macLen); off += macLen;
-  }
-
   let c_key = key_block.slice(off, off + p.keylen); off += p.keylen;
   let s_key = key_block.slice(off, off + p.keylen); off += p.keylen;
 
@@ -635,8 +541,6 @@ function tls_derive_from_master_secret_tls12(master_secret, server_random, clien
   let s_iv_salt = ivFromKbLen ? key_block.slice(off, off + ivFromKbLen) : null; off += ivFromKbLen;
 
   return {
-    client_mac: c_mac,
-    server_mac: s_mac,
     client_key: c_key,
     server_key: s_key,
     client_iv: c_iv_salt,
@@ -646,7 +550,7 @@ function tls_derive_from_master_secret_tls12(master_secret, server_random, clien
     prf_hash:    hashName,
     key_len:     p.keylen,
     fixed_ivlen: ivFromKbLen,
-    record_ivlen: p.aead ? (p.record_ivlen || 0) : 16
+    record_ivlen: p.record_ivlen || 0
   };
 }
 
@@ -844,11 +748,9 @@ const DEFAULT_CIPHER_SUITES_TLS12 = [
 /**
  * Can the record layer actually protect traffic with this cipher suite?
  *
- * TLS_CIPHER_SUITES describes suites the code can NAME — including CBC ones
- * kept for parsing peer offers and for reporting — but record.js implements
- * AEAD only. A suite that is merely described is not a capability: selecting
- * one produces a handshake that agrees on parameters and then cannot encrypt a
- * single record.
+ * TLS_CIPHER_SUITES describes the suites the code can name. A suite that is
+ * merely described is not a capability: selecting one produces a handshake
+ * that agrees on parameters and then cannot go on.
  *
  * This mirrors ecdh.js's is_supported_group, and exists for the same reason: a
  * configured list is not an implementation. Selection asks this, never the
@@ -856,7 +758,12 @@ const DEFAULT_CIPHER_SUITES_TLS12 = [
  */
 function is_usable_cipher_suite(id) {
   let m = TLS_CIPHER_SUITES[id];
-  return !!(m && m.aead === true);
+  // An AEAD suite whose key exchange this library does: TLS 1.3's, or
+  // TLS 1.2 ECDHE. (RSA key transport, DHE and CBC suites were listed and
+  // never worked — a server that picked one stalled after its Certificate.
+  // They are gone: insecure as they are (Marvin, Lucky13), no current
+  // client needs them.)
+  return !!(m && m.aead === true && (m.tls === 13 || (typeof m.kex === 'string' && m.kex.indexOf('ECDHE_') === 0)));
 }
 
 /**

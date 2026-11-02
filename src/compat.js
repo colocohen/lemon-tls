@@ -6,15 +6,16 @@
  */
 
 import net from 'node:net';
-import nodeTls from 'node:tls';   // for the shipped CA bundle only
+import { getRootCertificates, setRootCertificates } from './ca_store.js';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { TLS_CIPHER_SUITES } from './crypto.js';
 import TLSSession from './tls_session.js';
 import TLSSocket from './tls_socket.js';
 import createSecureContext from './secure_context.js';
-import { parseCiphers, parseEcdhCurve, parseSigalgs } from './node_options.js';
+import { parseCiphers, checkCipherSuites, parseEcdhCurve, parseSigalgs } from './node_options.js';
 import { prepare_ech_server } from './session/ech.js';
+import { matches_host, matches_altnames } from './session/x509.js';
 
 // ===================== Constants =====================
 
@@ -49,27 +50,9 @@ function getCiphers() {
 
 /* ===================== Default CA store ===================== */
 
-/**
- * The trust anchors Node ships (Mozilla's CA bundle). Exposed under the same
- * name Node uses so `tls.rootCertificates` works unchanged, and so this
- * library has a real default to chain against.
- *
- * That default matters more than parity. Until now, "no `ca` configured" meant
- * "authorize every certificate", while `rejectUnauthorized` defaulted to true
- * — the connection reported itself verified without ever verifying anything.
- * Node never behaved that way: it falls back to this bundle.
- *
- * Parsing all ~144 certificates costs a few tens of milliseconds, so it is
- * done once, lazily, and only if something actually needs it.
- */
-let _rootPems = null;
-function getRootCertificates() {
-  if (_rootPems === null) {
-    try { _rootPems = nodeTls.rootCertificates.slice(); }
-    catch (e) { _rootPems = []; }   // a build without the bundle
-  }
-  return _rootPems;
-}
+// The trust anchors Node ships (Mozilla's CA bundle), under the name Node
+// uses, so `tls.rootCertificates` works unchanged. The store is ca_store.js:
+// every session given no `ca` chains against it, as Node's does.
 
 /** Node-compat: tls.getCACertificates([type]). 'default' and 'bundled' both
  *  resolve to the shipped bundle; 'extra' and 'system' are not sourced here
@@ -83,92 +66,42 @@ function getCACertificates(type) {
 /** Node-compat: tls.setDefaultCACertificates(certs). Replaces the bundle for
  *  every subsequent connection that does not pass its own `ca`. */
 function setDefaultCACertificates(certs) {
-  if (!Array.isArray(certs)) throw new TypeError('certs must be an array');
-  _rootPems = certs.slice();
+  setRootCertificates(certs);
 }
 
 // ===================== tls.checkServerIdentity() =====================
 
 /**
- * Verifies that the peer certificate matches the hostname per RFC 6125.
- * Returns undefined on success, or an Error on mismatch.
+ * node:tls's tls.checkServerIdentity(hostname, cert): undefined when the
+ * certificate is for the host, an Error (code ERR_TLS_CERT_ALTNAME_INVALID,
+ * reason, host, cert) when it is not. The handshake's own check —
+ * session/x509.js matches_host, one implementation: the subjectAltName only
+ * (no common-name fallback, RFC 9525 §6.3), wildcards a whole leftmost
+ * label. Node still falls back to the common name of a certificate without
+ * a DNS name; this does not, as browsers do not — and as the handshake does
+ * not, which this used to disagree with.
  *
- * This is the default identity check Node uses when `rejectUnauthorized: true`
- * (the default for tls.connect). Apps can override via the `checkServerIdentity`
- * option in tls.connect to supply their own check.
- *
- * Matching rules:
- *   1. If the cert has Subject Alternative Name (SAN) entries:
- *      - For DNS SANs: compare against hostname (supports leftmost-label wildcards
- *        like *.example.com). IP address in hostname only matches IP SAN, not DNS SAN.
- *      - For IP SANs: compare against hostname as IP.
- *      - CN is IGNORED (per RFC 6125 and modern browsers).
- *   2. If no SAN entries exist, fall back to the cert's CN (common name)
- *      with the same matching rules — legacy path, deprecated by RFC 6125
- *      but still accepted by Node and common CAs.
- *
- * cert: the object returned by tlsSocket.getPeerCertificate() — must have
- *       `subject` (with `CN`) and `subjectaltname` (OpenSSL-formatted string).
+ * cert: what getPeerCertificate() returns — its `raw` DER is what is read.
  */
 function checkServerIdentity(hostname, cert) {
-  if (!cert) return new Error('checkServerIdentity: no certificate');
-  const host = String(hostname || '').toLowerCase();
-  if (!host) return new Error('checkServerIdentity: hostname required');
-
-  const isIp = /^(\d{1,3}\.){3}\d{1,3}$|^\[?[0-9a-fA-F:]+\]?$/.test(host);
-
-  // Parse subjectaltname (OpenSSL format: "DNS:a.com, DNS:*.b.com, IP Address:1.2.3.4")
-  const altnames = [];
-  if (cert.subjectaltname && typeof cert.subjectaltname === 'string') {
-    const parts = cert.subjectaltname.split(',');
-    for (let p of parts) {
-      p = p.trim();
-      if (p.startsWith('DNS:')) altnames.push({ type: 'DNS', value: p.slice(4).toLowerCase() });
-      else if (p.startsWith('IP Address:')) altnames.push({ type: 'IP', value: p.slice(11).trim() });
-      else if (p.startsWith('IP:')) altnames.push({ type: 'IP', value: p.slice(3).trim() });
-      // Other SAN types (URI, email, etc.) ignored
-    }
+  const host = String(hostname || '');
+  let err = null;
+  if (!cert) err = new Error('checkServerIdentity: no certificate to check');
+  else if (!host) err = new Error('checkServerIdentity: hostname required');
+  else {
+    // By the DER when the object has it (getPeerCertificate()'s does), or
+    // by its subjectaltname string, as Node reads it.
+    let ok = false;
+    try { ok = cert.raw ? matches_host(cert.raw, host.toLowerCase()) : matches_altnames(cert.subjectaltname, host); } catch (e) { ok = false; }
+    if (ok) return undefined;
+    err = new Error("Hostname/IP does not match certificate's altnames: Host: " + host + ". is not in the cert's altnames: " +
+                    (cert.subjectaltname || '(none)'));
   }
-
-  // DNS wildcard matcher: the wildcard must be the leftmost label only.
-  //   *.example.com  matches foo.example.com, NOT foo.bar.example.com, NOT example.com.
-  function dnsMatches(pattern, name) {
-    if (pattern === name) return true;
-    if (!pattern.startsWith('*.')) return false;
-    const dot = name.indexOf('.');
-    if (dot < 0) return false;
-    return pattern.slice(2) === name.slice(dot + 1);
-  }
-
-  // IP match: string-equal for IPv4; normalize brackets/case for IPv6.
-  function ipMatches(pattern, name) {
-    return pattern.replace(/^\[|\]$/g, '').toLowerCase()
-         === name.replace(/^\[|\]$/g, '').toLowerCase();
-  }
-
-  // RFC 6125: if SANs are present, do NOT fall back to CN.
-  if (altnames.length > 0) {
-    for (const s of altnames) {
-      if (isIp && s.type === 'IP' && ipMatches(s.value, host)) return undefined;
-      if (!isIp && s.type === 'DNS' && dnsMatches(s.value, host)) return undefined;
-    }
-    const details = altnames.map(s => `${s.type}:${s.value}`).join(', ');
-    return new Error(`Hostname/IP does not match certificate's altnames: Host: ${hostname}. is not in the cert's altnames: ${details}`);
-  }
-
-  // Legacy CN fallback (only when no SAN present)
-  const cn = cert.subject && cert.subject.CN;
-  if (cn) {
-    const cnLower = String(cn).toLowerCase();
-    if (isIp) {
-      if (ipMatches(cnLower, host)) return undefined;
-    } else {
-      if (dnsMatches(cnLower, host)) return undefined;
-    }
-    return new Error(`Hostname/IP does not match certificate's CN: Host: ${hostname}. is not cert's CN: ${cn}`);
-  }
-
-  return new Error(`Hostname/IP does not match any certificate identity`);
+  err.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+  err.reason = err.message;
+  err.host = host;
+  err.cert = cert;
+  return err;
 }
 
 // ===================== tls.connect() =====================
@@ -216,7 +149,11 @@ function connect(/* ...args */) {
 
   options = options || {};
 
-  let socket = new TLSSocket(null, {
+  // Every option goes on to the socket (and from it to the session), with
+  // what connect() settles itself over them — the lists that picked options
+  // one by one dropped a documented option time and again (pins, ech,
+  // customExtensions, recordSizeLimit …).
+  let socket = new TLSSocket(null, Object.assign({}, options, {
     isServer: false,
     servername: options.servername || host,
     rejectUnauthorized: options.rejectUnauthorized,
@@ -228,8 +165,6 @@ function connect(/* ...args */) {
     secureContext: options.secureContext,
     passphrase: options.passphrase,
     ca: options.ca,
-    useDefaultCA: options.useDefaultCA,
-    defaultCA: getRootCertificates,
     session: options.session,
     ALPNProtocols: options.ALPNProtocols,
     minVersion: options.minVersion,
@@ -241,7 +176,7 @@ function connect(/* ...args */) {
     prioritizeChaCha: options.prioritizeChaCha,
     // Forwarded on the server side but dropped here, so a client could not
     // narrow the suites it offers.
-    allowedCipherSuites: options.allowedCipherSuites || parseCiphers(options.ciphers),
+    allowedCipherSuites: checkCipherSuites(options.allowedCipherSuites, 'allowedCipherSuites') || parseCiphers(options.ciphers),
     maxRecordSize: options.maxRecordSize,
     sessionTickets: options.sessionTickets,
     ticketLifetime: options.ticketLifetime,
@@ -271,7 +206,7 @@ function connect(/* ...args */) {
     // 0-RTT: with `session` whose ticket allows it, what is written before
     // 'secureConnect' goes in the first flight ('earlyData' says if taken).
     earlyData: options.earlyData === true,
-  });
+  }));
 
   addCompatMethods(socket);
 
@@ -354,7 +289,7 @@ function Server(options, connectionListener) {
 
   // node:tls's strings, read once (node_options.js) — a bad one throws here,
   // as Node's createServer does, not on the first connection.
-  let nodeSuites = options.allowedCipherSuites || parseCiphers(options.ciphers);
+  let nodeSuites = checkCipherSuites(options.allowedCipherSuites, 'allowedCipherSuites') || parseCiphers(options.ciphers);
   let nodeGroups = options.groups || parseEcdhCurve(options.ecdhCurve);
   let nodeSigalgs = options.signatureAlgorithms || parseSigalgs(options.sigalgs);
 
@@ -409,7 +344,11 @@ function Server(options, connectionListener) {
   }
 
   function buildSocketOpts() {
-    let socketOpts = {
+    // Every server option goes on to each socket, with what the server
+    // settles over them. Not the key and certificate themselves: they are in
+    // the secure context (defaultCtx) — with several pairs, its alternates.
+    let socketOpts = Object.assign({}, options, {
+      key: undefined, cert: undefined, pfx: undefined, passphrase: undefined, SNICallback: undefined,
       isServer: true,
       ticketKeys: self._ticketKeys,
       // node:tls's sessionTimeout is how long a session stays good — a
@@ -471,7 +410,7 @@ function Server(options, connectionListener) {
       // never handed to the socket, so a client sending no server_name got
       // the callback asked with null instead of this certificate, as in Node.
       secureContext: defaultCtx || undefined,
-    };
+    });
 
     if (options.SNICallback) {
       // An explicit callback wins outright — it may do things the registry
@@ -536,7 +475,9 @@ function Server(options, connectionListener) {
     });
 
     // 'secureConnection' fires AFTER handshake completes (Node.js semantics)
+    let established = false;
     socket.on('secureConnect', function() {
+      established = true;
       if (connectionListener) connectionListener(socket);
       self.emit('secureConnection', socket);
     });
@@ -546,9 +487,12 @@ function Server(options, connectionListener) {
       self.emit('keylog', line, socket);
     });
 
-    // Surface pre-handshake errors as 'tlsClientError' (Node.js semantics)
+    // Surface pre-handshake errors as 'tlsClientError' (Node.js semantics) —
+    // those only. It read socket.secureEstablished, which no socket has: every
+    // error, after the handshake too (a reset, a bad record), was a
+    // tlsClientError as well.
     socket.on('error', function(err) {
-      if (!socket.secureEstablished) {
+      if (!established) {
         self.emit('tlsClientError', err, socket);
       }
     });

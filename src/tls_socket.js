@@ -3,26 +3,11 @@ import TLSSession from './tls_session.js';
 import crypto from 'node:crypto';
 import { Duplex } from 'node:stream';
 
-import { TLS_CIPHER_SUITES, default_cipher_suites } from './crypto.js';
-import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT, HANDSHAKE_MESSAGE_MAX } from './wire.js';
-import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, SERVER_DEFAULT_GROUPS, group_name as ecdh_group_name } from './session/ecdh.js';
-import { default_signature_schemes } from './session/signing.js';
+import { TLS_CIPHER_SUITES } from './crypto.js';
+import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT, peer_alert_error, read_peer_alert, MAX_WARNING_ALERTS, local_alert_error, version_name } from './wire.js';
+import { group_name as ecdh_group_name, dh_group_info } from './session/ecdh.js';
 import { certificateObject } from './utils.js';
-
-// The suite list a socket offers or accepts, from the defaults: ChaCha20
-// suites moved to the front when asked (prioritizeChaCha), then narrowed to an
-// allow-list. One function for the client and server paths, which each kept a
-// copy — and both copies knew ChaCha20 by two codes (0x1303, 0xCCA8), so
-// ECDHE_ECDSA_WITH_CHACHA20_POLY1305 (0xCCA9) was never moved forward. The
-// suite table says which suites are ChaCha20.
-function chooseCipherSuites(ciphers, prioritizeChaCha, allowed) {
-    if (prioritizeChaCha) {
-        let isChaCha = function (c) { return !!TLS_CIPHER_SUITES[c] && TLS_CIPHER_SUITES[c].cipher === 'CHACHA20_POLY1305'; };
-        ciphers = ciphers.filter(isChaCha).concat(ciphers.filter(function (c) { return !isChaCha(c); }));
-    }
-    if (allowed) ciphers = ciphers.filter(function (c) { return allowed.includes(c); });
-    return ciphers;
-}
+import { versionsInRange, localLists, pskOptions } from './node_options.js';
 
 import {
   getAeadAlgo,
@@ -46,8 +31,10 @@ import {
 // not for an upload — what does not fit goes after the handshake.
 const EARLY_DATA_MAX_TCP = 16384;
 
-// Handshake messages: refused on sight past HANDSHAKE_MESSAGE_MAX (wire.js) —
-// before their bytes are kept.
+// The most plaintext a record carries (RFC 8446 §5.1, RFC 5246 §6.2.1):
+// 2^14. A protected one's ciphertext may be 256 bytes over it (1.3), 2048
+// (1.2).
+const MAX_RECORD_PLAINTEXT = 16384;
 
 // legacy_record_version (TLS 1.3 uses 0x0303 in record header)
 const REC_VERSION = 0x0303;
@@ -77,17 +64,7 @@ function sigalgCodeToName(code) {
 // ==== עזרי המרה ====
 function toBuf(u8){ return Buffer.isBuffer(u8) ? u8 : Buffer.from(u8 || []); }
 
-function parseVersion(v) {
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string') {
-    let s = v.toUpperCase().replace(/[^0-9.]/g, '');
-    if (s === '1.3' || s === '13') return 0x0304;
-    if (s === '1.2' || s === '12') return 0x0303;
-    if (s === '1.1' || s === '11') return 0x0302;
-    if (s === '1.0' || s === '10') return 0x0301;
-  }
-  return null;
-}
+
 
 
 
@@ -102,6 +79,10 @@ function parseVersion(v) {
 function TLSSocket(duplex, options){
   if (!(this instanceof TLSSocket)) return new TLSSocket(duplex, options);
   options = options || {};
+
+  // The versions to offer (client) or take (server), newest first — checked
+  // here, at construction (node_options.js: one reading for TLS and DTLS).
+  const localVersions = versionsInRange(options.minVersion, options.maxVersion, false);
 
   // allowHalfOpen follows Node: false unless the caller asks otherwise, so
   // that when the peer stops writing our writable side ends too. This was
@@ -160,8 +141,11 @@ function TLSSocket(duplex, options){
     // External transport (Duplex)
     transport: (duplex && typeof duplex.write === 'function') ? duplex : null,
 
-    // Internal TLSSession
-    session: new TLSSession({
+    // Internal TLSSession: every option goes on to it (as DTLSSession hands
+    // its own on), with what this socket settles itself over them. Picked one
+    // by one, an option the list did not name never reached the session —
+    // the class of bug that dropped DTLS's (r99) and record_size_limit here.
+    session: new TLSSession(Object.assign({}, options, {
         isServer: !!options.isServer,
         servername: options.servername,
         ALPNProtocols: options.ALPNProtocols || null,
@@ -183,21 +167,12 @@ function TLSSocket(duplex, options){
         ocspRequest: typeof options.ocspRequest === 'function' ? options.ocspRequest : null,
         requestOCSP: options.requestOCSP === true,
         session: options.session || null,
-        psk: options.psk || null,
+        // External PSK, as node:tls takes it (pskOptions).
+        ...pskOptions(options, self),
         rejectUnauthorized: options.rejectUnauthorized,
         checkServerIdentity: options.checkServerIdentity,
         ALPNCallback: options.ALPNCallback || null,
         ca: options.ca || _sc('ca') || null,
-        // The platform trust store, for when no `ca` is given. compat.js
-        // hands both to this socket (defaultCA: Node's root certificates);
-        // they were never passed on, so the session had no trust anchors at
-        // all, and with none it checks only the name in the certificate. A
-        // self-signed certificate for the right name — anyone can make one —
-        // was accepted as verified: every connection this library opened
-        // (quico.request, WebSocket over wss://) was open to a
-        // man-in-the-middle, with rejectUnauthorized true.
-        useDefaultCA: options.useDefaultCA,
-        defaultCA: options.defaultCA,
         sessionTickets: options.sessionTickets,
         maxHandshakeSize: options.maxHandshakeSize || 0,
         customExtensions: options.customExtensions || [],
@@ -218,7 +193,7 @@ function TLSSocket(duplex, options){
         earlyDataContext: options.earlyDataContext,
         maxEarlyData: typeof options.maxEarlyData === 'number' ? options.maxEarlyData : EARLY_DATA_MAX_TCP,
         endOfEarlyData: true,
-    }),
+    })),
     
     // Handshake write
     handshake_write_key: null,
@@ -311,8 +286,13 @@ function TLSSocket(duplex, options){
     // header. Without this, a record carrying EE+Cert+CV+Finished (as
     // OpenSSL/BoringSSL routinely pack) fed only its FIRST message to the
     // session and silently dropped the rest.
-    hsBuf: null,
-    hsBufState: null,      // the read state hsBuf's bytes arrived under
+    // A handshake message in pieces (feedHandshakeBytes): its header so far
+    // (under 4 bytes), then its pieces and their total.
+    hsHdr: null,
+    hsParts: null,
+    hsFill: 0,
+    hsLen: 0,
+    hsBufState: null,      // the read state the pending bytes arrived under
 
     appWriteQueue: [],
 
@@ -335,11 +315,10 @@ function TLSSocket(duplex, options){
     ticketKeys: _ticketKeys,
 
     // Advanced options
-    maxRecordSize: options.maxRecordSize || 16384,
+    maxRecordSize: Math.min(options.maxRecordSize || MAX_RECORD_PLAINTEXT, MAX_RECORD_PLAINTEXT),
     sessionTickets: options.sessionTickets !== false,
     pins: options.pins || null,              // ['sha256/AAAA...'] certificate pinning
     handshakeTimeout: options.handshakeTimeout || 0, // ms, 0 = no timeout
-    allowedCipherSuites: options.allowedCipherSuites || null, // [0x1301, ...] whitelist
     certificateCallback: options.certificateCallback || null, // (info, cb) => cb(null, ctx)
     handshakeTimer: null,
 
@@ -398,16 +377,17 @@ function TLSSocket(duplex, options){
         });
     }
 
-    const MAX_RECORD_PLAINTEXT = 16384; // TLS max record size (2^14)
 
     // writeAppData / writeAppDataSingle return the transport's backpressure signal:
     //   true  → transport is ready for more writes
     //   false → transport's internal buffer is full; caller should wait for 'drain'
     //           on context.transport before writing more. Propagated up to _write so
     //           user sock.write() returns false and Node's stream flow control kicks in.
+    // The most a record of ours may carry: 2^14, or the peer's
+    // record_size_limit (RFC 8449) when negotiated.
     function writeAppData(plain){
         const total = plain.length;
-        const maxSize = context.maxRecordSize || MAX_RECORD_PLAINTEXT;
+        const maxSize = Math.min(context.maxRecordSize || MAX_RECORD_PLAINTEXT, session.recordSendLimit());
         if (total > maxSize) {
             // Fragment across multiple records. Cork+uncork lets Node batch the
             // individual writes into a single TCP send (fewer syscalls, less overhead).
@@ -547,8 +527,7 @@ function TLSSocket(duplex, options){
     // 336 of 338 bad_record_mac alerts were never sent), then the report.
     function abort(alert, message, code) {
         if (context.destroyed) return;
-        const err = new Error(message);
-        if (code) err.code = code;
+        const err = local_alert_error(alert, message, code);
         try { session.sendAlert(2, alert); } catch (e) {}
         markTransportDead();
         closeAfterAlert();
@@ -556,12 +535,21 @@ function TLSSocket(duplex, options){
     }
 
     // A record's plaintext, by its content type — the decrypted one, or a
-    // cleartext record's own. Content longer than a record carries is
-    // record_overflow (RFC 8446 §5.4, RFC 5246 §6.2.1); a handshake or alert
-    // fragment of zero bytes is not one (§5.1).
-    function dispatchContent(contentType, content, state) {
-        if (content.length > 16384) {
+    // cleartext record's own (`clear`). Content longer than a record carries
+    // is record_overflow (RFC 8446 §5.4, RFC 5246 §6.2.1); a handshake or
+    // alert fragment of zero bytes is not one (§5.1).
+    function dispatchContent(contentType, content, state, clear) {
+        if (content.length > MAX_RECORD_PLAINTEXT) {
             abort(TLS_ALERT.RECORD_OVERFLOW, 'record of ' + content.length + ' bytes of plaintext, more than 2^14', 'ERR_SSL_RECORD_OVERFLOW');
+            return;
+        }
+        // Ours, once negotiated (RFC 8449 §4: "MUST generate a fatal
+        // record_overflow alert") — on protected records: "Unprotected
+        // messages are not subject to this limit" (a TLS 1.2 Certificate in
+        // the clear, in full records, was refused). As DTLS.
+        const rsl = clear ? null : session.getRecordSizeLimit();
+        if (rsl && content.length > rsl.receive) {
+            abort(TLS_ALERT.RECORD_OVERFLOW, 'record of ' + content.length + ' bytes of plaintext, more than our record_size_limit (' + rsl.receive + ')', 'ERR_SSL_RECORD_OVERFLOW');
             return;
         }
         if (contentType === CT.APPLICATION_DATA) {
@@ -569,6 +557,13 @@ function TLSSocket(duplex, options){
             // keys; in TLS 1.2 after the peer's Finished.
             // Before that, it was handed to the reader all the same.
             if (state === 'app13' || (state === 'tls12' && peerFinished())) {
+                // In the middle of a handshake message (a post-handshake one
+                // in pieces): "MUST NOT be interleaved with other record
+                // types" (RFC 8446 §5.1).
+                if (hsPending()) {
+                    abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'application data inside a handshake message', 'ERR_SSL_UNEXPECTED_MESSAGE');
+                    return;
+                }
                 if (content.length > 0) {
                     context.consecutive_key_updates = 0;
                     context.consecutive_warning_alerts = 0;
@@ -585,7 +580,7 @@ function TLSSocket(duplex, options){
             // RFC 8446 §5.1: "Handshake messages MUST NOT span key changes"
             // — a message begun under one read state and continued under
             // another (RFC 5246's CCS has its own check, handleChangeCipherSpec).
-            if (context.hsBuf !== null && context.hsBuf.length > 0 && context.hsBufState !== state) {
+            if (hsPending() && context.hsBufState !== state) {
                 abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'a handshake message spans a key change', 'ERR_SSL_UNEXPECTED_MESSAGE');
                 return;
             }
@@ -642,7 +637,7 @@ function TLSSocket(duplex, options){
         // most 2^14 + 1 bytes (RFC 8446 §5.4: "MUST NOT exceed"). Checked on
         // the whole, not on the content once the padding is gone: 2^14 − 8
         // bytes with 9 of padding passed.
-        if (out.length > 16384 + 1) {
+        if (out.length > MAX_RECORD_PLAINTEXT + 1) {
             abort(TLS_ALERT.RECORD_OVERFLOW, 'TLSInnerPlaintext of ' + out.length + ' bytes, more than 2^14 + 1', 'ERR_SSL_RECORD_OVERFLOW');
             return true;
         }
@@ -706,7 +701,7 @@ function TLSSocket(duplex, options){
         }
         if (v13 === false && state === 'plain') {
             const ts = session.getTrafficSecrets();
-            if (ts && ts.masterSecret && (context.hsBuf === null || context.hsBuf.length === 0)) {
+            if (ts && ts.masterSecret && !hsPending()) {
                 context.tls12_read_seq = 0;
                 context.remote_ccs_seen = true;
                 return;
@@ -779,7 +774,7 @@ function TLSSocket(duplex, options){
         if (j < 0) { abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'TLSInnerPlaintext with no content type', 'ERR_SSL_UNEXPECTED_MESSAGE'); return; }
         const ct = out[j];
         if (ct === CT.APPLICATION_DATA) {
-            if (j > 16384) { abort(TLS_ALERT.RECORD_OVERFLOW, 'early data record of ' + j + ' bytes, more than 2^14', 'ERR_SSL_RECORD_OVERFLOW'); return; }
+            if (j > MAX_RECORD_PLAINTEXT) { abort(TLS_ALERT.RECORD_OVERFLOW, 'early data record of ' + j + ' bytes, more than 2^14', 'ERR_SSL_RECORD_OVERFLOW'); return; }
             context.early.recv += j;
             if (context.early.recv > earlyLimit()) { earlyTooMuch(); return; }
             if (j > 0) pushAppData(out.subarray(0, j));
@@ -909,6 +904,35 @@ function TLSSocket(duplex, options){
         context.readEnd = needed;
     }
 
+    // A handshake message, protected: in its records (handshakeFragments),
+    // each sealed and framed in one step (as writeAppDataSingle) under the
+    // keys named — TLS 1.3's (handshake or application) or 1.2's.
+    function writeProtectedHandshake(buf, v13, keyField, ivField, seqField) {
+        const algo = v13 ? (context.aeadAlgo || getAeadAlgo(session.getCipher())) : null;
+        for (const part of handshakeFragments(buf)) {
+            const rec = v13
+                ? encryptCompleteRecord13(CT.HANDSHAKE, part, context[keyField],
+                    get_nonce_into(context._nonceEncScratch, context[ivField], context[seqField]), algo, context.rec_version)
+                : encryptCompleteRecord12(part, context[keyField], context[ivField], context[seqField], CT.HANDSHAKE, context.rec_version);
+            context[seqField]++;
+            if (canWrite()) context.transport.write(rec);
+        }
+    }
+
+    // A handshake message, in records of at most 2^14 bytes (RFC 8446 §5.1,
+    // RFC 5246 §6.2.1: "MUST NOT exceed 2^14 bytes") — and of at most the
+    // peer's record_size_limit, once it is known. It went in one record
+    // however long: a chain over 16 KB was refused by OpenSSL (record
+    // overflow), and over 64 KB the record's 16-bit length wrapped — the
+    // stream after it unreadable. Post-quantum (ML-DSA) chains reach both.
+    function handshakeFragments(buf) {
+        const max = session.recordSendLimit();
+        if (buf.length <= max) return [buf];
+        let out = [];
+        for (let o = 0; o < buf.length; o += max) out.push(buf.subarray(o, Math.min(o + max, buf.length)));
+        return out;
+    }
+
     /**
      * Handshake message reassembly (RFC 8446 §5.1).
      *
@@ -921,30 +945,46 @@ function TLSSocket(duplex, options){
      *
      * Note on memory: session.message() stashes views of the fed bytes into
      * its transcript, so every message handed over must be backed by memory
-     * we never overwrite. Buffer.from()/Buffer.concat() below always copy out
-     * of the (reused) record buffers; the carve-out subarrays then alias the
-     * fresh copy, which nothing mutates.
+     * we never overwrite: each is copied out of the (reused) record buffers.
+     *
+     * Linear in the message: its pieces are kept as they come and joined
+     * once, when the last arrives. The buffer was joined anew with every
+     * record — a 128 KB ClientHello in 1-byte records cost 1.9 s of CPU and
+     * 200 MB, before anything about it was checked.
      */
+    function hsPending() { return context.hsHdr !== null || context.hsParts !== null; }
+    function hsReset() { context.hsHdr = null; context.hsParts = null; context.hsFill = 0; context.hsLen = 0; }
     function feedHandshakeBytes(bytes){
-        if (context.hsBuf === null || context.hsBuf.length === 0) {
-            context.hsBuf = Buffer.from(bytes);
-        } else {
-            context.hsBuf = Buffer.concat([context.hsBuf, Buffer.from(bytes)]);
-        }
-
-        while (context.hsBuf.length >= 4) {
-            const len = (context.hsBuf[1] << 16) | (context.hsBuf[2] << 8) | context.hsBuf[3];
-            const maxMsg = options.maxHandshakeSize > 0 ? Math.min(options.maxHandshakeSize, HANDSHAKE_MESSAGE_MAX) : HANDSHAKE_MESSAGE_MAX;
-            if (len > maxMsg) {
-                // OpenSSL's answer to an excessive message: illegal_parameter.
-                context.hsBuf = null;
-                abort(TLS_ALERT.ILLEGAL_PARAMETER, 'TLS handshake message of ' + len + ' bytes, more than ' + maxMsg);
-                return;
+        let p = 0;
+        while (p < bytes.length) {
+            if (context.hsParts === null) {
+                // The header: 4 bytes, maybe across records.
+                let have = context.hsHdr === null ? 0 : context.hsHdr.length;
+                let take = Math.min(4 - have, bytes.length - p);
+                let hdr = have === 0 ? Buffer.from(bytes.subarray(p, p + take))
+                                     : Buffer.concat([context.hsHdr, Buffer.from(bytes.subarray(p, p + take))]);
+                p += take;
+                if (hdr.length < 4) { context.hsHdr = hdr; return; }
+                context.hsHdr = null;
+                const len = (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+                const maxMsg = session.handshakeMessageLimit();
+                if (len > maxMsg) {
+                    // OpenSSL's answer to an excessive message: illegal_parameter.
+                    hsReset();
+                    abort(TLS_ALERT.ILLEGAL_PARAMETER, 'TLS handshake message of ' + len + ' bytes, more than ' + maxMsg);
+                    return;
+                }
+                context.hsParts = [hdr]; context.hsFill = 4; context.hsLen = 4 + len;
             }
-            if (context.hsBuf.length < 4 + len) break; // partial message — wait for more records
+            let take = Math.min(context.hsLen - context.hsFill, bytes.length - p);
+            if (take > 0) {
+                context.hsParts.push(Buffer.from(bytes.subarray(p, p + take)));
+                context.hsFill += take; p += take;
+            }
+            if (context.hsFill < context.hsLen) return;   // partial message — wait for more records
 
-            const msg = context.hsBuf.subarray(0, 4 + len);
-            context.hsBuf = context.hsBuf.subarray(4 + len);
+            const msg = context.hsParts.length === 1 ? context.hsParts[0] : Buffer.concat(context.hsParts, context.hsLen);
+            hsReset();
 
             session.message(msg);
 
@@ -952,11 +992,13 @@ function TLSSocket(duplex, options){
             // transport torn down). Don't keep feeding a corpse.
             if (context.destroyed) return;
 
-            // The message changed the read keys (a ServerHello, a Finished):
-            // what follows it in the same record was protected under the old
-            // ones, and is no message of the new state (RFC 8446 §5.1).
-            if (context.hsBuf.length > 0 && readState() !== context.hsBufState) {
-                context.hsBuf = null;
+            // The message changed the read keys (a ServerHello, a Finished, a
+            // KeyUpdate): what follows it in the same record was protected
+            // under the old ones, and is no message of the new state (RFC
+            // 8446 §5.1: "MUST align with a record boundary"). A KeyUpdate
+            // leaves the read state's name as it was ('app13'), so it is
+            // named here: two in one record were taken.
+            if (p < bytes.length && (readState() !== context.hsBufState || msg[0] === 24)) {
                 abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'handshake data after a key change, in the record before it', 'ERR_SSL_UNEXPECTED_MESSAGE');
                 return;
             }
@@ -1017,9 +1059,9 @@ function TLSSocket(duplex, options){
             const state = readState();
             {
                 const recVer = (rb[off + 1] << 8) | rb[off + 2];
-                const maxLen = state === 'tls12' ? 16384 + 2048
-                             : (state === 'hs13' || state === 'app13' || type === CT.APPLICATION_DATA) ? 16384 + 256
-                             : 16384;
+                const maxLen = state === 'tls12' ? MAX_RECORD_PLAINTEXT + 2048
+                             : (state === 'hs13' || state === 'app13' || type === CT.APPLICATION_DATA) ? MAX_RECORD_PLAINTEXT + 256
+                             : MAX_RECORD_PLAINTEXT;
                 if ((recVer >>> 8) !== 0x03 || type < CT.CHANGE_CIPHER_SPEC || type > CT.APPLICATION_DATA) {
                     abort((recVer >>> 8) !== 0x03 ? TLS_ALERT.PROTOCOL_VERSION : TLS_ALERT.UNEXPECTED_MESSAGE,
                         'wrong version number: not a TLS record (type 0x' + type.toString(16) + ', version 0x' + recVer.toString(16) + ')',
@@ -1082,7 +1124,7 @@ function TLSSocket(duplex, options){
                 } else if (type === CT.ALERT && state === 'hs13') {
                     // A peer that cannot yet protect its alert — a client
                     // refusing the ServerHello before it has the keys.
-                    dispatchContent(CT.ALERT, body, state);
+                    dispatchContent(CT.ALERT, body, state, true);
                 } else {
                     // A cleartext handshake record — or alert — where only
                     // protected records may be (RFC 8446 §5: unexpected_message).
@@ -1093,7 +1135,7 @@ function TLSSocket(duplex, options){
             } else {
                 // 'plain': handshake and alerts in the clear; application data
                 // has no place before the keys.
-                dispatchContent(type, body, state);
+                dispatchContent(type, body, state, true);
             }
             if (context.destroyed) return;
         }
@@ -1165,26 +1207,13 @@ function TLSSocket(duplex, options){
     // certificate") — without it the socket just closed and nothing learned
     // why: a server could not see that clients were refusing its certificate.
     function handleAlert(body) {
-        // Two bytes, a level of 1 or 2 (RFC 8446 §6, RFC 5246 §7.2). An empty
-        // or short alert was passed over and the connection left open.
-        if (!body || body.length !== 2) {
-            abort(TLS_ALERT.DECODE_ERROR, 'alert of ' + (body ? body.length : 0) + ' bytes, not 2', 'ERR_SSL_DECODE_ERROR');
-            return;
-        }
-        if (body[0] !== TLS_ALERT_LEVEL.WARNING && body[0] !== TLS_ALERT_LEVEL.FATAL) {
-            abort(TLS_ALERT.ILLEGAL_PARAMETER, 'alert of level ' + body[0], 'ERR_SSL_ILLEGAL_PARAMETER');
-            return;
-        }
-        const desc  = body[1];
-        // TLS 1.3: every alert but close_notify and user_canceled ends the
-        // connection, "regardless of the AlertLevel in the message" (§6.2).
-        const level = (negotiated13() === true && desc !== TLS_ALERT.CLOSE_NOTIFY && desc !== TLS_ALERT.USER_CANCELED)
-            ? TLS_ALERT_LEVEL.FATAL : body[0];
-        self.emit('alert', { level: body[0], description: desc });
-        // A run of warnings (BoGo: TooManyWarningAlerts) — the limit
-        // BoringSSL keeps, 4.
-        if (level === TLS_ALERT_LEVEL.WARNING && desc !== TLS_ALERT.CLOSE_NOTIFY &&
-            ++context.consecutive_warning_alerts > 4) {
+        const a = read_peer_alert(body, negotiated13() === true);
+        if (a.error) { abort(a.error.alert, a.error.message); return; }
+        const desc = a.desc;
+        const level = a.fatal ? TLS_ALERT_LEVEL.FATAL : TLS_ALERT_LEVEL.WARNING;
+        self.emit('alert', { level: a.level, description: desc });
+        // A run of warnings, nothing else between them.
+        if (!a.fatal && desc !== TLS_ALERT.CLOSE_NOTIFY && ++context.consecutive_warning_alerts > MAX_WARNING_ALERTS) {
             abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'too many consecutive warning alerts', 'ERR_SSL_UNEXPECTED_MESSAGE');
             return;
         }
@@ -1211,12 +1240,7 @@ function TLSSocket(duplex, options){
             // reacting to it finds the session already over.
             markTransportDead();
             if (desc !== TLS_ALERT.CLOSE_NOTIFY) {
-                let name = null;
-                for (const k in TLS_ALERT) if (TLS_ALERT[k] === desc) { name = k.toLowerCase(); break; }
-                const err = new Error('peer sent fatal alert: ' + (name || 'alert') + ' (' + desc + ')');
-                err.code = 'ERR_TLS_ALERT_RECEIVED';
-                err.alert = desc;
-                self.emit('error', err);
+                self.emit('error', peer_alert_error(desc));
             }
             // Nothing of ours to flush: the peer has ended the connection.
             if (context.transport && typeof context.transport.destroy === 'function') context.transport.destroy();
@@ -1318,11 +1342,8 @@ function TLSSocket(duplex, options){
         const buf = toBuf(data || []);
         coalesceFlight();
 
-        // Resolve TLS version: use cached isTls13 if set (post-secureConnect); otherwise query.
-        // During handshake we may not yet have context.isTls13 set — only after secureConnect.
-        const isTls13 = context.isTls13 !== undefined
-            ? context.isTls13
-            : session.getVersion() === 0x0304;
+        noteNegotiated();
+        const isTls13 = context.isTls13 === true;
 
         // Alert messages — encrypt based on current epoch (0=plaintext, 1=handshake, 2=app)
         if (type === 'alert') {
@@ -1494,21 +1515,8 @@ function TLSSocket(duplex, options){
                     context.handshake_write_iv = d.iv;
                 }
 
-                const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
                 try {
-                    // Fused encrypt+frame — produces a complete TLS record buffer
-                    // ready for transport.write. Same optimization as writeAppDataSingle.
-                    const rec = encryptCompleteRecord13(
-                        CT.HANDSHAKE, buf,
-                        context.handshake_write_key,
-                        get_nonce_into(context._nonceEncScratch, context.handshake_write_iv, context.handshake_write_seq),
-                        algo,
-                        context.rec_version
-                    );
-                    context.handshake_write_seq++;
-                    if (canWrite()) {
-                        context.transport.write(rec);
-                    }
+                    writeProtectedHandshake(buf, true, 'handshake_write_key', 'handshake_write_iv', 'handshake_write_seq');
                     if (session.isServer && type === 'finished' && context.early.status === 'accepted' && !context.early.srvWrite) {
                         context.early.srvWrite = true;
                         process.nextTick(flushServerEarlyWrites);
@@ -1535,14 +1543,7 @@ function TLSSocket(duplex, options){
                 }
 
                 try {
-                    const rec = encryptCompleteRecord12(
-                        buf, context.app_write_key, context.app_write_iv,
-                        context.app_write_seq, CT.HANDSHAKE, context.rec_version
-                    );
-                    context.app_write_seq++;
-                    if (canWrite()) {
-                        context.transport.write(rec);
-                    }
+                    writeProtectedHandshake(buf, false, 'app_write_key', 'app_write_iv', 'app_write_seq');
                 } catch(e) {
                     self.emit('error', e);
                 }
@@ -1560,19 +1561,8 @@ function TLSSocket(duplex, options){
                 }
             }
             if (context.app_write_key) {
-                const algo = context.aeadAlgo || getAeadAlgo(session.getCipher());
                 try {
-                    const rec = encryptCompleteRecord13(
-                        CT.HANDSHAKE, buf,
-                        context.app_write_key,
-                        get_nonce_into(context._nonceEncScratch, context.app_write_iv, context.app_write_seq),
-                        algo,
-                        context.rec_version
-                    );
-                    context.app_write_seq++;
-                    if (canWrite()) {
-                        context.transport.write(rec);
-                    }
+                    writeProtectedHandshake(buf, true, 'app_write_key', 'app_write_iv', 'app_write_seq');
                 } catch(e) {
                     self.emit('error', e);
                 }
@@ -1582,54 +1572,23 @@ function TLSSocket(duplex, options){
     });
 
 
+    // The version and AEAD, cached for the hot paths once negotiated: a
+    // client's at its ServerHello ('hello'), a server's when it answers —
+    // after its 'hello', which comes first (the application may still
+    // configure the session there): its ServerHello's 'message'. Read at
+    // 'hello' alone, a server had neither, and its 0.5-RTT data went out
+    // as TLS 1.2.
+    function noteNegotiated() {
+        if (context.isTls13 !== undefined) return;
+        const v = session.getVersion();
+        if (!v) return;
+        context.isTls13 = v === 0x0304;
+        if (session.getCipher()) context.aeadAlgo = getAeadAlgo(session.getCipher());
+    }
+
     session.on('hello', function(){
         context.rec_version = 0x0303; // legacy record version (both 1.2 and 1.3)
-
-        // Client already sent its preferences in ClientHello — don't override
-        if (!session.isServer) return;
-
-        // Parse version range from options
-        let maxVer = parseVersion(options.maxVersion) || 0x0304;
-        let minVer = parseVersion(options.minVersion) || 0x0303;
-
-        let versions = [];
-        if (maxVer >= 0x0304 && minVer <= 0x0304) versions.push(0x0304);
-        if (maxVer >= 0x0303 && minVer <= 0x0303) versions.push(0x0303);
-        if (versions.length === 0) versions.push(0x0303); // fallback
-
-        // Cipher suites based on supported versions
-        // crypto.js owns the default suite list (see default_cipher_suites).
-        let ciphers = default_cipher_suites(versions.includes(0x0304), versions.includes(0x0303));
-
-        // Signature algorithms: override or default
-        // signing.js owns the scheme list (see default_signature_schemes):
-        // the PKCS#1 set is only added when TLS 1.2 is actually in range.
-        let sigalgs = options.signatureAlgorithms
-            || default_signature_schemes();
-
-        // Groups: override or default
-        // A server's default: post-quantum hybrid first (ecdh.js). A client that
-        // offers it gets it; any other gets the classical group it asked for.
-        let groups = options.groups || SERVER_DEFAULT_GROUPS.slice();
-
-        ciphers = chooseCipherSuites(ciphers, options.prioritizeChaCha, context.allowedCipherSuites);
-
-        // ALPN from options
-        let alpns = Array.isArray(options.ALPNProtocols) ? options.ALPNProtocols : [];
-
-        session.set_context({
-            local_supported_versions: versions,
-            local_supported_alpns: alpns,
-            local_supported_groups: groups,
-            local_supported_cipher_suites: ciphers,
-            local_supported_signature_algorithms: sigalgs,
-        });
-
-        // Resolve AEAD algorithm + isTls13 flag once cipher/version are negotiated.
-        // For client, both are known after receiving ServerHello (this event fires after).
-        // For server, these are cached again at secureConnect as a fallback.
-        if (session.getCipher()) context.aeadAlgo = getAeadAlgo(session.getCipher());
-        if (session.getVersion()) context.isTls13 = (session.getVersion() === 0x0304);
+        noteNegotiated();
     });
 
     session.on('secureConnect', function(){
@@ -1637,8 +1596,8 @@ function TLSSocket(duplex, options){
         // and the flight ending in Finished must end EXACTLY there. Leftover
         // bytes in the message stream at completion are trailing garbage the
         // peer packed after its Finished — a framing violation, not padding.
-        if (context.hsBuf !== null && context.hsBuf.length > 0) {
-            context.hsBuf = null;
+        if (hsPending()) {
+            hsReset();
             // An alert this time: the peer learns why.
             abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'Trailing data after handshake completion', 'ERR_SSL_UNEXPECTED_MESSAGE');
             return;
@@ -1807,8 +1766,9 @@ function TLSSocket(duplex, options){
             context.app_write_seq = 0;
         } else if (info.direction === 'receive') {
             // A run of KeyUpdates with no data between them (BoGo:
-            // TooManyKeyUpdates) — 32, BoringSSL's limit.
-            if (++context.consecutive_key_updates > 32) {
+            // TooManyKeyUpdates) — 32, BoringSSL's limit. The peer's answers
+            // to ours aside (info.answer): those we asked for.
+            if (!info.answer && ++context.consecutive_key_updates > 32) {
                 abort(TLS_ALERT.UNEXPECTED_MESSAGE, 'too many KeyUpdates without application data', 'ERR_SSL_UNEXPECTED_MESSAGE');
                 return;
             }
@@ -1879,45 +1839,12 @@ function TLSSocket(duplex, options){
      * The other four are applied for the same reason — each is documented as a
      * per-connection option, and each was being dropped on the client side.
      */
-    function applyClientContext() {
-        if (session.isServer) return;
-
-        let update = {};
-
-        if (Array.isArray(options.ALPNProtocols) && options.ALPNProtocols.length > 0) {
-            update.local_supported_alpns = options.ALPNProtocols.map(function (p) {
-                return Buffer.isBuffer(p) ? p.toString('latin1') : String(p);
-            });
-        }
-
-        let maxVer = parseVersion(options.maxVersion);
-        let minVer = parseVersion(options.minVersion);
-        if (maxVer || minVer) {
-            maxVer = maxVer || 0x0304;
-            minVer = minVer || 0x0303;
-            let versions = [];
-            if (maxVer >= 0x0304 && minVer <= 0x0304) versions.push(0x0304);
-            if (maxVer >= 0x0303 && minVer <= 0x0303) versions.push(0x0303);
-            if (versions.length === 0) versions.push(0x0303);
-            update.local_supported_versions = versions;
-        }
-
-        if (options.groups) update.local_supported_groups = options.groups;
-        if (options.signatureAlgorithms) {
-            update.local_supported_signature_algorithms = options.signatureAlgorithms;
-        }
-
-        if (options.allowedCipherSuites || options.prioritizeChaCha) {
-            let vers = update.local_supported_versions || [0x0304, 0x0303];
-            let ciphers = default_cipher_suites(vers.indexOf(0x0304) >= 0,
-                                                vers.indexOf(0x0303) >= 0);
-            update.local_supported_cipher_suites = chooseCipherSuites(ciphers, options.prioritizeChaCha, options.allowedCipherSuites);
-        }
-
-        if (Object.keys(update).length > 0) session.set_context(update);
-    }
-
-    applyClientContext();
+    // What the options say about the lists the session negotiates with
+    // (node_options.js localLists — the versions, and suites, groups,
+    // signature schemes and ALPN where given); TLSSession fills the rest by
+    // its role. For a server this was done on its 'hello', a client's
+    // separately, each its own way.
+    session.set_context(localLists(options, localVersions));
 
     // If duplex was passed in constructor, start reading
     if (context.transport) {
@@ -2111,7 +2038,7 @@ function TLSSocket(duplex, options){
             sendCompatCCS();
         }
 
-        writeRecord(CT.HANDSHAKE, buf);
+        for (const part of handshakeFragments(buf)) writeRecord(CT.HANDSHAKE, part);
 
         // Offering early data: the compatibility CCS right after this
         // first hello (§D.4), then the early data.
@@ -2219,12 +2146,7 @@ function TLSSocket(duplex, options){
 
     /** Returns negotiated protocol string: 'TLSv1.3', 'TLSv1.2', etc. */
     self.getProtocol = function(){
-        let v = session.getVersion();
-        if (v === 0x0304) return 'TLSv1.3';
-        if (v === 0x0303) return 'TLSv1.2';
-        if (v === 0x0302) return 'TLSv1.1';
-        if (v === 0x0301) return 'TLSv1';
-        return null;
+        return version_name(session.getVersion());
     };
 
     /** Returns cipher info: { name, standardName, version }. */
@@ -2244,6 +2166,11 @@ function TLSSocket(duplex, options){
     // Encrypted Client Hello (server): null (not offered) | 'accepted' | 'rejected'.
     Object.defineProperty(self, 'echStatus', { get: function(){ return session.getEchStatus(); } });
     Object.defineProperty(self, 'echAccepted', { get: function(){ return session.getEchStatus() === 'accepted'; } });
+    // Server, split mode: ECH accepted by the client-facing server in front of this one.
+    Object.defineProperty(self, 'echBackend', { get: function(){ return session.isEchBackend(); } });
+    /** External PSK: the identity this connection was authenticated with
+     *  (a Buffer), or null. */
+    self.getPskIdentity = function(){ let id = session.getPskIdentity(); return id ? Buffer.from(id) : null; };
     Object.defineProperty(self, 'alpnProtocol', {
         get: function(){ return session.getALPN() || false; },
         enumerable: true
@@ -2377,7 +2304,7 @@ function TLSSocket(duplex, options){
      *  encrypt path chunk on this boundary; values outside the range throw. */
     self.setMaxSendFragment = function(size){
         size = Number(size);
-        if (!Number.isInteger(size) || size < 512 || size > 16384) {
+        if (!Number.isInteger(size) || size < 512 || size > MAX_RECORD_PLAINTEXT) {
             throw new RangeError('setMaxSendFragment: size must be an integer in [512, 16384]');
         }
         self._maxSendFragment = size;
@@ -2538,14 +2465,7 @@ function TLSSocket(duplex, options){
       if (session.context && session.context.isServer) return null;
       let g = session.context ? session.context.selected_group : null;
       if (g == null) return {};
-      let known = {
-        0x0017: { name: 'prime256v1', size: 256 },
-        0x0018: { name: 'secp384r1',  size: 384 },
-        0x0019: { name: 'secp521r1',  size: 521 },
-        0x001d: { name: 'x25519',     size: 253 },
-        0x001e: { name: 'x448',       size: 448 }
-      };
-      let k = known[g];
+      let k = dh_group_info(g);
       // Not an ECDH curve, so not in that table, but a group with a name.
       if (!k && ecdh_group_name(g)) return { type: 'TLSGroup', name: ecdh_group_name(g) };
       // Anything outside that table is still a negotiated TLS group — report

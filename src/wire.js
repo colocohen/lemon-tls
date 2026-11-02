@@ -42,6 +42,17 @@ function is_tls13_wire(v) {
   return v === TLS_VERSION.TLS1_3 || v === DTLS_VERSION.DTLS1_3;
 }
 
+/** A version's node:tls name ('TLSv1.3', 'DTLSv1.2' …), or null. */
+function version_name(v) {
+  switch (v) {
+    case TLS_VERSION.TLS1_3: return 'TLSv1.3';
+    case TLS_VERSION.TLS1_2: return 'TLSv1.2';
+    case DTLS_VERSION.DTLS1_3: return 'DTLSv1.3';
+    case DTLS_VERSION.DTLS1_2: return 'DTLSv1.2';
+  }
+  return null;
+}
+
 /** Companion to is_tls13_wire for the 1.2 message format. */
 function is_tls12_wire(v) {
   return v === TLS_VERSION.TLS1_2 || v === DTLS_VERSION.DTLS1_2;
@@ -56,8 +67,8 @@ const TLS_CONTENT_TYPE = {
 
 // The largest one handshake message may be, as its header declares it, or a
 // CompressedCertificate decompressed to. OpenSSL allows a ClientHello of
-// 128 KB and certificate chains up to 100 KB (max_cert_list); QUIC's CRYPTO
-// buffer in QUICO is 64 KB. The 24-bit length would allow 16 MB — memory a
+// 128 KB and certificate chains up to 100 KB (max_cert_list). The 24-bit
+// length would allow 16 MB — memory a
 // peer could make us hold, or inflate a few hundred bytes into, before it
 // has proven anything. A maxHandshakeSize below it lowers it.
 const HANDSHAKE_MESSAGE_MAX = 128 * 1024;
@@ -101,6 +112,8 @@ const TLS_MESSAGE_TYPE = {
   NEW_SESSION_TICKET: 4,
   END_OF_EARLY_DATA: 5,
   ENCRYPTED_EXTENSIONS: 8,
+  REQUEST_CONNECTION_ID: 9,     // DTLS 1.3 (RFC 9147 §5.8.4)
+  NEW_CONNECTION_ID: 10,        // DTLS 1.3 (RFC 9147 §5.8.3)
   CERTIFICATE: 11,
   SERVER_KEY_EXCHANGE: 12,
   CERTIFICATE_REQUEST: 13,
@@ -138,6 +151,7 @@ const TLS_EXT = {
   PADDING: 21,
   EXTENDED_MASTER_SECRET: 23,
   COMPRESS_CERTIFICATE: 27,     // RFC 8879
+  RECORD_SIZE_LIMIT: 28,        // RFC 8449
   SESSION_TICKET: 35,
   PRE_SHARED_KEY: 41,
   EARLY_DATA: 42,
@@ -149,6 +163,7 @@ const TLS_EXT = {
   POST_HANDSHAKE_AUTH: 49,
   SIGNATURE_ALGORITHMS_CERT: 50,
   KEY_SHARE: 51,
+  CONNECTION_ID: 54,            // RFC 9146 (DTLS)
   RENEGOTIATION_INFO: 0xFF01
 };
 
@@ -1252,7 +1267,17 @@ function parse_hello(params) {
       }
     }
 
+    // cipher_suites<2..2^16-2> (RFC 8446 §4.1.2, RFC 5246 §7.4.1.2): never
+    // empty, whole suites only, inside the message. An empty list was taken
+    // (and the server, with nothing to choose, sent nothing); an odd length
+    // read a byte past it.
+    // (params.lenient: a hello read to be fingerprinted — JA4 has a form
+    // for an empty list — not to be answered.)
     let csLen; [csLen, off] = r_u16(body, off);
+    if (off + csLen > body.length || (!params.lenient && (csLen < 2 || (csLen & 1) !== 0))) {
+      throw parseError('ClientHello cipher_suites: length ' + csLen);
+    }
+    if (params.lenient) csLen -= csLen & 1;
     let csEnd = off + csLen;
     while (off < csEnd) {
       let cs; [cs, off] = r_u16(body, off);
@@ -1889,31 +1914,10 @@ function parse_server_key_exchange(body) {
     return { kex: 'ECDHE', group: group, public_key: pub, sig_alg: sig_alg, signature: sig };
   }
 
-  // Basic DHE: dh_p<2>, dh_g<2>, dh_Ys<2>, then SignatureAndHashAlgorithm + signature<2>
-  let pLen;
-  [pLen, off] = r_u16(body, off);
-  let dh_p;
-  [dh_p, off] = r_bytes(body, off, pLen);
-
-  let gLen;
-  [gLen, off] = r_u16(body, off);
-  let dh_g;
-  [dh_g, off] = r_bytes(body, off, gLen);
-
-  let yLen;
-  [yLen, off] = r_u16(body, off);
-  let dh_Ys;
-  [dh_Ys, off] = r_bytes(body, off, yLen);
-
-  let sig_alg2;
-  [sig_alg2, off] = r_u16(body, off);
-
-  let s2len;
-  [s2len, off] = r_u16(body, off);
-  let sig2;
-  [sig2, off] = r_bytes(body, off, s2len);
-
-  return { kex: 'DHE', dh_p: dh_p, dh_g: dh_g, dh_Ys: dh_Ys, sig_alg: sig_alg2, signature: sig2 };
+  // Not a named curve (RFC 8422 §5.4: the only ECCurveType a TLS 1.2 ECDHE
+  // ServerKeyExchange may carry). DHE parameters were read here once — from
+  // the wrong offset — for suites this library no longer has.
+  throw parseError('ServerKeyExchange: ECCurveType ' + curve_type + ', not named_curve', TLS_ALERT.ILLEGAL_PARAMETER);
 }
 
 /* ============================== TLS 1.2 ClientKeyExchange ============================== */
@@ -2049,15 +2053,22 @@ function build_dtls_handshake(tls_msg, msg_seq, frag_offset, frag_length) {
   if (frag_offset === undefined) frag_offset = 0;
   if (frag_length === undefined) frag_length = body.length;
 
-  let frag_body = body.subarray(frag_offset, frag_offset + frag_length);
+  return build_dtls_fragment(type, total_length, msg_seq, frag_offset, body.subarray(frag_offset, frag_offset + frag_length));
+}
 
+/**
+ * One fragment of a DTLS handshake message (RFC 6347 §4.2.2, RFC 9147
+ * §5.2): its 12-byte header — type, the whole message's length, message_seq,
+ * the fragment's offset and length — and its bytes.
+ */
+function build_dtls_fragment(type, total_length, msg_seq, frag_offset, frag_body) {
   let out = new Uint8Array(12 + frag_body.length);
   let off = 0;
   off = w_u8(out, off, type);
   off = w_u24(out, off, total_length);
   off = w_u16(out, off, msg_seq);
   off = w_u24(out, off, frag_offset);
-  off = w_u24(out, off, frag_length);
+  off = w_u24(out, off, frag_body.length);
   off = w_bytes(out, off, frag_body);
   return out;
 }
@@ -2113,12 +2124,82 @@ function parse_hello_verify_request(body) {
 
 
 /* ================================ Exports ================================= */
+
+// Warning alerts taken in a row, nothing else between: BoringSSL's limit
+// (BoGo TooManyWarningAlerts).
+const MAX_WARNING_ALERTS = 4;
+
+/**
+ * What an alert record from the peer says — one reading for TLS over TCP and
+ * DTLS, which each had their own and disagreed (an empty alert, a level that
+ * is neither, user_canceled at the fatal level). Two bytes, a level of 1 or
+ * 2 (RFC 8446 §6, RFC 5246 §7.2); an empty one is a zero-length fragment
+ * (§5.1 forbids them for alerts): unexpected_message; another length,
+ * decode_error; another level, illegal_parameter — each as
+ * { error: { alert, message } }. Otherwise { level, desc, fatal }:
+ * in TLS 1.3 every alert but close_notify and user_canceled is fatal,
+ * "regardless of the AlertLevel" (§6.2, §6); before it, the level says.
+ */
+function read_peer_alert(body, is13) {
+  if (!body || body.length === 0) return { error: { alert: TLS_ALERT.UNEXPECTED_MESSAGE, message: 'empty alert record' } };
+  if (body.length !== 2) return { error: { alert: TLS_ALERT.DECODE_ERROR, message: 'alert of ' + body.length + ' bytes, not 2' } };
+  let level = body[0], desc = body[1];
+  if (level !== TLS_ALERT_LEVEL.WARNING && level !== TLS_ALERT_LEVEL.FATAL) {
+    return { error: { alert: TLS_ALERT.ILLEGAL_PARAMETER, message: 'alert of level ' + level } };
+  }
+  let fatal = is13 ? (desc !== TLS_ALERT.CLOSE_NOTIFY && desc !== TLS_ALERT.USER_CANCELED) : level === TLS_ALERT_LEVEL.FATAL;
+  return { level: level, desc: desc, fatal: fatal };
+}
+
+// An alert's name, lowercase as the RFC writes it ('record_overflow'), or null.
+function alert_name(desc) {
+  for (const k in TLS_ALERT) if (TLS_ALERT[k] === desc) return k.toLowerCase();
+  return null;
+}
+
+/**
+ * A fatal alert of OURS, as every layer reports it — TLSSession, TLSSocket
+ * and DTLSSession alike, which gave a bare Error, one with a code, and one
+ * with neither: the message, err.alert (what we sent), err.code —
+ * ERR_SSL_<ALERT> (OpenSSL's reason codes as node:tls has them:
+ * ERR_SSL_RECORD_OVERFLOW, ERR_SSL_UNEXPECTED_MESSAGE …) unless a more
+ * precise one is given (ERR_TLS_CERT_PIN_MISMATCH). An error that already
+ * has them keeps its own.
+ */
+function local_alert_error(desc, message, code) {
+  const err = message instanceof Error ? message : new Error(message);
+  if (err.alert === undefined) err.alert = desc;
+  if (!err.code) err.code = code || ('ERR_SSL_' + (alert_name(desc) || 'alert_' + desc).toUpperCase());
+  return err;
+}
+
+/**
+ * A fatal alert the peer sent, as the error both transports report it — TLS
+ * over TCP and DTLS alike: 'peer sent fatal alert: <name> (<code>)',
+ * code ERR_TLS_ALERT_RECEIVED, err.alert the code. DTLS reported
+ * 'DTLS alert: level=2 desc=121', no code, no name.
+ */
+function peer_alert_error(desc) {
+  const err = new Error('peer sent fatal alert: ' + (alert_name(desc) || 'alert') + ' (' + desc + ')');
+  err.code = 'ERR_TLS_ALERT_RECEIVED';
+  err.alert = desc;
+  return err;
+}
+
 export {
+  build_dtls_fragment,
+  parseError,
+  local_alert_error,
+  alert_name,
+  peer_alert_error,
+  read_peer_alert,
+  MAX_WARNING_ALERTS,
   HANDSHAKE_MESSAGE_MAX,
   TLS_VERSION,
   DTLS_VERSION,
   is_tls13_wire,
   is_tls12_wire,
+  version_name,
   TLS_CONTENT_TYPE,
   TLS_ALERT_LEVEL,
   TLS_ALERT,

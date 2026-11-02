@@ -280,19 +280,29 @@ function prepare_ech_server_uncached(option) {
 
 // ============================================================
 //  ClientHello bytes (RFC 8446 §4.1.2), without the handshake header
+//
+//  ECH is TLS 1.3's and DTLS 1.3's (RFC 9849 §1). Over DTLS the hello is
+//  DTLS's (RFC 9147 §5.3): a legacy_cookie<0..255> after the session id —
+//  the encoded inner hello (§5.1) and the outer one the AAD is made of
+//  (§5.2) the same. `dtls` says which, everywhere below: read as a TLS one,
+//  every field past the session id was a byte off ("trailing bytes after
+//  ClientHello" for every DTLS hello with ECH).
 // ============================================================
 
 /**
  * The fields of a ClientHello body with their positions — what rebuilding
  * the inner hello and zeroing the outer payload need, and what a parsed
- * message object no longer has.
+ * message object no longer has. `afterSid` is past the session id, `mid`
+ * (cipher_suites onwards) past the cookie too.
  */
-function scan_client_hello(body) {
+function scan_client_hello(body, dtls) {
   var r = new Reader(body);
   r.u16();                                            // legacy_version
   var random = r.bytes(32);
   var sidStart = r.o; var session_id = r.vec8();
   var afterSid = r.o;
+  var cookie = dtls ? r.vec8() : null;                // DTLS legacy_cookie
+  var mid = r.o;
   r.vec16();                                          // cipher_suites
   r.vec8();                                           // legacy_compression_methods
   var extsStart = r.o;
@@ -306,7 +316,7 @@ function scan_client_hello(body) {
       exts.push({ type: type, start: base + at, end: base + er.o, data: data, dataStart: base + at + 4 });
     }
   }
-  return { random: random, session_id: session_id, sidStart: sidStart, afterSid: afterSid, extsStart: extsStart, exts: exts };
+  return { random: random, session_id: session_id, sidStart: sidStart, afterSid: afterSid, cookie: cookie, mid: mid, extsStart: extsStart, exts: exts };
 }
 
 function find_ext(scan, type) {
@@ -347,12 +357,13 @@ function outer_aad(body, ext, ech) {
  * outer extensions it names. In linear time, as §5.1 asks: one forward walk
  * over the outer extensions for the whole reference list.
  */
-function decode_inner(encoded, outerBody, outerScan) {
+function decode_inner(encoded, outerBody, outerScan, dtls) {
   var r = new Reader(encoded);
   r.u16(); r.bytes(32);
   var sidLen = r.u8();
   if (sidLen !== 0) throw eccError('EncodedClientHelloInner session id not empty');
   var afterSid = r.o;
+  if (dtls) r.vec8();                                 // its legacy_cookie, kept as it is
   r.vec16(); r.vec8();
   var extsStart = r.o;
   var extBlock = r.vec16();
@@ -384,7 +395,7 @@ function decode_inner(encoded, outerBody, outerScan) {
   var newExts = concat(parts);
   var sid = outerScan.session_id;
   var head = encoded.subarray(0, afterSid - 1);         // legacy_version + random
-  var mid = encoded.subarray(afterSid, extsStart);      // cipher_suites + compression
+  var mid = encoded.subarray(afterSid, extsStart);      // (DTLS: cookie +) cipher_suites + compression
   var extLen = new Uint8Array(2); put16(extLen, 0, newExts.length);
   return concat([head, new Uint8Array([sid.length]), sid, mid, extLen, newExts]);
 }
@@ -401,20 +412,23 @@ function wrap_client_hello(body) {
  * §7.1: the inner hello must carry the inner ECH extension and offer
  * nothing below TLS 1.3.
  */
-function check_inner(innerBody) {
-  var scan = scan_client_hello(innerBody);
+function check_inner(innerBody, dtls) {
+  var scan = scan_client_hello(innerBody, dtls);
   var e = find_ext(scan, EXT_ECH);
   if (!e || parse_ech_ext(e.data).type !== 1) throw eccError('ClientHelloInner without the inner encrypted_client_hello extension');
   var sv = find_ext(scan, EXT_SUPPORTED_VERSIONS);
-  if (!sv) throw eccError('ClientHelloInner offers TLS 1.2');
+  if (!sv) throw eccError('ClientHelloInner offers ' + (dtls ? 'DTLS' : 'TLS') + ' 1.2');
   var r = new Reader(sv.data), list = r.vec8();
   if (list.length === 0 || list.length % 2) throw eccError('ClientHelloInner supported_versions malformed', ALERT_DECODE_ERROR);
   for (var i = 0; i < list.length; i += 2) {
     var v = u16(list, i);
     // 0x?a?a is GREASE (RFC 8701). TLS 1.3 and up: 0x0304 to 0xfdff — the
-    // 0xfexx codes are DTLS, never a TLS version.
+    // 0xfexx codes are DTLS, never a TLS version. DTLS 1.3 and up, over
+    // DTLS: 0xfefc and down (DTLS versions count downwards), never 1.2
+    // (0xfefd) or 1.0 (0xfeff).
     if ((v & 0x0f0f) === 0x0a0a) continue;
-    if (v < 0x0304 || v >= 0xfe00) throw eccError('ClientHelloInner offers a version other than TLS 1.3 and up (0x' + v.toString(16) + ')');
+    var ok = dtls ? (v >= 0xfe00 && v <= 0xfefc) : (v >= 0x0304 && v < 0xfe00);
+    if (!ok) throw eccError('ClientHelloInner offers a version other than ' + (dtls ? 'DTLS' : 'TLS') + ' 1.3 and up (0x' + v.toString(16) + ')');
   }
   return scan;
 }
@@ -470,9 +484,9 @@ function backend_client_hello(state, extensions, random, isSecond) {
  * `state.status` is 'rejected' and retry_configs are due). Throws, with
  * `.alertDesc`, where §5.1 / §7.1 / §7.1.1 require the connection to end.
  */
-function server_process_client_hello(server, state, data, isSecond) {
+function server_process_client_hello(server, state, data, isSecond, dtls) {
   var body = data.subarray(4);
-  var scan = scan_client_hello(body);
+  var scan = scan_client_hello(body, dtls);
   var ext = find_ext(scan, EXT_ECH);
 
   if (isSecond) {
@@ -485,8 +499,8 @@ function server_process_client_hello(server, state, data, isSecond) {
     }
     var pt2 = state.context.open(outer_aad(body, ext, ech2), ech2.payload);
     if (!pt2) throw eccError('second ClientHelloInner does not decrypt', ALERT_DECRYPT_ERROR);
-    var inner2 = decode_inner(pt2, body, scan);
-    var scan2 = check_inner(inner2);
+    var inner2 = decode_inner(pt2, body, scan, dtls);
+    var scan2 = check_inner(inner2, dtls);
     // RFC 8446 §4.1.2: the second hello repeats the first one's random; the
     // ServerHello's confirmation (§7.2) is computed over it.
     same_inner_random(state, scan2.random);
@@ -520,8 +534,8 @@ function server_process_client_hello(server, state, data, isSecond) {
     if (!pt) continue;
 
     // Decrypted: from here a malformed inner hello is fatal (§5.1).
-    var inner = decode_inner(pt, body, scan);
-    var innerScan = check_inner(inner);
+    var inner = decode_inner(pt, body, scan, dtls);
+    var innerScan = check_inner(inner, dtls);
     state.status = 'accepted';
     state.context = ctx;
     state.kdf_id = ech.kdf_id; state.aead_id = ech.aead_id; state.config_id = ech.config_id;
@@ -628,9 +642,9 @@ function client_outer_ext_data(kdf_id, aead_id, config_id, enc, payloadLen) {
  * little of the name: the server_name padded to maximum_name_length, and
  * the whole to a multiple of 32.
  */
-function client_encode_inner(innerMsg, compressed, maxNameLength, sniLength) {
+function client_encode_inner(innerMsg, compressed, maxNameLength, sniLength, dtls) {
   var body = innerMsg.subarray(4);
-  var scan = scan_client_hello(body);
+  var scan = scan_client_hello(body, dtls);
   var parts = [], placed = false;
   for (var i = 0; i < scan.exts.length; i++) {
     var e = scan.exts[i];
@@ -648,7 +662,7 @@ function client_encode_inner(innerMsg, compressed, maxNameLength, sniLength) {
   }
   var exts = concat(parts);
   var head = body.subarray(0, scan.sidStart);                  // legacy_version + random
-  var mid = body.subarray(scan.afterSid, scan.extsStart);      // cipher_suites + compression
+  var mid = body.subarray(scan.afterSid, scan.extsStart);      // (DTLS: cookie +) cipher_suites + compression
   var extLen = new Uint8Array(2); put16(extLen, 0, exts.length);
   var encoded = concat([head, new Uint8Array([0]), mid, extLen, exts]);
   var pad = sniLength != null ? Math.max(0, maxNameLength - sniLength) : 9 + maxNameLength;
@@ -656,14 +670,20 @@ function client_encode_inner(innerMsg, compressed, maxNameLength, sniLength) {
   return concat([encoded, new Uint8Array(pad)]);
 }
 
+/** A ClientHello's (a handshake message) encrypted_client_hello extension data, as it went. */
+function client_hello_ech_ext(msg, dtls) {
+  var e = find_ext(scan_client_hello(msg.subarray(4), dtls), EXT_ECH);
+  return e ? new Uint8Array(e.data) : null;
+}
+
 /**
  * ClientHelloOuter (a handshake message, its ECH payload zero) → the same
  * with the payload: `encoded` sealed with AAD = the outer hello itself, as
  * it is now (§5.2).
  */
-function client_seal_outer(outerMsg, hpkeContext, encoded) {
+function client_seal_outer(outerMsg, hpkeContext, encoded, dtls) {
   var body = outerMsg.subarray(4);
-  var scan = scan_client_hello(body);
+  var scan = scan_client_hello(body, dtls);
   var ext = find_ext(scan, EXT_ECH);
   var ech = parse_ech_ext(ext.data);
   var ct = hpkeContext.seal(new Uint8Array(body), encoded);
@@ -738,6 +758,7 @@ export {
   client_outer_ext_data,
   client_encode_inner,
   client_seal_outer,
+  client_hello_ech_ext,
   grease_ech_state,
   grease_ech_ext_data,
   hrr_ech_offset,

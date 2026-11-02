@@ -22,7 +22,9 @@ import dns from 'node:dns';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import DTLSSession from './dtls_session.js';
+import DTLSSession, { SERVER_CID_LEN } from './dtls_session.js';
+import { datagramCid } from './record.js';
+import { localLists, versionsInRange, pskOptions } from './node_options.js';
 
 
 // ============================================================
@@ -33,6 +35,10 @@ import DTLSSession from './dtls_session.js';
 // by one of the family its host name resolves to, and closes it when done.
 const kOwnsTransport = Symbol('ownsTransport');
 const kTransport = Symbol('transport');
+// The server's: told when one of its connections takes a new address
+// (setRemoteAddress), to find it there.
+const kAddressMoved = Symbol('addressMoved');
+
 
 // What a DTLSSocket — or the server, for each of its connections — sets
 // itself. Every other option goes on to the DTLSSession as the caller gave
@@ -87,7 +93,8 @@ function DTLSSocket(udpSocket, options) {
     });
   }
 
-  let session = new DTLSSession(sessionOptions(options, { isServer: !!options.isServer }));
+  // External PSK as node:tls takes it, as TLSSocket does (pskOptions).
+  let session = new DTLSSession(sessionOptions(options, Object.assign({ isServer: !!options.isServer }, pskOptions(options, self))));
 
   // Wire session → UDP
   // Datagrams handed to the UDP socket and not yet sent: dgram's send() is
@@ -145,9 +152,22 @@ function DTLSSocket(udpSocket, options) {
     ev.emit('clienthello', data, message);
   });
 
+  // An alert received (the peer's warnings among them), and the Connection
+  // IDs agreed or moved: as DTLSSession reports them.
+  session.on('alert', function(a) { ev.emit('alert', a); });
+  session.on('connectionId', function(ids) { ev.emit('connectionId', ids); });
+
   /**
    * Feed an incoming UDP datagram (filtered by remote address/port).
    * Called by the UDP socket's message handler or by DTLSServer.
+   *
+   * With Connection IDs agreed, a datagram of this connection may come from
+   * another address (a NAT that rebound the peer's port; the server finds
+   * the connection by its CID). It is taken, and when it holds the newest
+   * authenticated record yet the new address is reported:
+   * 'remoteAddressChange' { address, port }. It is not taken over by itself
+   * — RFC 9146 §6 (and RFC 9147 §9) forbid it without a way of knowing the
+   * peer is there; an application that has one calls setRemoteAddress.
    */
   function feedDatagram(data, rinfo) {
     // Update remote address on first datagram (server side)
@@ -156,7 +176,20 @@ function DTLSSocket(udpSocket, options) {
       remotePort = rinfo.port;
     }
 
-    session.feedDatagram(data);
+    let newest = session.feedDatagram(data);
+    if (newest && rinfo && (rinfo.address !== remoteAddress || rinfo.port !== remotePort) && session.getConnectionIds()) {
+      ev.emit('remoteAddressChange', { address: rinfo.address, port: rinfo.port });
+    }
+  }
+
+  /** Send to another address from now on — the peer's new one, as the
+   *  application knows it (see feedDatagram). */
+  function setRemoteAddress(address, port) {
+    if (net.isIP(address) === 0 || !Number.isInteger(port) || port <= 0 || port > 65535) throw new TypeError('setRemoteAddress: an IP address and a port');
+    let previous = { address: remoteAddress, port: remotePort };
+    remoteAddress = address;
+    remotePort = port;
+    if (typeof options[kAddressMoved] === 'function') options[kAddressMoved](previous, { address: address, port: port });
   }
 
   // A client reads its UDP socket itself (a server's connections are fed by
@@ -184,6 +217,7 @@ function DTLSSocket(udpSocket, options) {
   self.send = function(data) { session.send(data); };
   self.close = function() { session.close(); };
   self.feedDatagram = feedDatagram;
+  self.setRemoteAddress = setRemoteAddress;
 
   self.on = function(name, fn) { ev.on(name, fn); };
   self.off = function(name, fn) { ev.off(name, fn); };
@@ -196,6 +230,11 @@ function DTLSSocket(udpSocket, options) {
 
   self.getNegotiationResult = function() { return session.getNegotiationResult(); };
   self.getALPN = function() { return session.getALPN(); };
+  self.getEchStatus = function() { return session.getEchStatus(); };
+  self.isEchBackend = function() { return session.isEchBackend(); };
+  /** External PSK: the identity (a Buffer, as TLSSocket's), or null. */
+  self.getPskIdentity = function() { let id = session.getPskIdentity(); return id ? Buffer.from(id) : null; };
+  self.getConnectionIds = function() { return session.getConnectionIds(); };
   self.getPeerCertificate = function() { return session.getPeerCertificate(); };
 
   /** TLS fingerprints, { hash, raw } or null (see TLSSession): JA4 and JA5
@@ -270,6 +309,15 @@ function createDTLSServer(options, connectionListener) {
     options = {};
   }
   options = options || {};
+  // Checked here, once, as createServer does: not on each client's hello.
+  localLists(options, versionsInRange(options.minVersion, options.maxVersion, true));
+  // Connection IDs: one per connection, drawn here — a single one given for
+  // the server would be every connection's, and find none of them.
+  if (options.connectionId !== undefined && options.connectionId !== null && typeof options.connectionId !== 'boolean') {
+    throw new TypeError('createDTLSServer: connectionId is true or false (each connection is given its own)');
+  }
+  let cidOn = options.connectionId === true;
+  let byCid = {};       // CID (hex) → DTLSSocket
 
   let ev = new EventEmitter();
   let udpSocket = null;
@@ -288,16 +336,34 @@ function createDTLSServer(options, connectionListener) {
   }
 
   function newConnection(key, rinfo) {
+    let cid = null;
+    if (cidOn) {
+      do { cid = crypto.randomBytes(SERVER_CID_LEN); } while (byCid[cid.toString('hex')]);
+    }
     let socket = new DTLSSocket(udpSocket, sessionOptions(options, {
       isServer: true,
       remoteAddress: rinfo.address,
       remotePort: rinfo.port,
       ticketKeys: ticketKeys,
+      connectionId: cid || false,
+      // Moved (setRemoteAddress): found at its new address from now on —
+      // unless another connection holds it; its own records, with the CID,
+      // find it anyway (onDatagram), and the other is not ended on the
+      // application's word.
+      [kAddressMoved]: function(from, to) {
+        let next = to.address + ':' + to.port;
+        if (connections[key] === socket) delete connections[key];
+        if (replacing[key] === socket) delete replacing[key];
+        key = next;
+        if (!connections[key]) connections[key] = socket;
+      },
     }));
+    if (cid) byCid[cid.toString('hex')] = socket;
 
     socket.on('close', function() {
       if (connections[key] === socket) delete connections[key];
       if (replacing[key] === socket) delete replacing[key];
+      if (cid && byCid[cid.toString('hex')] === socket) delete byCid[cid.toString('hex')];
     });
 
     socket.on('connect', function() {
@@ -337,9 +403,16 @@ function createDTLSServer(options, connectionListener) {
   let replacing = {};   // 'addr:port' → the DTLSSocket of a new handshake there
 
   function onDatagram(msg, rinfo) {
+    // A record with one of our CIDs is that connection's, whatever address
+    // it comes from — the peer moved, maybe onto an address another
+    // connection still holds (a NAT that gave the port on).
+    if (cidOn) {
+      let c = datagramCid(msg, SERVER_CID_LEN);
+      let owner = c ? byCid[Buffer.from(c).toString('hex')] : null;
+      if (owner) { owner.feedDatagram(msg, rinfo); return; }
+    }
     let key = rinfo.address + ':' + rinfo.port;
     let conn = connections[key];
-
     if (!conn) {
       conn = connections[key] = newConnection(key, rinfo);
       conn.feedDatagram(msg, rinfo);
@@ -390,6 +463,7 @@ function createDTLSServer(options, connectionListener) {
       .concat(Object.keys(replacing).map(function(k) { return replacing[k]; }));
     connections = {};
     replacing = {};
+    byCid = {};
     let sock = udpSocket;
     udpSocket = null;
     for (let i = 0; i < open.length; i++) open[i].close();

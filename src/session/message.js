@@ -198,7 +198,7 @@ function parse_tls_message(data, negotiatedVersion, opts) {
 
   if (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO || message.type == wire.TLS_MESSAGE_TYPE.SERVER_HELLO) {
     let kind = (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_HELLO) ? 'client' : 'server';
-    let hello = wire.parse_hello({ kind: kind, body: message.body, dtls: opts ? opts.dtls : undefined });
+    let hello = wire.parse_hello({ kind: kind, body: message.body, dtls: opts ? opts.dtls : undefined, lenient: !!(opts && opts.lenient) });
     out = normalize_hello(hello, kind);
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.SERVER_KEY_EXCHANGE) {
@@ -206,6 +206,12 @@ function parse_tls_message(data, negotiatedVersion, opts) {
     out.type = 'server_key_exchange';
 
   } else if (message.type == wire.TLS_MESSAGE_TYPE.CLIENT_KEY_EXCHANGE) {
+    // ECDHE (RFC 8422 §5.7): ClientECDiffieHellmanPublic, the point as
+    // opaque <1..2^8-1>. Its length byte was skipped, never read: a wrong
+    // one was taken — decode_error.
+    if (message.body.length < 2 || message.body[0] !== message.body.length - 1) {
+      throw wire.parseError('ClientKeyExchange: point length ' + (message.body.length ? message.body[0] : 'missing') + ' for ' + Math.max(0, message.body.length - 1) + ' bytes');
+    }
     out.body = message.body;
     out.public_key = message.body.slice(1);
     out.type = 'client_key_exchange';
@@ -255,7 +261,7 @@ function parse_tls_message(data, negotiatedVersion, opts) {
     // 1.2 does. Testing only for 0x0303 sent a DTLS 1.2 ticket through the
     // TLS 1.3 parser — the same class of bug as the Certificate encoding one:
     // a version comparison that does not know DTLS exists.
-    if (negotiatedVersion === 0x0303 || negotiatedVersion === 0xFEFD) {
+    if (wire.is_tls12_wire(negotiatedVersion)) {
       out = wire.parse_new_session_ticket_tls12(message.body);
     } else {
       out = wire.parse_new_session_ticket(message.body);

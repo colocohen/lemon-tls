@@ -23,7 +23,7 @@
 
 import crypto from 'node:crypto';
 import { hkdf_extract, hkdf_expand } from '../crypto.js';
-import { x25519_get_public_key, x25519_get_shared_secret } from './ecdh.js';
+import { CURVES } from './ecdh.js';
 
 var MODE_BASE = 0x00, MODE_PSK = 0x01, MODE_AUTH = 0x02, MODE_AUTH_PSK = 0x03;
 
@@ -65,61 +65,29 @@ function labeled_expand(hash, suite_id, prk, label, info, L) {
 //  KEMs: DH groups (RFC 9180 §4.1, §7.1)
 // ============================================================
 
-// The two Montgomery curves, through node:crypto's raw-key DER wrapping.
-var X448_PKCS8 = Buffer.from('3046020100300506032b656f043a0438', 'hex');
-var X448_SPKI  = Buffer.from('3042300506032b656f033900', 'hex');
-
-function x448_public_key(sk) {
-  var priv = crypto.createPrivateKey({ key: Buffer.concat([X448_PKCS8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
-  return new Uint8Array(crypto.createPublicKey(priv).export({ type: 'spki', format: 'der' }).subarray(X448_SPKI.length));
-}
-function x448_shared(sk, pk) {
-  var priv = crypto.createPrivateKey({ key: Buffer.concat([X448_PKCS8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
-  var pub  = crypto.createPublicKey({ key: Buffer.concat([X448_SPKI, Buffer.from(pk)]), format: 'der', type: 'spki' });
-  var dh = new Uint8Array(crypto.diffieHellman({ privateKey: priv, publicKey: pub }));
-  // RFC 9180 §7.1.4 / RFC 7748 §6.2: an all-zero result means a low-order
-  // public key — the sender would know the "secret". Constant time.
-  var acc = 0;
-  for (var i = 0; i < dh.length; i++) acc |= dh[i];
-  if (acc === 0) throw new Error('HPKE: X448 shared secret is all zero (invalid public key)');
-  return dh;
-}
-
-// The NIST curves: a private key is a scalar below the group order;
-// DeriveKeyPair draws candidates until one is (§7.1.3).
+// The curves are ecdh.js's — TLS's key exchange uses the same ones. The
+// NIST curves' private keys are scalars below the group order, which
+// DeriveKeyPair draws candidates for (§7.1.3).
 function nist(curve, order, bitmask) {
-  return {
-    order: order,
-    bitmask: bitmask,
-    public_key: function (sk) {
-      var e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
-      return new Uint8Array(e.getPublicKey(null, 'uncompressed'));
-    },
-    // computeSecret validates the peer point (on the curve, not infinity)
-    // and gives the x-coordinate: the DH value of §7.1.
-    shared: function (sk, pk) {
-      var e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
-      return new Uint8Array(e.computeSecret(Buffer.from(pk)));
-    }
-  };
+  return { order: order, bitmask: bitmask, public_key: curve.public_key, shared: curve.shared };
 }
 
 var KEMS = {};
-KEMS[0x0010] = Object.assign(nist('prime256v1',
+KEMS[0x0010] = Object.assign(nist(CURVES.p256,
   hexToBig('ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551'), 0xff),
   { id: 0x0010, name: 'DHKEM(P-256, HKDF-SHA256)', hash: 'sha256', Nsecret: 32, Nenc: 65, Npk: 65, Nsk: 32 });
-KEMS[0x0011] = Object.assign(nist('secp384r1',
+KEMS[0x0011] = Object.assign(nist(CURVES.p384,
   hexToBig('ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973'), 0xff),
   { id: 0x0011, name: 'DHKEM(P-384, HKDF-SHA384)', hash: 'sha384', Nsecret: 48, Nenc: 97, Npk: 97, Nsk: 48 });
-KEMS[0x0012] = Object.assign(nist('secp521r1',
+KEMS[0x0012] = Object.assign(nist(CURVES.p521,
   hexToBig('01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409'), 0x01),
   { id: 0x0012, name: 'DHKEM(P-521, HKDF-SHA512)', hash: 'sha512', Nsecret: 64, Nenc: 133, Npk: 133, Nsk: 66 });
 KEMS[0x0020] = { id: 0x0020, name: 'DHKEM(X25519, HKDF-SHA256)', hash: 'sha256', Nsecret: 32, Nenc: 32, Npk: 32, Nsk: 32,
-  public_key: x25519_get_public_key,
-  shared: x25519_get_shared_secret };       // rejects the all-zero result itself
+  public_key: CURVES.x25519.public_key,
+  shared: CURVES.x25519.shared };           // rejects the all-zero result itself (§7.1.4)
 KEMS[0x0021] = { id: 0x0021, name: 'DHKEM(X448, HKDF-SHA512)', hash: 'sha512', Nsecret: 64, Nenc: 56, Npk: 56, Nsk: 56,
-  public_key: x448_public_key,
-  shared: x448_shared };
+  public_key: CURVES.x448.public_key,
+  shared: CURVES.x448.shared };
 
 function kem_suite_id(kem) { return concat(u8('KEM'), i2osp(kem.id, 2)); }
 

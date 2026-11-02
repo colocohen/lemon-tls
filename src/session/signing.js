@@ -465,6 +465,7 @@ function ec_key_group(keyObj) {
 }
 
 export {
+  scheme_matches_key,
   scheme_name,
   cert_allows_signing,
   ec_key_group,

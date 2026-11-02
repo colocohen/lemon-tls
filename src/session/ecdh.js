@@ -1,94 +1,74 @@
 /**
- * ECDH key generation and shared secret helpers using node:crypto.
- * X25519, P-256 and P-384; ML-KEM alone and in hybrids with them (below).
+ * The key-exchange groups: the Diffie-Hellman ones — X25519, X448, P-256,
+ * P-384, P-521 — and ML-KEM alone and in hybrids with them (below), over
+ * node:crypto. The one place a group is implemented: TLS's key exchange,
+ * the hybrids' classical halves and HPKE's DHKEMs (hpke.js) all take their
+ * primitives from here.
  */
 
 import * as crypto from 'crypto';
 
-// DER prefixes for raw X25519 key import/export
-let X25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex');
-let X25519_SPKI_PREFIX  = Buffer.from('302a300506032b656e032100', 'hex');
-
-/**
- * Derive the X25519 public key from a 32-byte private key.
- */
-function x25519_get_public_key(privateKeyRaw) {
-  let der = Buffer.concat([X25519_PKCS8_PREFIX, Buffer.from(privateKeyRaw)]);
-  let privObj = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
-  let pubObj = crypto.createPublicKey(privObj);
-  let spki = pubObj.export({ type: 'spki', format: 'der' });
-  return new Uint8Array(spki.subarray(X25519_SPKI_PREFIX.length));
-}
-
-/**
- * Compute X25519 shared secret from local private key and remote public key (both raw 32 bytes).
- */
-function x25519_get_shared_secret(localPrivateRaw, remotePublicRaw) {
-  let privDer = Buffer.concat([X25519_PKCS8_PREFIX, Buffer.from(localPrivateRaw)]);
-  let pubDer  = Buffer.concat([X25519_SPKI_PREFIX, Buffer.from(remotePublicRaw)]);
-  let privObj = crypto.createPrivateKey({ key: privDer, format: 'der', type: 'pkcs8' });
-  let pubObj  = crypto.createPublicKey({ key: pubDer, format: 'der', type: 'spki' });
-  let secret  = new Uint8Array(crypto.diffieHellman({ privateKey: privObj, publicKey: pubObj }));
-
-  // RFC 7748 §6.1: implementations MUST reject an all-zero shared secret. A peer
-  // that sends a low-order/small-order public key can force the X25519 result to
-  // be all zeros — a value it knows in advance — which would let it choose the
-  // key material. The `break` here is safe (does not leak a secret): the peer's
-  // public key is public, so an early exit reveals nothing exploitable.
-  let allZero = true;
-  for (let i = 0; i < secret.length; i++) {
-    if (secret[i] !== 0) { allZero = false; break; }
-  }
-  if (allZero) {
-    throw new Error('X25519: all-zero shared secret — invalid peer public key (RFC 7748 §6.1)');
-  }
-
+// RFC 7748 §6: an all-zero shared secret means the peer's public key was of
+// low order — a value it knew in advance. MUST be rejected. Constant time
+// (the peer's key is public, but there is no reason to branch on secrets).
+function reject_all_zero(secret, name) {
+  let acc = 0;
+  for (let i = 0; i < secret.length; i++) acc |= secret[i];
+  if (acc === 0) throw new Error(name + ': all-zero shared secret — invalid peer public key (RFC 7748 §6)');
   return secret;
 }
 
-/**
- * Generate a P-256 keypair. Returns { private_key: Uint8Array, public_key: Uint8Array(65) }.
- * Public key is uncompressed format (0x04 || x || y).
- */
-function p256_generate_keypair() {
-  let ecdh = crypto.createECDH('prime256v1');
-  ecdh.generateKeys();
+// A Montgomery curve, through node:crypto's raw-key DER wrapping: the PKCS#8
+// and SPKI prefixes before the raw private and public keys.
+function montgomery(name, len, pkcs8Hex, spkiHex) {
+  let pkcs8 = Buffer.from(pkcs8Hex, 'hex'), spki = Buffer.from(spkiHex, 'hex');
+  let priv = (sk) => crypto.createPrivateKey({ key: Buffer.concat([pkcs8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
+  let c = {
+    kind: 'montgomery', len: len, privLen: len,
+    public_key: function (sk) {
+      return new Uint8Array(crypto.createPublicKey(priv(sk)).export({ type: 'spki', format: 'der' }).subarray(spki.length));
+    },
+    shared: function (sk, pk) {
+      let pub = crypto.createPublicKey({ key: Buffer.concat([spki, Buffer.from(pk)]), format: 'der', type: 'spki' });
+      return reject_all_zero(new Uint8Array(crypto.diffieHellman({ privateKey: priv(sk), publicKey: pub })), name);
+    },
+    generate: function () {
+      let sk = new Uint8Array(crypto.randomBytes(len));
+      return { private_key: sk, public_key: c.public_key(sk) };
+    },
+  };
+  return c;
+}
+// A NIST prime curve: shares are uncompressed points (0x04 || X || Y,
+// RFC 8446 §4.2.8.2), the shared secret the x-coordinate.
+function nist(curve, coordLen) {
   return {
-    private_key: new Uint8Array(ecdh.getPrivateKey()),
-    public_key: new Uint8Array(ecdh.getPublicKey(null, 'uncompressed'))
+    kind: 'nist', len: 1 + 2 * coordLen, coordLen: coordLen, privLen: coordLen,
+    public_key: function (sk) {
+      let e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
+      return new Uint8Array(e.getPublicKey(null, 'uncompressed'));
+    },
+    // computeSecret validates the peer point (on the curve, not infinity)
+    // before any secret exists.
+    shared: function (sk, pk) {
+      let e = crypto.createECDH(curve); e.setPrivateKey(Buffer.from(sk));
+      return new Uint8Array(e.computeSecret(Buffer.from(pk)));
+    },
+    generate: function () {
+      let e = crypto.createECDH(curve); e.generateKeys();
+      return { private_key: new Uint8Array(e.getPrivateKey()), public_key: new Uint8Array(e.getPublicKey(null, 'uncompressed')) };
+    },
   };
 }
 
-/**
- * Compute P-256 shared secret (raw x-coordinate, 32 bytes).
- */
-function p256_get_shared_secret(localPrivateRaw, remotePublicRaw) {
-  let ecdh = crypto.createECDH('prime256v1');
-  ecdh.setPrivateKey(Buffer.from(localPrivateRaw));
-  return new Uint8Array(ecdh.computeSecret(Buffer.from(remotePublicRaw)));
-}
+const CURVES = {
+  x25519: montgomery('X25519', 32, '302e020100300506032b656e04220420', '302a300506032b656e032100'),
+  x448:   montgomery('X448',   56, '3046020100300506032b656f043a0438', '3042300506032b656f033900'),
+  p256:   nist('prime256v1', 32),
+  p384:   nist('secp384r1', 48),
+  p521:   nist('secp521r1', 66),
+};
 
-/**
- * Generate a P-384 keypair. Returns { private_key: Uint8Array(48), public_key: Uint8Array(97) }.
- * Public key is uncompressed format (0x04 || x || y).
- */
-function p384_generate_keypair() {
-  let ecdh = crypto.createECDH('secp384r1');
-  ecdh.generateKeys();
-  return {
-    private_key: new Uint8Array(ecdh.getPrivateKey()),
-    public_key: new Uint8Array(ecdh.getPublicKey(null, 'uncompressed'))
-  };
-}
-
-/**
- * Compute P-384 shared secret (raw x-coordinate, 48 bytes).
- */
-function p384_get_shared_secret(localPrivateRaw, remotePublicRaw) {
-  let ecdh = crypto.createECDH('secp384r1');
-  ecdh.setPrivateKey(Buffer.from(localPrivateRaw));
-  return new Uint8Array(ecdh.computeSecret(Buffer.from(remotePublicRaw)));
-}
 
 /**
  * Named groups this module actually implements, in preference order.
@@ -104,8 +84,10 @@ function p384_get_shared_secret(localPrivateRaw, remotePublicRaw) {
  */
 const NAMED_GROUP = {
   X25519:    0x001d,
+  X448:      0x001e,
   SECP256R1: 0x0017,
   SECP384R1: 0x0018,
+  SECP521R1: 0x0019,
   // Post-quantum. KEMs, not Diffie-Hellman: the server does not make a key
   // pair of its own, it ENCAPSULATES to the client's — see kem_server_exchange.
   //   Hybrids (draft-ietf-tls-ecdhe-mlkem): ML-KEM (FIPS 203) and an ECDH
@@ -124,11 +106,23 @@ const NAMED_GROUP = {
 
 // Each group's name — the IANA registry's, as OpenSSL and node:tls spell them.
 const GROUP_NAMES = {
-  0x001d: 'X25519', 0x0017: 'P-256', 0x0018: 'P-384',
+  0x001d: 'X25519', 0x001e: 'X448', 0x0017: 'P-256', 0x0018: 'P-384', 0x0019: 'P-521',
   0x11ec: 'X25519MLKEM768', 0x11eb: 'SecP256r1MLKEM768', 0x11ed: 'SecP384r1MLKEM1024',
   0x0200: 'MLKEM512', 0x0201: 'MLKEM768', 0x0202: 'MLKEM1024',
 };
 function group_name(group) { return GROUP_NAMES[group] || null; }
+
+// The Diffie-Hellman groups, by code point: their curve, and how node:tls
+// (getEphemeralKeyInfo) names and sizes them.
+const DH_GROUPS = {
+  0x001d: { curve: CURVES.x25519, ecdhName: 'x25519',     bits: 253 },
+  0x001e: { curve: CURVES.x448,   ecdhName: 'x448',       bits: 448 },
+  0x0017: { curve: CURVES.p256,   ecdhName: 'prime256v1', bits: 256 },
+  0x0018: { curve: CURVES.p384,   ecdhName: 'secp384r1',  bits: 384 },
+  0x0019: { curve: CURVES.p521,   ecdhName: 'secp521r1',  bits: 521 },
+};
+/** node:tls's description of a DH group ({ name, size }), or null. */
+function dh_group_info(group) { let d = DH_GROUPS[group]; return d ? { name: d.ecdhName, size: d.bits } : null; }
 
 // ML-KEM's three parameter sets (FIPS 203 Table 3): encapsulation key and
 // ciphertext sizes. The shared secret is 32 bytes for each.
@@ -138,18 +132,12 @@ const MLKEM = {
   1024: { type: 'ml-kem-1024', ek: 1568, ct: 1568 },
 };
 
-// The classical halves of the hybrids: a share's size, a key pair, a secret.
-const ECDH_PART = {
-  x25519: { len: 32,
-            generate: function () { let priv = new Uint8Array(crypto.randomBytes(32)); return { private_key: priv, public_key: x25519_get_public_key(priv) }; },
-            shared: function (priv, pub) { return x25519_get_shared_secret(priv, pub); } },
-  p256:   { len: 65, generate: function () { return p256_generate_keypair(); },
-            shared: function (priv, pub) { check_point(pub, 65); return p256_get_shared_secret(priv, pub); } },
-  p384:   { len: 97, generate: function () { return p384_generate_keypair(); },
-            shared: function (priv, pub) { check_point(pub, 97); return p384_get_shared_secret(priv, pub); } },
-};
-function check_point(pub, len) {
-  if (pub.length !== len || pub[0] !== 0x04) throw new Error('the ECDH part must be a ' + len + '-byte uncompressed point');
+// The classical halves of the hybrids: the curves above, their parts checked
+// as a group's share is (normalize_dh_share).
+const ECDH_PART = {};
+for (const name of ['x25519', 'p256', 'p384']) {
+  let c = CURVES[name];
+  ECDH_PART[name] = { len: c.len, generate: c.generate, shared: function (sk, pk) { return c.shared(sk, normalize_dh_share(c, pk)); } };
 }
 
 // The KEM groups: which ML-KEM, which ECDH half (none for ML-KEM alone), and
@@ -239,6 +227,11 @@ const SERVER_DEFAULT_GROUPS = [
   NAMED_GROUP.X25519,
   NAMED_GROUP.SECP256R1,
   NAMED_GROUP.SECP384R1,
+  // Taken from a client that offers them — none offers only these by
+  // default, so they come last (OpenSSL's order: X448 after the NIST
+  // curves it offers by default, P-521 last).
+  NAMED_GROUP.X448,
+  NAMED_GROUP.SECP521R1,
 ]);
 
 // Everything implemented here, on either side. A KEM group only where
@@ -260,9 +253,7 @@ function is_kem_group(group) {
  * Returns { private_key, public_key } or null for an unsupported group.
  */
 function generate_keypair(group) {
-  if (group === NAMED_GROUP.X25519) return ECDH_PART.x25519.generate();
-  if (group === NAMED_GROUP.SECP256R1) return p256_generate_keypair();
-  if (group === NAMED_GROUP.SECP384R1) return p384_generate_keypair();
+  if (DH_GROUPS[group]) return DH_GROUPS[group].curve.generate();
   if (kem_group_available(group)) {
     // The CLIENT side: an ML-KEM key pair, and an ECDH one for a hybrid; the
     // share is the two public keys in the group's order.
@@ -351,17 +342,17 @@ function normalize_peer_public_key(group, pub) {
     return pub;
   }
 
-  if (group === NAMED_GROUP.X25519) {
-    if (pub.length !== 32) {
-      throw new Error('X25519 key_exchange must be 32 bytes, got ' + pub.length);
-    }
+  if (!DH_GROUPS[group]) throw new Error('unsupported group 0x' + (group >>> 0).toString(16));
+  return normalize_dh_share(DH_GROUPS[group].curve, pub);
+}
+
+// A Diffie-Hellman share as the curve has it, or an error.
+function normalize_dh_share(c, pub) {
+  if (c.kind === 'montgomery') {
+    if (pub.length !== c.len) throw new Error('key_exchange must be ' + c.len + ' bytes, got ' + pub.length);
     return pub;
   }
-
-  let coordLen = (group === NAMED_GROUP.SECP256R1) ? 32
-               : (group === NAMED_GROUP.SECP384R1) ? 48 : 0;
-  if (coordLen === 0) throw new Error('unsupported group 0x' + (group >>> 0).toString(16));
-
+  let coordLen = c.coordLen;
   // RFC 8446 §4.2.8.2: for the secp*r1 groups the key_exchange is an
   // UNCOMPRESSED point — 0x04 || X || Y — and nothing else. The length is
   // therefore exact.
@@ -373,7 +364,7 @@ function normalize_peer_public_key(group, pub) {
   // as a DIFFERENT, prefix-less point and happily fed to the ECDH. The same
   // arithmetic applies to P-384 (97 → 96). Malformed input must be rejected,
   // not silently reinterpreted.
-  let expected = 1 + 2 * coordLen;
+  let expected = c.len;
 
   if (pub.length !== expected) {
     // Name the two shapes we know we are refusing, so the failure is
@@ -394,7 +385,7 @@ function normalize_peer_public_key(group, pub) {
   }
 
   // Whether the point actually lies on the curve is checked by the ECDH
-  // primitive below (node throws ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY), which
+  // primitive (node throws ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY), which
   // happens before any secret is produced — so an off-curve point can never
   // yield key material.
   return pub;
@@ -408,9 +399,7 @@ function normalize_peer_public_key(group, pub) {
 function get_shared_secret(group, localPrivateRaw, remotePublicRaw) {
   let pub = normalize_peer_public_key(group, remotePublicRaw);
 
-  if (group === NAMED_GROUP.X25519)    return x25519_get_shared_secret(localPrivateRaw, pub);
-  if (group === NAMED_GROUP.SECP256R1) return p256_get_shared_secret(localPrivateRaw, pub);
-  if (group === NAMED_GROUP.SECP384R1) return p384_get_shared_secret(localPrivateRaw, pub);
+  if (DH_GROUPS[group]) return DH_GROUPS[group].curve.shared(localPrivateRaw, pub);
   if (kem_group_available(group)) {
     // The CLIENT side: the server's share is the ciphertext (and, for a
     // hybrid, the server's ECDH public key), in the group's order.
@@ -442,10 +431,6 @@ export {
   generate_keypair,
   normalize_peer_public_key,
   get_shared_secret,
-  x25519_get_public_key,
-  x25519_get_shared_secret,
-  p256_generate_keypair,
-  p256_get_shared_secret,
-  p384_generate_keypair,
-  p384_get_shared_secret
+  dh_group_info,
+  CURVES,
 };

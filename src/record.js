@@ -784,136 +784,125 @@ function parseDtlsPlaintext(data) {
 
 
 // ===================== DTLS 1.2 encrypted records =====================
+//
+// With a Connection ID (RFC 9146) the peer asked for, a protected record is
+// a tls12_cid one: outer type 25, the CID after the sequence number, and the
+// real type inside, after the content (DTLSInnerPlaintext; zeros may pad it
+// — we send none). Its AAD is §5.3's: the 0xff placeholder, 25, the CID
+// length, 25, version, epoch, sequence number, the CID, and the length of
+// the inner plaintext. `cid` below: that CID — null or empty, no CID.
 
-/** DTLS 1.2 AAD: epoch(2) + seq(6) + type(1) + version(2) + plaintext_length(2). */
-function buildDtlsAad12(epoch, seq, type, plaintextLen) {
-  let aad = new Uint8Array(13);
-  let off = 0;
+const TLS12_CID = 25;
+const SEQ_NUM_PLACEHOLDER = new Uint8Array(8).fill(0xff);
+
+function hasCid(cid) { return !!cid && cid.length > 0; }
+
+/** DTLS 1.2 AAD: epoch(2) + seq(6) + type(1) + version(2) + plaintext_length(2);
+ *  with a CID, RFC 9146 §5.3's (the type is then tls12_cid). */
+function buildDtlsAad12(epoch, seq, type, plaintextLen, cid) {
+  if (!hasCid(cid)) {
+    let aad = new Uint8Array(13);
+    let off = 0;
+    off = w_u16(aad, off, epoch);
+    off = w_u48(aad, off, seq);
+    off = w_u8(aad, off, type);
+    off = w_u16(aad, off, 0xFEFD);
+    off = w_u16(aad, off, plaintextLen);
+    return aad;
+  }
+  let aad = new Uint8Array(23 + cid.length);
+  aad.set(SEQ_NUM_PLACEHOLDER, 0);
+  let off = 8;
+  off = w_u8(aad, off, TLS12_CID);
+  off = w_u8(aad, off, cid.length);
+  off = w_u8(aad, off, TLS12_CID);
+  off = w_u16(aad, off, 0xFEFD);
   off = w_u16(aad, off, epoch);
   off = w_u48(aad, off, seq);
-  off = w_u8(aad, off, type);
-  off = w_u16(aad, off, 0xFEFD);
-  off = w_u16(aad, off, plaintextLen);
+  aad.set(cid, off); off += cid.length;
+  w_u16(aad, off, plaintextLen);
   return aad;
 }
 
-/** Encrypt DTLS 1.2 record payload. Returns: [explicit_nonce(8) ||] ciphertext || tag(16).
- *
- * AES-GCM: prepends an 8-byte explicit nonce (the record seq); nonce = salt(4) || seq(8).
- * ChaCha20-Poly1305 (RFC 7905): NO explicit nonce on the wire; nonce = iv(12) XOR
- *   (epoch(16) || seq(48)). Detected by ivSalt length (12 = ChaCha, 4 = GCM).
- */
-function encryptDtls12(pt, key, ivSalt, epoch, seq, type) {
-  let aad = buildDtlsAad12(epoch, seq, type, pt.length);
-
-  // ChaCha20-Poly1305: full 12-byte IV, no explicit nonce (RFC 7905).
+// The AEAD of a DTLS 1.2 record: the cipher (or decipher) and, for AES-GCM,
+// the 8-byte explicit nonce (the record seq). ChaCha20-Poly1305 has none on
+// the wire (RFC 7905): its nonce is iv(12) XOR (epoch(16) || seq(48)) —
+// the suite told apart by the IV's length (12 for ChaCha, a 4-byte salt for
+// GCM). One place for both directions.
+function dtls12Aead(decrypt, key, ivSalt, epoch, seq, aad, ptLen, explicit) {
+  let make = decrypt ? crypto.createDecipheriv : crypto.createCipheriv;
+  let c;
   if (ivSalt.length === 12) {
-    // DTLS folds the 16-bit epoch above the 48-bit seq to form the 64-bit
-    // sequence input, matching the AAD's epoch||seq (RFC 6347 / RFC 9147).
-    let seq64 = epoch * 0x1000000000000 + seq;
-    let nonce = getChachaNonce12(ivSalt, seq64);
-    let cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
-    cipher.setAAD(aad, { plaintextLength: pt.length });
-    let ct = cipher.update(pt);
-    cipher.final();
-    let tag = cipher.getAuthTag();
-    // No explicit nonce prefix for ChaCha.
-    let out = new Uint8Array(ct.length + tag.length);
-    out.set(new Uint8Array(ct), 0);
-    out.set(new Uint8Array(tag), ct.length);
-    return out;
+    c = make('chacha20-poly1305', key, getChachaNonce12(ivSalt, epoch * 0x1000000000000 + seq), { authTagLength: 16 });
+    c.setAAD(aad, { plaintextLength: ptLen });
+  } else {
+    c = make(key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm', key, getNonce12(ivSalt, explicit));
+    c.setAAD(aad);
   }
-
-  // AES-GCM: explicit nonce (= record seq) prepended.
-  let explicit = seqToBytes(seq);
-  let nonce = getNonce12(ivSalt, explicit);
-  let algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  let cipher = crypto.createCipheriv(algo, key, nonce);
-  cipher.setAAD(aad);
-  let ct = cipher.update(pt);
-  cipher.final();
-  let tag = cipher.getAuthTag();
-  let out = new Uint8Array(8 + ct.length + tag.length);
-  out.set(explicit, 0);
-  out.set(new Uint8Array(ct), 8);
-  out.set(new Uint8Array(tag), 8 + ct.length);
-  return out;
+  return c;
 }
 
-/** Decrypt DTLS 1.2 record fragment.
- *  AES-GCM input: explicit_nonce(8) || ciphertext || tag(16).
- *  ChaCha20 input: ciphertext || tag(16)  (no explicit nonce — RFC 7905).
- */
-function decryptDtls12(fragment, key, ivSalt, epoch, seq, type) {
-  // ChaCha20-Poly1305: no explicit nonce; nonce = iv(12) XOR (epoch||seq).
-  if (ivSalt.length === 12) {
-    if (fragment.length < 16) throw new Error('DTLS 1.2 ChaCha fragment too short');
-    let ct  = fragment.subarray(0, fragment.length - 16);   // views: only read
-    let tag = fragment.subarray(fragment.length - 16);
-    let seq64 = epoch * 0x1000000000000 + seq;
-    let nonce = getChachaNonce12(ivSalt, seq64);
-    let aad = buildDtlsAad12(epoch, seq, type, ct.length);
-    let decipher = crypto.createDecipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
-    decipher.setAAD(aad, { plaintextLength: ct.length });
-    decipher.setAuthTag(tag);
-    let pt = decipher.update(ct);
-    decipher.final();
-    // The decipher's fresh Buffer itself (a Uint8Array): handed on as it is,
-    // up to 'data' — no copy, and no second view of it either.
-    return pt;
-  }
-
-  // AES-GCM: strip the 8-byte explicit nonce.
-  if (fragment.length < 24) throw new Error('DTLS 1.2 fragment too short');
-  let explicit = fragment.subarray(0, 8);   // views: only read
-  let tag = fragment.subarray(fragment.length - 16);
-  let ct = fragment.subarray(8, fragment.length - 16);
-  let nonce = getNonce12(ivSalt, explicit);
-  let aad = buildDtlsAad12(epoch, seq, type, ct.length);
-  let algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  let decipher = crypto.createDecipheriv(algo, key, nonce);
-  decipher.setAAD(aad);
-  decipher.setAuthTag(tag);
-  let pt = decipher.update(ct);
-  decipher.final();
-  // As it is — see the ChaCha branch above.
-  return pt;
-}
-
-/** Build complete encrypted DTLS 1.2 record (header + encrypted payload). */
-function buildEncryptedDtls12(type, epoch, seq, plaintext, keys) {
-  // Same bytes as buildDtlsPlaintext(type, epoch, seq, encryptDtls12(...)),
-  // written straight into the record instead of through two more buffers.
+/** Build a complete protected DTLS 1.2 record: the header, then
+ *  [explicit_nonce(8) ||] ciphertext || tag(16) — with `cid`, a tls12_cid
+ *  record (RFC 9146 §4). */
+function buildEncryptedDtls12(type, epoch, seq, plaintext, keys, cid) {
   let key = keys.key, ivSalt = keys.iv;
-  let chacha = ivSalt.length === 12;
-  let explicitLen = chacha ? 0 : 8;
-  let fragLen = explicitLen + plaintext.length + 16;
-  let out = new Uint8Array(13 + fragLen);
+  let withCid = hasCid(cid);
+  let explicitLen = ivSalt.length === 12 ? 0 : 8;
+  let innerLen = plaintext.length + (withCid ? 1 : 0);
+  let fragLen = explicitLen + innerLen + 16;
+  let hdrLen = 13 + (withCid ? cid.length : 0);
+  let out = new Uint8Array(hdrLen + fragLen);
   let off = 0;
-  off = w_u8(out, off, type);
+  off = w_u8(out, off, withCid ? TLS12_CID : type);
   off = w_u16(out, off, 0xFEFD);
   off = w_u16(out, off, epoch);
   off = w_u48(out, off, seq);
+  if (withCid) { out.set(cid, off); off += cid.length; }
   off = w_u16(out, off, fragLen);
-  let aad = buildDtlsAad12(epoch, seq, type, plaintext.length);
-  let cipher;
-  if (chacha) {
-    let nonce = getChachaNonce12(ivSalt, epoch * 0x1000000000000 + seq);
-    cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
-    cipher.setAAD(aad, { plaintextLength: plaintext.length });
-  } else {
-    // AES-GCM: explicit nonce (= record seq) prepended.
-    let explicit = seqToBytes(seq);
-    out.set(explicit, off); off += 8;
-    cipher = crypto.createCipheriv(key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm', key, getNonce12(ivSalt, explicit));
-    cipher.setAAD(aad);
-  }
+  let explicit = null;
+  if (explicitLen) { explicit = seqToBytes(seq); out.set(explicit, off); off += 8; }
+  let cipher = dtls12Aead(false, key, ivSalt, epoch, seq, buildDtlsAad12(epoch, seq, type, innerLen, cid), innerLen, explicit);
   let ct = cipher.update(plaintext);
   out.set(ct, off); off += ct.length;
+  if (withCid) { let t = cipher.update(_contentTypeByte(type)); out.set(t, off); off += t.length; }
   let fin = cipher.final();
   if (fin.length) { out.set(fin, off); off += fin.length; }
   out.set(cipher.getAuthTag(), off);
   return out;
+}
+
+/** The protected part of a DTLS 1.2 record alone: [explicit_nonce(8) ||]
+ *  ciphertext || tag(16). */
+function encryptDtls12(pt, key, ivSalt, epoch, seq, type) {
+  return buildEncryptedDtls12(type, epoch, seq, pt, { key: key, iv: ivSalt }).subarray(13);
+}
+
+/** Decrypt a DTLS 1.2 record fragment ([explicit_nonce(8) ||] ciphertext ||
+ *  tag(16)). Throws when it does not open. `type` is the record's (outer)
+ *  type; with `cid` the AAD is RFC 9146's, and what comes back is the
+ *  DTLSInnerPlaintext still — openDtls12 takes it apart. */
+function decryptDtls12(fragment, key, ivSalt, epoch, seq, type, cid) {
+  let explicitLen = ivSalt.length === 12 ? 0 : 8;
+  if (fragment.length < explicitLen + 16) throw new Error('DTLS 1.2 fragment too short');
+  // Views: only read; the plaintext comes out of the decipher as a fresh
+  // Buffer (a Uint8Array), handed on as it is, up to 'data' — no copy.
+  let explicit = explicitLen ? fragment.subarray(0, 8) : null;
+  let ct = fragment.subarray(explicitLen, fragment.length - 16);
+  let decipher = dtls12Aead(true, key, ivSalt, epoch, seq, buildDtlsAad12(epoch, seq, type, ct.length, cid), ct.length, explicit);
+  decipher.setAuthTag(fragment.subarray(fragment.length - 16));
+  let pt = decipher.update(ct);
+  decipher.final();
+  return pt;
+}
+
+/** Open a protected DTLS 1.2 record: { type, content }. A tls12_cid record
+ *  — under the CID we asked for (`cid`) — gives its real type from inside
+ *  (RFC 9146 §4: the last non-zero byte; none at all is unexpected_message,
+ *  as in TLS 1.3). Throws when it does not open. */
+function openDtls12(fragment, keys, epoch, seq, type, cid) {
+  if (type !== TLS12_CID) return { type: type, content: decryptDtls12(fragment, keys.key, keys.iv, epoch, seq, type) };
+  return parseInnerPlaintext(decryptDtls12(fragment, keys.key, keys.iv, epoch, seq, type, cid));
 }
 
 
@@ -956,6 +945,17 @@ function parseUnifiedHdr(b) {
 
 /** Check if a byte is a DTLS 1.3 unified header (0x20..0x3F). */
 function isUnifiedHdr(b) { return (b & 0xE0) === UNIFIED_HDR_FIXED; }
+
+/** The Connection ID of a datagram's first record, `cidLen` bytes, or null
+ *  when it carries none: a tls12_cid record's (after the 11-byte prefix),
+ *  or a unified header's with the C bit (after its first byte). What a
+ *  server finds a connection by, whatever address it comes from. */
+function datagramCid(data, cidLen) {
+  if (!data || cidLen <= 0) return null;
+  if (data[0] === TLS12_CID) return data.length >= 13 + cidLen ? data.subarray(11, 11 + cidLen) : null;
+  if (isUnifiedHdr(data[0]) && parseUnifiedHdr(data[0]).hasCid) return data.length > cidLen ? data.subarray(1, 1 + cidLen) : null;
+  return null;
+}
 
 
 // ===================== DTLS 1.3 record number encryption =====================
@@ -1010,13 +1010,18 @@ function maskRecordNumber(snKey, rnBytes, ciphertext, algo) {
  * seq:       record sequence number
  * epoch:     low 2 bits (2=handshake, 3=application)
  * keys:      { key, iv, snKey, algo? }
+ * cid:       the peer's Connection ID (RFC 9147 §4: C bit, the CID after
+ *            the first byte; its length is the one negotiated, not on the
+ *            wire), or null / empty for none
  */
-function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
+function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys, cid) {
   let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
   let isChaCha = algo === 'chacha20-poly1305';
+  let cidLen = cid ? cid.length : 0;
 
-  // Unified header: 2-byte seq, with length, no CID
-  let info = buildUnifiedHdr(epoch, true, true, false);
+  // Unified header: [CID], 2-byte seq, with length
+  let info = buildUnifiedHdr(epoch, true, true, cidLen > 0);
+  let rnOff = 1 + cidLen, hdrLen = rnOff + 4;
 
   // Plaintext record number
   let rn0 = (seq >>> 8) & 0xFF, rn1 = seq & 0xFF;
@@ -1026,13 +1031,15 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
   let innerLen = plaintext.length + 1;
   let encLen = innerLen + 16;
 
-  // AAD = header with PLAINTEXT record number (before RN encryption)
-  let aad = new Uint8Array(5);
+  // AAD = the header with the PLAINTEXT record number (before RN
+  // encryption) — the CID in it (§4.2.3: the whole header).
+  let aad = new Uint8Array(hdrLen);
   aad[0] = info;
-  aad[1] = rn0;
-  aad[2] = rn1;
-  aad[3] = (encLen >>> 8) & 0xFF;
-  aad[4] = encLen & 0xFF;
+  if (cidLen) aad.set(cid, 1);
+  aad[rnOff] = rn0;
+  aad[rnOff + 1] = rn1;
+  aad[rnOff + 2] = (encLen >>> 8) & 0xFF;
+  aad[rnOff + 3] = encLen & 0xFF;
 
   // Nonce (reuse TLS 1.3 nonce construction)
   let nonce = getNonce(keys.iv, seq);
@@ -1043,8 +1050,8 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
   let cipher = crypto.createCipheriv(algo, keys.key, nonce,
     isChaCha ? { authTagLength: 16 } : undefined);
   cipher.setAAD(aad, isChaCha ? { plaintextLength: innerLen } : undefined);
-  let record = new Uint8Array(5 + encLen);
-  let off = 5;
+  let record = new Uint8Array(hdrLen + encLen);
+  let off = hdrLen;
   let ct1 = cipher.update(plaintext);
   record.set(ct1, off); off += ct1.length;
   let ct2 = cipher.update(_contentTypeByte(innerType));
@@ -1052,7 +1059,7 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
   let ct3 = cipher.final();
   if (ct3.length) { record.set(ct3, off); off += ct3.length; }
   record.set(cipher.getAuthTag(), off);
-  let ciphertext = record.subarray(5);
+  let ciphertext = record.subarray(hdrLen);
 
   // Encrypt record number
   let encRn = maskRecordNumber(keys.snKey, [rn0, rn1], ciphertext, algo);
@@ -1081,11 +1088,9 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys) {
   }
   // ─────────────────────────────────────────────────────────────────────
 
-  record[0] = info;
-  record[1] = encRn[0];
-  record[2] = encRn[1];
-  record[3] = (ciphertext.length >>> 8) & 0xFF;
-  record[4] = ciphertext.length & 0xFF;
+  record.set(aad, 0);
+  record[rnOff] = encRn[0];
+  record[rnOff + 1] = encRn[1];
   return record;
 }
 
@@ -1167,15 +1172,27 @@ function resolveReadEpoch(epochBits, keysByEpoch) {
  * Decrypt a DTLS 1.3 encrypted record.
  * data: full record bytes (starting with unified header byte)
  * keys: { key, iv, snKey, algo?, maxReadSeq? }
+ * cid:  the Connection ID we asked the peer for, or null / empty. A record
+ *       with a CID when there is none, or another, does not open;
+ * cidRequired: the peer agreed to it — then nor does one without it (§4:
+ *       "it MUST be contained in all datagrams"), but in epoch 1, early data
+ *       sent before the CID was known.
  * Returns { epoch, seq, type, content } or null on failure.
  */
-function decryptEncryptedDtls13(data, keys, fullEpoch) {
+function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
   if (data.length < 1) return null;
 
   let hdr = parseUnifiedHdr(data[0]);
   let off = 1;
+  let cidLen = cid ? cid.length : 0;
 
-  if (hdr.hasCid) return null; // CID not supported yet
+  if (hdr.hasCid) {
+    if (cidLen === 0 || data.length < 1 + cidLen) return null;
+    for (let i = 0; i < cidLen; i++) if (data[1 + i] !== cid[i]) return null;
+    off += cidLen;
+  } else if (cidRequired && fullEpoch !== 1) {
+    return null;
+  }
 
   let rnLen = hdr.seqLen2 ? 2 : 1;
   if (off + rnLen > data.length) return null;
@@ -1223,13 +1240,13 @@ function decryptEncryptedDtls13(data, keys, fullEpoch) {
   // Rebuild AAD with plaintext RN. AAD depends only on the wire bytes (the
   // decrypted record number + length), NOT on the reconstructed full seq —
   // so it's computed once and reused across seq candidates below.
-  let hdrLen = 1 + rnLen + (hdr.hasLength ? 2 : 0);
-  let aad = new Uint8Array(hdrLen);
-  aad[0] = data[0];
-  for (let i = 0; i < rnLen; i++) aad[1 + i] = rn[i];
+  let rnOff = off - rnLen - (hdr.hasLength ? 2 : 0);
+  let aad = new Uint8Array(off);
+  aad.set(data.subarray(0, rnOff), 0);   // the first byte, and the CID
+  for (let i = 0; i < rnLen; i++) aad[rnOff + i] = rn[i];
   if (hdr.hasLength) {
-    aad[1 + rnLen]     = (ctLen >>> 8) & 0xFF;
-    aad[1 + rnLen + 1] = ctLen & 0xFF;
+    aad[rnOff + rnLen]     = (ctLen >>> 8) & 0xFF;
+    aad[rnOff + rnLen + 1] = ctLen & 0xFF;
   }
 
   let ct = ciphertext.subarray(0, ciphertext.length - 16);
@@ -1297,17 +1314,26 @@ function decryptEncryptedDtls13(data, keys, fullEpoch) {
  * Dispatches between plaintext (classic header) and encrypted (unified header).
  *
  * keysByEpoch: { [epoch]: { key, iv, snKey, algo } } — null for plaintext only.
+ * cid:         the Connection ID we asked the peer for (RFC 9146, RFC 9147
+ *              §9), or null / empty — from the moment it is asked for: its
+ *              length is what finds the boundaries of a record carrying it,
+ *              which may come in the datagram that says it was agreed to. A
+ *              datagram of CID records when we asked for none is not one of
+ *              ours, and ends here.
+ * cidRequired: the peer agreed to it: every protected record carries it.
  * Returns array of { type, epoch, seq, content, encrypted }.
  */
-function parseDtlsDatagram(data, keysByEpoch) {
+function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
   let records = [];
   let off = 0;
+  let cidLen = cid ? cid.length : 0;
 
   while (off < data.length) {
     let first = data[off];
 
     if (isUnifiedHdr(first)) {
       let hdr = parseUnifiedHdr(first);
+      if (hdr.hasCid && cidLen === 0) break;
       // Header carries 2 epoch bits; map them back to a real epoch first.
       let fullEpoch = resolveReadEpoch(hdr.epoch, keysByEpoch);
       let keys = (fullEpoch === null) ? null : keysByEpoch[fullEpoch];
@@ -1323,8 +1349,7 @@ function parseDtlsDatagram(data, keysByEpoch) {
         // Keep the raw bytes and mark the record deferred; the caller retries
         // it after processing each earlier record, once the keys exist. This
         // generalises the CCS-only re-decrypt that DTLS 1.2 already had.
-        let rnLen = hdr.seqLen2 ? 2 : 1;
-        let skip = 1 + rnLen;
+        let skip = 1 + (hdr.hasCid ? cidLen : 0) + (hdr.seqLen2 ? 2 : 1);
         let total;
         if (hdr.hasLength && off + skip + 2 <= data.length) {
           total = skip + 2 + readU16(data, off + skip);
@@ -1349,7 +1374,7 @@ function parseDtlsDatagram(data, keysByEpoch) {
         continue;
       }
 
-      let result = decryptEncryptedDtls13(data.subarray(off), keys, fullEpoch);
+      let result = decryptEncryptedDtls13(data.subarray(off), keys, fullEpoch, cid, cidRequired);
       if (result) {
         records.push({
           type: result.type,
@@ -1364,13 +1389,31 @@ function parseDtlsDatagram(data, keysByEpoch) {
       }
 
     } else if (first <= 63) {
-      // Classic DTLS record
-      if (off + 13 > data.length) break;
+      // Classic DTLS record — or a tls12_cid one (RFC 9146 §4), the CID
+      // between the sequence number and the length.
+      let withCid = first === TLS12_CID;
+      if (withCid && cidLen === 0) break;
+      let hdrLen = 13 + (withCid ? cidLen : 0);
+      if (off + hdrLen > data.length) break;
       let type    = data[off];
       let epoch   = readU16(data, off + 3);
       let seq     = readU48(data, off + 5);
-      let length  = readU16(data, off + 11);
-      if (off + 13 + length > data.length) break;
+      let length  = readU16(data, off + hdrLen - 2);
+      if (off + hdrLen + length > data.length) break;
+      let fragment = data.subarray(off + hdrLen, off + hdrLen + length);
+      let at = off;
+      off += hdrLen + length;
+
+      // Ours, by its CID — or not. And with a CID asked for, every protected
+      // record carries it (§3: "MUST send with the record format"); one
+      // without is not this connection's.
+      if (withCid) {
+        let mine = true;
+        for (let i = 0; i < cidLen; i++) if (data[at + 11 + i] !== cid[i]) { mine = false; break; }
+        if (!mine) continue;
+      } else if (cidRequired && epoch > 0) {
+        continue;
+      }
 
       let payload = null;
       let encrypted = false;
@@ -1381,16 +1424,20 @@ function parseDtlsDatagram(data, keysByEpoch) {
       // decrypted — gets its own copy, as before.
       if (epoch > 0 && keysByEpoch && keysByEpoch[epoch]) {
         let keys = keysByEpoch[epoch];
-        try {
-          payload = decryptDtls12(data.subarray(off + 13, off + 13 + length), keys.key, keys.iv, epoch, seq, type);
-          encrypted = true;
-        } catch(e) {
-          // Decryption failed — return raw
+        let opened = null;
+        try { opened = openDtls12(fragment, keys, epoch, seq, type, cid); }
+        catch (e) {
+          // Opened, and malformed inside: the peer's (alertDesc). Otherwise
+          // it did not open — kept raw.
+          if (e && e.alertDesc) throw e;
         }
-        // Authenticated, and seen before: a replay — dropped, as in 1.3.
-        if (encrypted && !acceptRecordSeq(keys, seq)) { off += 13 + length; continue; }
+        if (opened) {
+          // Authenticated, and seen before: a replay — dropped, as in 1.3.
+          if (!acceptRecordSeq(keys, seq)) continue;
+          type = opened.type; payload = opened.content; encrypted = true;
+        }
       }
-      if (payload === null) payload = data.slice(off + 13, off + 13 + length);
+      if (payload === null) payload = fragment.slice();
 
       records.push({
         type: type,
@@ -1399,7 +1446,6 @@ function parseDtlsDatagram(data, keysByEpoch) {
         content: payload,
         encrypted: encrypted,
       });
-      off += 13 + length;
     } else {
       break;
     }
@@ -1510,6 +1556,7 @@ export {
   // DTLS helpers
   aesEcbEncrypt,
   isUnifiedHdr,
+  datagramCid,
 
   // DTLS plaintext records
   buildDtlsPlaintext,
@@ -1520,7 +1567,9 @@ export {
   acceptRecordSeq,
   encryptDtls12,
   decryptDtls12,
+  openDtls12,
   buildEncryptedDtls12,
+  TLS12_CID,
 
   // DTLS 1.3 unified header
   buildUnifiedHdr,

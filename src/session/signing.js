@@ -66,22 +66,22 @@ const SIG_SCHEMES_LEGACY_PKCS1 = [
   0x0401, 0x0501, 0x0601,   // rsa_pkcs1_sha256/384/512
 ];
 
-/**
- * SHA-1 schemes. Deliberately last, and deliberately still offered.
+/*
+ * SHA-1 (rsa_pkcs1_sha1 0x0201, ecdsa_sha1 0x0203) is neither offered nor
+ * used, at any version (RFC 9155): not in a ClientHello or CertificateRequest
+ * — "MUST NOT include" —, not signed with, and a peer's handshake signature
+ * under it is refused (scheme_info knows no SHA-1 scheme). It was offered
+ * last, and used whenever a TLS 1.2 peer asked for it first or offered
+ * nothing else: a server signed its ServerKeyExchange with SHA-1 for any
+ * client that wanted that (internet.nl: "insufficiently secure hash
+ * functions for key exchange"; NCSC-NL 2025-05 §3.3.5).
  *
- * Same offer/use split as the PKCS#1 set above, taken one step further: SHA-1
- * is unacceptable for a handshake signature, and scheme_info already refuses
- * these at TLS 1.3 so they can never be selected for CertificateVerify. But
- * signature_algorithms also describes the signatures we can verify ON
- * CERTIFICATES (RFC 8446 §4.2.3), and SHA-1-signed intermediates still exist
- * in real chains. Withholding them from the offer tells a peer we cannot
- * verify such a chain at all, which is a different — and wrong — statement
- * from "we will not sign with SHA-1".
+ * It had been kept in the offer for certificates — signature_algorithms also
+ * names what we verify on a chain (RFC 8446 §4.2.3). That reason is gone:
+ * a certificate below the anchor signed with SHA-1 is refused
+ * (session/x509.js, CA_MD_TOO_WEAK, as node:tls refuses it), and an anchor's
+ * own signature is never checked.
  */
-const SIG_SCHEMES_LEGACY_SHA1 = [
-  0x0201,   // rsa_pkcs1_sha1
-  0x0203,   // ecdsa_sha1
-];
 
 /**
  * Default offer list — the same for every version range, deliberately taking
@@ -100,8 +100,7 @@ const SIG_SCHEMES_LEGACY_SHA1 = [
 function default_signature_schemes() {
   return SIG_SCHEMES_MODERN
     .concat(SIG_SCHEMES_MLDSA)
-    .concat(SIG_SCHEMES_LEGACY_PKCS1)
-    .concat(SIG_SCHEMES_LEGACY_SHA1);
+    .concat(SIG_SCHEMES_LEGACY_PKCS1);
 }
 
 
@@ -151,12 +150,10 @@ function scheme_info(version, scheme) {
   // (RFC 8446 §4.4.3); TLS 1.2 still uses them.
   if (version === TLS_VERSION_TLS1_3) return null;
 
-  // TLS 1.2: classic (hash, sig) interpretation
-  if (h === 0x02 && s === 0x01) return { hash: 'sha1',   sig: 'rsa',   isPSS: false };
+  // TLS 1.2: classic (hash, sig) interpretation. No SHA-1 (RFC 9155).
   if (h === 0x04 && s === 0x01) return { hash: 'sha256', sig: 'rsa',   isPSS: false };
   if (h === 0x05 && s === 0x01) return { hash: 'sha384', sig: 'rsa',   isPSS: false };
   if (h === 0x06 && s === 0x01) return { hash: 'sha512', sig: 'rsa',   isPSS: false };
-  if (h === 0x02 && s === 0x03) return { hash: 'sha1',   sig: 'ecdsa', isPSS: false };
 
   return null;
 }
@@ -475,7 +472,6 @@ export {
   verify_with_scheme,
   SIG_SCHEMES_MODERN,
   SIG_SCHEMES_LEGACY_PKCS1,
-  SIG_SCHEMES_LEGACY_SHA1,
   SIG_SCHEMES_MLDSA,
   MLDSA_AVAILABLE,
   default_signature_schemes

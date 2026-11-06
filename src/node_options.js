@@ -92,6 +92,24 @@ function checkCipherSuites(list, name) {
   return out;
 }
 
+/**
+ * signatureAlgorithms (code points) → the list, or null when not given.
+ * SHA-1 is neither offered nor used (RFC 9155; session/signing.js), so a list
+ * naming it is refused where it is given — as `sigalgs` refuses a name it
+ * does not know — rather than offered and then never used.
+ */
+function checkSignatureAlgorithms(list) {
+  if (list === undefined || list === null) return null;
+  if (!Array.isArray(list)) throw new TypeError('signatureAlgorithms must be an array of signature scheme code points');
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] === 0x0201 || list[i] === 0x0203) {
+      throw new Error('signatureAlgorithms: 0x0' + list[i].toString(16) + ' (' + (list[i] === 0x0201 ? 'rsa_pkcs1_sha1' : 'ecdsa_sha1') +
+        ') is not supported: SHA-1 handshake signatures are refused (RFC 9155)');
+    }
+  }
+  return list;
+}
+
 // The groups by name: the registry's (session/ecdh.js, GROUP_NAMES) and
 // OpenSSL's curve names for the NIST ones.
 var GROUPS = (function () {
@@ -230,7 +248,7 @@ function localLists(options, versions) {
     if (out.local_supported_cipher_suites.length === 0) throw new Error('allowedCipherSuites: no cipher match for the versions in range');
   }
   if (options.groups) out.local_supported_groups = options.groups.slice();
-  if (options.signatureAlgorithms) out.local_supported_signature_algorithms = options.signatureAlgorithms.slice();
+  if (options.signatureAlgorithms) out.local_supported_signature_algorithms = checkSignatureAlgorithms(options.signatureAlgorithms).slice();
   var alpn = options.ALPNProtocols || options.alpnProtocols;
   if (Array.isArray(alpn) && alpn.length > 0) {
     out.local_supported_alpns = alpn.map(function (p) { return Buffer.isBuffer(p) ? p.toString('latin1') : String(p); });
@@ -254,4 +272,4 @@ function pskOptions(options, socket) {
   return { psk: r ? { identity: r.identity, psk: r.psk, hash: r.hash } : null, pskCallback: null };
 }
 
-export { parseCiphers, checkCipherSuites, parseEcdhCurve, parseSigalgs, parseTlsVersion, versionsInRange, localLists, pskOptions };
+export { parseCiphers, checkCipherSuites, checkSignatureAlgorithms, parseEcdhCurve, parseSigalgs, parseTlsVersion, versionsInRange, localLists, pskOptions };

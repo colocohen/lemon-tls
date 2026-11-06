@@ -1978,13 +1978,12 @@ function TLSSession(options){
     return true;
   }
 
-  // The client's signature_algorithms. TLS 1.2 without the extension: SHA-1
-  // with the key's algorithm (RFC 5246 §7.4.1.4.1, "the server MUST" assume
-  // it); TLS 1.3 has no default.
+  // The client's signature_algorithms, and nothing else. TLS 1.2 without the
+  // extension had SHA-1 assumed (RFC 5246 §7.4.1.4.1); RFC 9155 §3 updates
+  // that: such a client gets handshake_failure, as one with no scheme we can
+  // sign with does. Every suite here signs (ECDHE_RSA, ECDHE_ECDSA).
   function peer_signature_algorithms(v13) {
-    let list = context.remote_supported_signature_algorithms || [];
-    if (list.length > 0 || v13) return list;
-    return [0x0201, 0x0203];
+    return context.remote_supported_signature_algorithms || [];
   }
 
   // A ClientHello as §4.1.2 compares two: what may not change between them.

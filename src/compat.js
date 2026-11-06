@@ -13,7 +13,7 @@ import { TLS_CIPHER_SUITES } from './crypto.js';
 import TLSSession from './tls_session.js';
 import TLSSocket from './tls_socket.js';
 import createSecureContext from './secure_context.js';
-import { parseCiphers, checkCipherSuites, parseEcdhCurve, parseSigalgs } from './node_options.js';
+import { parseCiphers, checkCipherSuites, checkSignatureAlgorithms, parseEcdhCurve, parseSigalgs } from './node_options.js';
 import { prepare_ech_server } from './session/ech.js';
 import { matches_host, matches_altnames } from './session/x509.js';
 
@@ -171,7 +171,7 @@ function connect(/* ...args */) {
     maxVersion: options.maxVersion,
     // node:tls's own strings (ciphers, ecdhCurve, sigalgs) — taken by
     // nothing until now — or lemon-tls's code lists, which win.
-    signatureAlgorithms: options.signatureAlgorithms || parseSigalgs(options.sigalgs),
+    signatureAlgorithms: checkSignatureAlgorithms(options.signatureAlgorithms) || parseSigalgs(options.sigalgs),
     groups: options.groups || parseEcdhCurve(options.ecdhCurve),
     prioritizeChaCha: options.prioritizeChaCha,
     // Forwarded on the server side but dropped here, so a client could not
@@ -291,7 +291,7 @@ function Server(options, connectionListener) {
   // as Node's createServer does, not on the first connection.
   let nodeSuites = checkCipherSuites(options.allowedCipherSuites, 'allowedCipherSuites') || parseCiphers(options.ciphers);
   let nodeGroups = options.groups || parseEcdhCurve(options.ecdhCurve);
-  let nodeSigalgs = options.signatureAlgorithms || parseSigalgs(options.sigalgs);
+  let nodeSigalgs = checkSignatureAlgorithms(options.signatureAlgorithms) || parseSigalgs(options.sigalgs);
 
   // sessionTimeout: seconds to cache a TLS 1.2 Session ID (Node default: 300)
   let sessionTimeoutSec = (typeof options.sessionTimeout === 'number' && options.sessionTimeout > 0)

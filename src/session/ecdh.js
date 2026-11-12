@@ -7,6 +7,8 @@
  */
 
 import * as crypto from 'crypto';
+import * as SPKI from 'cryptographic-formats/spki';
+import * as PKCS8 from 'cryptographic-formats/pkcs8';
 
 // RFC 7748 §6: an all-zero shared secret means the peer's public key was of
 // low order — a value it knew in advance. MUST be rejected. Constant time
@@ -30,20 +32,20 @@ const NATIVE_PRIVATE = new WeakMap();
 
 const b64u = (s) => new Uint8Array(Buffer.from(s, 'base64url'));
 
-// A Montgomery curve, through node:crypto's raw-key DER wrapping: the PKCS#8
-// and SPKI prefixes before the raw private and public keys.
-function montgomery(name, len, pkcs8Hex, spkiHex) {
-  let pkcs8 = Buffer.from(pkcs8Hex, 'hex'), spki = Buffer.from(spkiHex, 'hex');
+// A Montgomery curve. node:crypto takes and gives its raw keys only inside
+// PKCS#8 and SPKI: cryptographic-formats writes and reads that wrapping (RFC 8410)
+// — it was two DER prefixes written out here by hand.
+function montgomery(name, len) {
   let type = name.toLowerCase();
   let priv = (sk) => NATIVE_PRIVATE.get(sk) ||
-    crypto.createPrivateKey({ key: Buffer.concat([pkcs8, Buffer.from(sk)]), format: 'der', type: 'pkcs8' });
+    crypto.createPrivateKey({ key: Buffer.from(PKCS8.to_der({ algorithm: name, scalar: sk })), format: 'der', type: 'pkcs8' });
   let c = {
     kind: 'montgomery', len: len, privLen: len,
     public_key: function (sk) {
-      return new Uint8Array(crypto.createPublicKey(priv(sk)).export({ type: 'spki', format: 'der' }).subarray(spki.length));
+      return new Uint8Array(SPKI.from_der(crypto.createPublicKey(priv(sk)).export({ type: 'spki', format: 'der' })).point);
     },
     shared: function (sk, pk) {
-      let pub = crypto.createPublicKey({ key: Buffer.concat([spki, Buffer.from(pk)]), format: 'der', type: 'spki' });
+      let pub = crypto.createPublicKey({ key: Buffer.from(SPKI.to_der({ algorithm: name, point: pk })), format: 'der', type: 'spki' });
       return reject_all_zero(new Uint8Array(crypto.diffieHellman({ privateKey: priv(sk), publicKey: pub })), name);
     },
     // Made natively (the same CSPRNG as randomBytes), and read back as JWK —
@@ -91,8 +93,8 @@ function nist(curve, coordLen) {
 }
 
 const CURVES = {
-  x25519: montgomery('X25519', 32, '302e020100300506032b656e04220420', '302a300506032b656e032100'),
-  x448:   montgomery('X448',   56, '3046020100300506032b656f043a0438', '3042300506032b656f033900'),
+  x25519: montgomery('X25519', 32),
+  x448:   montgomery('X448',   56),
   p256:   nist('prime256v1', 32),
   p384:   nist('secp384r1', 48),
   p521:   nist('secp521r1', 66),
@@ -189,9 +191,12 @@ const KEM_GROUPS = {
 //
 // Decided once per parameter set, by a real round trip rather than by the
 // functions existing (on BoringSSL, crypto.encapsulate can be defined and
-// still not know ML-KEM) — and the raw key's SPKI wrapping taken from the key
-// made: a fixed DER prefix, as for X25519 above.
-const MLKEM_SPKI_PREFIX = {};
+// still not know ML-KEM). The raw key's SPKI wrapping is cryptographic-formats'
+// (RFC 9935), and the probe checks it is the one node:crypto writes: a set
+// where they differ is not offered.
+function mlkem_spki(bits, raw) {
+  return Buffer.from(SPKI.to_der({ algorithm: 'mlKem' + bits, point: raw }));
+}
 function probe_mlkem(bits) {
   if (typeof crypto.encapsulate !== 'function' || typeof crypto.decapsulate !== 'function') return false;
   try {
@@ -201,8 +206,8 @@ function probe_mlkem(bits) {
     let dec = crypto.decapsulate(kp.privateKey, enc.ciphertext);
     if (enc.ciphertext.length !== p.ct || Buffer.compare(Buffer.from(enc.sharedKey), Buffer.from(dec)) !== 0) return false;
     let spki = kp.publicKey.export({ format: 'der', type: 'spki' });
-    MLKEM_SPKI_PREFIX[bits] = Buffer.from(spki.subarray(0, spki.length - p.ek));
-    return true;
+    let ek = SPKI.from_der(spki).point;
+    return ek.length === p.ek && Buffer.compare(mlkem_spki(bits, ek), Buffer.from(spki)) === 0;
   } catch (e) {
     return false;
   }
@@ -213,7 +218,7 @@ const MLKEM_AVAILABLE = MLKEM_SETS[768];
 // Import checks the key (FIPS 203 §7.2: every coefficient below q) and throws
 // on a bad one — before any secret exists.
 function mlkem_public_key(bits, raw) {
-  return crypto.createPublicKey({ key: Buffer.concat([MLKEM_SPKI_PREFIX[bits], Buffer.from(raw)]), format: 'der', type: 'spki' });
+  return crypto.createPublicKey({ key: mlkem_spki(bits, raw), format: 'der', type: 'spki' });
 }
 
 function kem_group_available(group) {
@@ -288,8 +293,7 @@ function generate_keypair(group) {
     // share is the two public keys in the group's order.
     let d = KEM_GROUPS[group], sz = kem_sizes(group);
     let kem = crypto.generateKeyPairSync(MLKEM[d.kem].type);
-    let spki = kem.publicKey.export({ format: 'der', type: 'spki' });
-    let ek = spki.subarray(spki.length - sz.ek);
+    let ek = SPKI.from_der(kem.publicKey.export({ format: 'der', type: 'spki' })).point;
     let ec = d.ecdh ? ECDH_PART[d.ecdh].generate() : null;
     let pub = new Uint8Array(sz.client);
     if (!ec) pub.set(ek, 0);

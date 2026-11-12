@@ -1,6 +1,6 @@
 {
   "name": "lemon-tls",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "TLS 1.3/1.2 DTLS 1.3/1.2 implementation for Node.js - full control over cryptographic keys, record layer, and handshake. Drop-in replacement for node:tls with advanced options impossible in OpenSSL.",
   "main": "index.js",
   "type": "module",
@@ -58,6 +58,12 @@
   "engines": {
     "node": ">=24.0.0"
   },
+  "dependencies": {
+    "cryptographic-formats": "^0.1.0"
+  },
+  "scripts": {
+    "test": "node tests/test_all.js && node tests/test_x509_chain.js && node tests/test_keys_groups.js"
+  },
   "keywords": [
     "tls",
     "dtls",
@@ -110,7 +116,6 @@
     "http3",
     "record-layer",
     "pure-javascript",
-    "zero-dependencies",
     "no-openssl",
     "security",
     "network",

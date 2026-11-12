@@ -18,16 +18,20 @@
 
 ## ✨ Features
 
-* 🔒 **Pure JavaScript** – no OpenSSL, no native bindings. Zero dependencies.
+* 🔒 **Pure JavaScript** – no OpenSSL, no native bindings. The cryptography is `node:crypto`'s; certificates and keys are read by `cryptographic-formats`, its one dependency.
 * ⚡ **TLS 1.3 (RFC 8446)** + **TLS 1.2** – both server and client.
 * 📡 **DTLS 1.3 (RFC 9147)** + **DTLS 1.2** – server and client, with cookie exchange, retransmission, and **DTLS-SRTP** (RFC 5764) for WebRTC. Not a shim over TLS: the record layer, epochs, and sequence-number handling are implemented for datagrams.
 * 🌐 **Browser-tested** – verified interop with Chrome, curl, Node.js, openssl s_client, and msquic.
 * 🔑 **Key Access** – read handshake secrets, traffic keys, ECDHE shared secret, and resumption data at any point.
 * 🔁 **Session Resumption** – session tickets + PSK with binder validation, with application data carried inside the ticket (`ticketData`, `getTicketInfo()`).
 * 🔄 **Key Update** – refresh traffic keys on long-lived TLS 1.3 connections.
-* 🔃 **HelloRetryRequest** – automatic group negotiation fallback (X25519, P-256, P-384).
+* 🔃 **HelloRetryRequest** – automatic group negotiation fallback (X25519, P-256, P-384; a server takes X448 and P-521 too).
+* 🗝 **External PSK (RFC 8446 §2.2)** – a key both sides hold from elsewhere authenticates the handshake, no certificates — TLS 1.3 and DTLS 1.3, `node:tls`'s `pskCallback` or a `psk` option. Interop-tested with OpenSSL and `node:tls` both ways.
+* 📮 **DTLS Connection ID (RFC 9146, RFC 9147)** – a DTLS connection survives the peer's address changing (a NAT rebinding): `createDTLSServer` finds it by its CID.
+* 📏 **record_size_limit (RFC 8449)** – for constrained peers: what they take is what they are sent.
+* 🪪 **Several certificates per server** – `key` / `cert` arrays, as `node:tls`: an RSA and an ECDSA one, say — per handshake, the one the client can verify (its signature algorithms, and in TLS 1.2 its suites and curves).
 * 🛰 **Post-quantum key exchange** – the hybrid **X25519MLKEM768** group, as Chrome, Firefox, Safari and Cloudflare negotiate it, wherever `node:crypto` has ML-KEM (Node 24.7+).
-* 🕶 **Encrypted Client Hello (RFC 9849)** – server *and* client. The real ClientHello — the site's name, the ALPN list — goes encrypted with HPKE to a key published in DNS. Key generation, rotation, `retry_configs`, HelloRetryRequest, resumption inside ECH, and GREASE ECH. Tested against Go's `crypto/tls` in both directions.
+* 🕶 **Encrypted Client Hello (RFC 9849)** – server *and* client, over TLS 1.3 and DTLS 1.3. The real ClientHello — the site's name, the ALPN list — goes encrypted with HPKE to a key published in DNS. Key generation, rotation, `retry_configs`, HelloRetryRequest, resumption inside ECH, and GREASE ECH. Tested against Go's `crypto/tls` in both directions.
 * 🗜 **Certificate compression (RFC 8879)** – brotli, zlib and zstd, both directions; a public CA's chain often shrinks by half — over QUIC that can save a round trip.
 * 📄 **OCSP stapling** – the server staples (`'OCSPRequest'`, as `node:tls`), the client asks for it (`requestOCSP`, `'OCSPResponse'`).
 * 📜 **Client Certificate Auth** – mutual TLS (mTLS) with `requestCert` / `cert` / `key` options.
@@ -108,6 +112,37 @@ const socket2 = tls.connect(8443, 'localhost', { session: savedSession }, () => 
   console.log('Resumed:', socket2.isSessionReused());  // true
 });
 ```
+
+### External PSK
+
+A key both sides hold from elsewhere (provisioned, derived from a pairing),
+in place of certificates — TLS 1.3 and DTLS 1.3, with a fresh ECDHE secret
+mixed in (psk_dhe_ke). The peer that proves it is authenticated by it:
+`authorized` is `true` with no certificate at all. As in `node:tls`:
+
+```js
+const KEYS = { 'device-17': Buffer.from('…32 bytes…', 'hex') };
+
+const server = tls.createServer({
+  key, cert,                                   // optional: for clients without a PSK
+  pskCallback: (socket, identity) => KEYS[identity] || null,
+}, (socket) => console.log(socket.getPskIdentity().toString()));   // 'device-17'
+
+tls.connect({ host, port, pskCallback: () => ({ identity: 'device-17', psk: KEYS['device-17'] }) });
+// or, without a callback: psk: { identity: 'device-17', psk: KEYS['device-17'] }
+```
+
+SHA-256 unless said otherwise (`hash: 'sha384'`, on both sides — the server
+answers with `{ psk, hash }`). An identity the server does not know gives a
+full handshake with its certificate, checked as usual. The PSK is TLS 1.3's:
+a client offering only TLS 1.2 fails at once, saying so (TLS 1.2 PSK suites
+are not carried). A server with no certificate takes PSK clients only — any
+other gets `handshake_failure`. A client given both `psk` and a saved
+`session` offers the PSK, its credential; the server, offered several
+identities (OpenSSL lists a ticket and a PSK), takes the first it knows.
+DTLS 1.3 the same: `createDTLSServer` / `connectDTLS` take `pskCallback` as
+above, `DTLSSession` as `TLSSession` does (`pskCallback(identity)`, the
+identity as bytes).
 
 ### Mutual TLS (Client Certificate)
 
@@ -284,13 +319,14 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | `minVersion` | string | `'TLSv1.2'` or `'TLSv1.3'` |
 | `maxVersion` | string | `'TLSv1.2'` or `'TLSv1.3'` |
 | `ALPNProtocols` | string[] | Offered ALPN protocols |
-| `rejectUnauthorized` | boolean | Validate peer certificate (default: `true`) |
+| `rejectUnauthorized` | boolean | Validate peer certificate (default: `true`): the chain to a trust anchor, each certificate's validity, and what each may do (RFC 5280: basicConstraints and pathLenConstraint, keyUsage, extendedKeyUsage — serverAuth for a server, clientAuth for a client — name constraints — on the subject, its emailAddress, every subjectAltName, and a leaf's common name when it has no DNS name, as OpenSSL — critical extensions), no signature by MD5 or SHA-1 below the anchor (`CA_MD_TOO_WEAK`, as node:tls), then the name (subjectAltName only: no common-name fallback, no partial wildcards). No trust anchors: not authorized |
 | `ca` | Buffer/string | CA certificate(s) for validation |
 | `ticketKeys` | Buffer | 48-byte key for session ticket encryption (server) |
 | `session` | Buffer | Saved session blob from `'session'` event (client resumption) |
 | `requestCert` | boolean | Request client certificate (server) |
-| `cert` | Buffer/string | Client certificate PEM (for mTLS) |
-| `key` | Buffer/string | Client private key PEM (for mTLS) |
+| `cert` | Buffer/string | Certificate PEM — a client's for mTLS; a server's, or several as an array |
+| `key` | Buffer/string | Private key PEM — with several certificates, an array, each key paired with the chain of its public key; per handshake the server presents the one the client can verify |
+| `pskCallback` | function | External PSK (TLS 1.3). **Client:** `(hint) => ({ psk, identity })` or `null` — `hint` is always `null` (TLS 1.3 has none). **Server:** `(socket, identity) => psk` (or `{ psk, hash }`), `null` for an identity it does not know |
 | `ciphers`, `ecdhCurve`, `sigalgs` | string | As `node:tls` takes them (`createServer` / `connect`); a value naming nothing usable throws. `sigalgs` limits what the endpoint signs with, as well as what it offers and accepts |
 | `requestOCSP` | boolean | Client: ask for the server's stapled OCSP response; it comes as `'OCSPResponse'` |
 | `sessionTimeout` | number | Server: seconds a session stays good — TLS 1.2 Session IDs, and the ticket lifetime unless `ticketLifetime` is given |
@@ -300,16 +336,18 @@ High-level wrapper extending `stream.Duplex`, API-compatible with Node.js [`tls.
 | Option | Type | Description |
 |---|---|---|
 | `sessionTickets` | boolean | Enable/disable session tickets (default: `true`) |
-| `signatureAlgorithms` | number[] | Per-connection sigalg list, e.g. `[0x0804]` for RSA-PSS only |
+| `signatureAlgorithms` | number[] | Per-connection sigalg list, e.g. `[0x0804]` for RSA-PSS only. No SHA-1 scheme is offered, signed with or accepted for a handshake signature, at any version (RFC 9155): a list naming `0x0201` or `0x0203` throws, and a TLS 1.2 client that offers only SHA-1 — or no `signature_algorithms` at all — gets `handshake_failure` |
 | `groups` | number[] | Per-connection curves, e.g. `[0x001d]` for X25519 only |
 | `prioritizeChaCha` | boolean | Move ChaCha20-Poly1305 before AES in cipher preference |
-| `maxRecordSize` | number | Max plaintext per TLS record (default: 16384) |
-| `allowedCipherSuites` | number[] | Whitelist - only these ciphers are offered |
+| `maxRecordSize` | number | Max plaintext per record of application data (default: 16384). Handshake messages always go in records of at most 2^14 bytes |
+| `recordSizeLimit` | number / false | RFC 8449: the largest record this side takes — 64 to 16385 (TLS 1.3 counts the type byte). A client sends it; a server answers a client's with this or the maximum. Records sent are cut to the peer's limit, a larger one received ends the connection (`record_overflow`). `false`: never sent nor answered |
+| `psk` | object | Client: an external PSK without a callback — `{ identity, psk, hash? }` (`hash`: `'sha256'`, the default, or `'sha384'`) |
+| `allowedCipherSuites` | number[] | Only these suites, in this order of preference (see Supported cipher suites) |
 | `pins` | string[] | Certificate pinning: `['sha256/AAAA...']` |
 | `handshakeTimeout` | number | Abort handshake after N ms. `createServer`: `120000` by default, as in Node |
 | `maxHandshakeSize` | number | Max handshake bytes - DoS protection |
 | `certificateCallback` | function | Dynamic cert selection: `(info, cb) => cb(null, ctx)` |
-| `ech` | object / Buffer / string | Encrypted Client Hello (RFC 9849). **Server:** `{ keys: [{ config, privateKey, retry }] }` — from `generateEchKey()`; `retry: false` keeps a key for decrypting without offering it in `retry_configs`. **Client:** the server's ECHConfigList, bytes or base64 (the `ech=` of its HTTPS record); the hello then offers TLS 1.3 only. A malformed list, or one with no config this client can use, throws |
+| `ech` | object / Buffer / string | Encrypted Client Hello (RFC 9849). **Server:** `{ keys: [{ config, privateKey, retry }] }` — from `generateEchKey()`; `retry: false` keeps a key for decrypting without offering it in `retry_configs`. **Client:** the server's ECHConfigList, bytes or base64 (the `ech=` of its HTTPS record); the hello then offers TLS 1.3 only (DTLS 1.3 over DTLS). A malformed list, or one with no config this client can use, throws — fail closed: never a connection with the name in the clear |
 | `echGrease` | boolean | Client, without `ech`: send GREASE ECH (RFC 9849 §6.2), as browsers do (default `false`) |
 | `certificateCompression` | boolean / string[] | RFC 8879: `['brotli', 'zlib', 'zstd']`, `true` (all this Node has) or `false`. Server: what it compresses its chain with, for a client that offers it (default: all). Client: what it offers (default: none) |
 | `ticketLifetime` | number | Server: seconds a TLS 1.3 ticket is good for (default `7200`, capped at 7 days, RFC 8446 §4.6.1) |
@@ -324,12 +362,13 @@ certificate is asked for again.
 
 ### Supported cipher suites
 
-Sixteen suites are implemented; three are offered by default. Anything else has
-to be asked for explicitly via `local_supported_cipher_suites` or narrowed with
-`allowedCipherSuites` — the default list stays small on purpose, because every
-extra suite widens the offer and changes your JA3/JA4.
+Nine suites, all AEAD with forward secrecy: the three of TLS 1.3, and six of
+TLS 1.2 with ECDHE. All are offered by default (the TLS 1.2 ones when TLS 1.2
+is enabled). `allowedCipherSuites` (DTLS: `cipherSuites`) or `ciphers`
+narrows the list; a list with none of these suites in it is refused where it
+is given ("no cipher match"), as node:tls refuses `ciphers`.
 
-**TLS 1.3** — offered by default
+**TLS 1.3**
 
 | Code | Suite | AEAD | Hash |
 |---|---|---|---|
@@ -337,7 +376,7 @@ extra suite widens the offer and changes your JA3/JA4.
 | `0x1302` | `TLS_AES_256_GCM_SHA384` | AES-256-GCM | SHA-384 |
 | `0x1303` | `TLS_CHACHA20_POLY1305_SHA256` | ChaCha20-Poly1305 | SHA-256 |
 
-**TLS 1.2 — AEAD** (opt in)
+**TLS 1.2**
 
 | Code | Suite | Key exchange | AEAD |
 |---|---|---|---|
@@ -347,29 +386,22 @@ extra suite widens the offer and changes your JA3/JA4.
 | `0xC030` | `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` | ECDHE_RSA | AES-256-GCM |
 | `0xCCA8` | `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | ECDHE_RSA | ChaCha20-Poly1305 |
 | `0xCCA9` | `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` | ECDHE_ECDSA | ChaCha20-Poly1305 |
-| `0xCCAA` | `TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | DHE_RSA | ChaCha20-Poly1305 |
-| `0x009C` | `TLS_RSA_WITH_AES_128_GCM_SHA256` | RSA | AES-128-GCM |
-| `0x009D` | `TLS_RSA_WITH_AES_256_GCM_SHA384` | RSA | AES-256-GCM |
 
-**TLS 1.2 — CBC** (opt in; legacy, no forward secrecy on the RSA ones)
-
-| Code | Suite | Key exchange | Cipher | MAC |
-|---|---|---|---|---|
-| `0xC013` | `TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA` | ECDHE_RSA | AES-128-CBC | SHA-1 |
-| `0xC014` | `TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA` | ECDHE_RSA | AES-256-CBC | SHA-1 |
-| `0x003C` | `TLS_RSA_WITH_AES_128_CBC_SHA256` | RSA | AES-128-CBC | SHA-256 |
-| `0x003D` | `TLS_RSA_WITH_AES_256_CBC_SHA256` | RSA | AES-256-CBC | SHA-256 |
-
-The `0xCCAA` / `0x009C` / `0x009D` suites and the CBC block carry no forward
-secrecy with an RSA key exchange; they exist for interoperability with older
-peers, not as a recommendation.
+RSA key transport (`0x009C`, `0x009D`), DHE (`0xCCAA`) and CBC (`0xC013`,
+`0xC014`, `0x003C`, `0x003D`) are not supported: no forward secrecy, and
+attacks of their own (Marvin, Lucky13). A client offering only those gets a
+`handshake_failure` alert.
 
 ChaCha20-Poly1305 uses a full 12-byte IV with no explicit nonce (RFC 7905),
 unlike GCM — the registry records that per suite.
 
-`prioritizeChaCha: true` moves the ChaCha suites ahead of AES. Note this
-changes your **JA3** but not your **JA4**: JA4 sorts the cipher list before
-hashing, so only *which* suites you offer matters there, never their order.
+`allowedCipherSuites` (or `ciphers`) is also the **preference order**: the
+suites are offered, and — with `honorCipherOrder: true` on a server — chosen,
+in the order given, as node:tls takes `ciphers`. Without `honorCipherOrder` a
+server takes the client's order (node:tls's default). `prioritizeChaCha: true`
+moves the ChaCha suites ahead of AES. Neither changes your **JA4**: JA4 sorts
+the cipher list before hashing, so only *which* suites you offer matters there,
+never their order.
 
 
 
@@ -432,16 +464,18 @@ hashing, so only *which* suites you offer matters there, never their order.
 | `socket.isResumed` | Alias for `isSessionReused()` |
 | `socket.handshakeDuration` | Handshake time in ms |
 | `socket.echStatus` | Encrypted Client Hello. Server: `null` (not offered), `'accepted'`, `'rejected'` (the handshake ran as the public name and `retry_configs` went out). Client: `null` (no ECH), `'grease'`, `'accepted'`, `'rejected'` |
+| `socket.echBackend` | Server, ECH split mode (RFC 9849 §3.1): `true` when the client-facing server in front of this one decrypted ECH and passed the inner hello on — `echStatus` is `'accepted'` either way (the name went encrypted). DTLS: `isEchBackend()` |
+| `socket.getPskIdentity()` | External PSK: the identity (`Buffer`) this connection was authenticated with — or resumed from one that was — else `null`. DTLS: the same, as bytes |
 | `socket.echAccepted` | `echStatus === 'accepted'` |
 | `socket.getTicketInfo()` | `{ data, resumed, offered, state }` — the `ticketData` of the ticket this connection resumed with (server), whether it resumed, whether a ticket was offered |
-| `useDefaultCA` | When no `ca` is given, chain against the platform trust store instead of authorizing everything (default `true`). **Breaking change**: a self-signed or private-CA peer that previously connected with no `ca` configured now fails with `UNABLE_TO_GET_ISSUER_CERT`. That is the point — the old behaviour reported a connection as verified while verifying nothing, with `rejectUnauthorized` defaulting to true. Set `false` to opt back out explicitly. DTLS defaults to `false`, since WebRTC peers are self-signed by design and authenticated by SDP fingerprint |
+| `useDefaultCA` | When no `ca` is given, chain against the platform trust store instead of authorizing everything (default `true`). **Breaking change**: a self-signed or private-CA peer that previously connected with no `ca` configured now fails with `UNABLE_TO_GET_ISSUER_CERT`. That is the point — the old behaviour reported a connection as verified while verifying nothing, with `rejectUnauthorized` defaulting to true. On both sides: a server asking for client certificates (`requestCert`) chains them against it too, as node:tls does. `false`: only `ca` — and with no `ca` either, no peer is authorized (`DEPTH_ZERO_SELF_SIGNED_CERT` / `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`); a caller that authenticates the peer another way says so with `rejectUnauthorized: false`. DTLS defaults to `false`, since WebRTC peers are self-signed by design and authenticated by SDP fingerprint |
 | `allowHalfOpen` | When `false` (the Node default, and now ours) the writable side ends automatically once the peer stops writing. This was hardcoded `true`, the opposite of Node — code expecting the documented behaviour was left holding connections open |
 | `checkServerIdentity(hostname, cert)` | Replaces the built-in RFC 6125 identity check. Return `undefined` to accept, an `Error` to reject. Runs **after** chain verification, as Node documents — a hook that only checks a pin cannot rescue a chain that failed |
 | `socket` | Run the handshake over an existing `Duplex` instead of dialling out. `host`/`port` are then ignored and nothing is connected for you, so the caller can speak cleartext first and upgrade — STARTTLS for SMTP, IMAP, PostgreSQL |
 | `secureContext` | A context from `createSecureContext()`, reused across connections instead of re-parsing the same PEM each time. Explicit `secureContext` wins over `key`/`cert` |
 | `ALPNCallback` | `({ servername, protocols }) => protocol \| undefined`. Server-side, synchronous. Returning `undefined` refuses with `no_application_protocol`. Mutually exclusive with `ALPNProtocols` |
-| `grease` | Insert GREASE (RFC 8701) reserved values into the ClientHello, as browsers do (default `false`). Covers cipher suites, extension types, supported groups, signature algorithms, supported versions, ALPN, `psk_key_exchange_modes` and a dummy `key_share` entry. **Changes no fingerprint** — JA3 and JA4 both strip GREASE — but its *absence* reads as "not a browser". Any list you already GREASE'd by hand is left alone, so `grease: true` never collides with manual configuration. Safe against public HTTPS servers; leave off for DTLS/WebRTC peers until tested |
-| `permuteExtensions` | Shuffle ClientHello extension order per connection, as Chrome 110+ does (default `false`). Changes your **JA3** on every handshake; leaves your **JA4** byte-for-byte identical, since JA4 sorts before hashing. Order is chosen once and replayed on a post-HRR retry, per RFC 8446 §4.1.2 |
+| `grease` | Insert GREASE (RFC 8701) reserved values into the ClientHello, as browsers do (default `false`). Covers cipher suites, extension types, supported groups, signature algorithms, supported versions, ALPN, `psk_key_exchange_modes` and a dummy `key_share` entry. **Changes no fingerprint** — JA4 strips GREASE — but its *absence* reads as "not a browser". Any list you already GREASE'd by hand is left alone, so `grease: true` never collides with manual configuration. Safe against public HTTPS servers; leave off for DTLS/WebRTC peers until tested |
+| `permuteExtensions` | Shuffle ClientHello extension order per connection, as Chrome 110+ does (default `false`). Leaves your **JA4** byte-for-byte identical, since JA4 sorts before hashing. Order is chosen once and replayed on a post-HRR retry, per RFC 8446 §4.1.2 |
 | `socket.getJA4(opts?)` | The client's **JA4** fingerprint, `{ hash, raw }` (`t13d1516h2_8daaf6152771_e5627ece308c`). Available in either role, since both hellos are visible to both peers; `null` before the ClientHello has been seen. Pass `{ protocol: 'q' }` when driving the session from QUIC |
 | `socket.getJA5(opts?)` | **JA5**: JA4 without the extensions that describe the connection rather than the client (`pre_shared_key`, `session_ticket`, `early_data`, `padding`, `cookie`, `psk_key_exchange_modes`) — the same client build has one JA5 whether it resumed or not — and with the `supported_groups` it offers, which JA4 does not look at. `{ hash, raw }` |
 | `socket.getJA4S(opts?)` | The server's **JA4S** fingerprint, `{ hash, raw }` — `null` until a ServerHello exists |
@@ -533,7 +567,18 @@ handling, cookie exchange):
 Retransmission under loss: in DTLS 1.3 an ACK that covers only part of a
 flight retires only those records — the rest are resent when the timer
 fires (RFC 9147 §7.1) — and a client keeps resending its final flight until
-the peer ACKs it or sends protected data (§5.8.3).
+the peer ACKs it: the one flight acknowledged by nothing else (§7.1), not
+even by the server's data, which can come before it has the Finished.
+
+The timer doubles on each timeout, up to 60 s. Where it starts: with
+`initialRetransmitTimeout` given, there — a fixed schedule, whatever round
+trip is measured; without it, at 1 s, and once a round trip has been
+measured, from SRTT + 4·RTTVAR (RFC 6298), at least 100 ms, never sampled
+from a resent flight. A
+flight is given up only after six retransmissions *and* 60 s, so a short
+timer (WebRTC uses 100 ms) does not end a handshake early on a lossy path.
+Post-handshake records (tickets, KeyUpdate) are ACKed together, a quarter
+of the timer after the first (§7.1).
 
 ```js
 import { DTLSSession, DTLSSocket, createDTLSServer, connectDTLS } from 'lemon-tls';
@@ -567,6 +612,44 @@ the `'clienthello'` event, plus `.tls` for direct access to the session.
 **`DTLSSocket` / `createDTLSServer` / `connectDTLS`** — UDP-transport
 wrappers over `DTLSSession`, mirroring the TCP socket layer's shape.
 The same delegated methods and events are available on the socket.
+
+**UDP socket buffers.** The sockets `createDTLSServer` and `connectDTLS` bind
+get 4 MB receive and send buffers (`socketBufferSize`, bytes; `0` or `false`
+for the OS default, 208 KB on Linux — about 180 datagrams, which a burst
+larger than one event-loop turn drains overflows: the kernel drops the rest,
+silently). The kernel caps the size at `net.core.rmem_max` / `wmem_max`, so
+on a server check them (`sysctl net.core.rmem_max`) and raise them if lower:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
+printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' > /etc/sysctl.d/90-udp-buffers.conf
+```
+
+A socket you hand to `new DTLSSocket(udp, ...)` is yours and keeps its own.
+
+**Connection ID** (RFC 9146 for DTLS 1.2, RFC 9147 §9 for 1.3). A peer
+behind a NAT may come back from another port; without a CID its records are
+no connection's. With `connectionId: true` on both sides, the client puts
+the server's CID (8 random bytes, one per connection) in every protected
+record, and `createDTLSServer` finds the connection by it from any address:
+
+```js
+const server = createDTLSServer({ key, cert, connectionId: true }, (socket) => {
+  socket.on('remoteAddressChange', ({ address, port }) => {
+    // The newest authenticated record yet came from there. Not taken over by
+    // itself: RFC 9146 §6 asks for a way of knowing the peer is there first —
+    // the application's (it answers, say), then:
+    socket.setRemoteAddress(address, port);
+  });
+});
+connectDTLS({ host, port, connectionId: true });
+```
+
+A client asks for an empty CID (it needs none: the server does not move);
+`connectionId` may also be the CID itself (`DTLSSession`). `getConnectionIds()`
+gives `{ local, peer }`. In DTLS 1.3 a peer's NewConnectionId with
+`cid_immediate` moves the CID we send; RequestConnectionId is answered by
+keeping the one agreed (the RFC allows it).
 
 ### Record Layer Module
 
@@ -650,7 +733,7 @@ const socket = tls.connect(443, 'api.example.com', {
   groups: [0x001d],                        // X25519 only (Node: ecdhCurve is global)
   signatureAlgorithms: [0x0804],           // RSA-PSS-SHA256 only (Node: no control)
   prioritizeChaCha: true,                  // ChaCha20 before AES (Node: no control)
-  allowedCipherSuites: [0x1301, 0x1303],   // whitelist (Node: string-based, error-prone)
+  allowedCipherSuites: [0x1303, 0x1301],   // only these, ChaCha first (Node: string-based, error-prone)
 });
 
 // Disable session tickets (in Node.js requires openssl.cnf)
@@ -722,6 +805,38 @@ LemonTLS is verified against real-world TLS implementations:
 | **msquic** | (via QUICO) | 1.3 | HRR + P-384 + AES-256-GCM-SHA384 tested |
 | **Go `crypto/tls`** | Client / Server | 1.3 | **ECH** both ways: accepted, `retry_configs` then accepted with them, HelloRetryRequest; GREASE ECH (our client), resumption inside ECH (our server) |
 
+### Certificate validation, against node:tls
+
+`tests/test_x509_chain.js` runs 71 cases, the chains made by `openssl ca` — trust and
+shape, validity windows, what a CA and a leaf may do, name constraints of
+every kind, RSA / RSA-PSS / Ed25519 / P-384, two CAs of one name — and
+connects to each with a node:tls client and a LemonTLS client (and checks
+client certificates with both servers), comparing `authorizationError`.
+Where node:tls reports `UNSPECIFIED` (codes missing from its table: name
+constraints, critical extensions, weak digests), `openssl verify` on the
+same chain is the reference. `tests/test_keys_groups.js` does the same for
+private keys in every encoding and the key-exchange groups, against node:tls
+and `openssl s_client`.
+
+The certificate format — DER, extensions, names, name constraints, host
+names — is `cryptographic-formats`'s; the
+verifier's decisions on top of it, and the signature checks (`node:crypto`),
+are `src/session/x509.js`.
+
+Where LemonTLS answers differently from node:tls, on purpose:
+
+| Case | node:tls | LemonTLS |
+|---|---|---|
+| An intermediate given as `ca` | not a root: refused | any certificate in `ca` is an anchor |
+| The peer's own leaf given as `ca` | refused | pinned: authorized |
+| A leaf that is a CA (`cA: TRUE`) | authorized | `INVALID_PURPOSE` (CA/B Forum BR 7.1.2.7.8) |
+| A leaf whose keyUsage does not allow signing | `INVALID_PURPOSE` | the handshake ends (`unsupported_certificate`): the key signs it |
+| A critical `nsCertType` | enforced by its own rules | `UNHANDLED_CRITICAL_EXTENSION`: not read here |
+| `b.example.com.` under an excluded `.example.com` | outside it; the host check fails it | `EXCLUDED_VIOLATION`: the exclusion holds for both spellings |
+| A URI name with an IPv6 host under a URI constraint | read as host `[2001`, passed | `UNSUPPORTED_NAME_SYNTAX` |
+| Two CAs of one name without key identifiers, the wrong one first | `CERT_SIGNATURE_FAILURE` | the next one is tried |
+| A `ca` bundle with a block that does not decode | stops there: the anchors after it are dropped | that block alone is skipped (named in the `LEMON_DEBUG` log; `createSecureContext()` returns it in `caSkipped`) |
+
 ## ⚡ Performance
 
 Benchmarks on Windows (Node v25.9.0, Lemon↔Lemon localhost, 10MB transfers, median of 25 iterations):
@@ -748,7 +863,7 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ✅ | TLS 1.3 - Server + Client |
 | ✅ | TLS 1.2 - Server + Client |
 | ✅ | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 |
-| ✅ | X25519 / P-256 / **P-384** key exchange |
+| ✅ | X25519 / P-256 / P-384 / X448 / P-521 key exchange |
 | ✅ | RSA-PSS / ECDSA / RSA-PKCS#1 signatures |
 | ✅ | SNI, ALPN extensions |
 | ✅ | HelloRetryRequest (both client and server side) |
@@ -768,7 +883,7 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ✅ | `exportKeyingMaterial` — RFC 5705 (1.2) + RFC 8446 §7.5 (1.3, proper two-stage `exporter_master_secret` derivation) |
 | ✅ | Peer-extension introspection (`getRemoteExtension(s)`) + custom `local_extensions` answered in the 1.2 ServerHello and 1.3 EncryptedExtensions |
 | ✅ | DTLS-SRTP keying flow (use_srtp negotiation + key export) verified end-to-end against rtp-packet |
-| ✅ | Zero dependencies - `node:crypto` only |
+| ✅ | `node:crypto` for the cryptography; certificate and key formats from `cryptographic-formats` |
 | ✅ | **72 automated tests** (compat, resumption, data transfer) |
 | ✅ | Browser-tested (Chrome) |
 | ✅ | Encrypted Client Hello (RFC 9849) — server and client, GREASE ECH |
@@ -777,6 +892,10 @@ For a pure-JavaScript implementation with zero native dependencies, this is with
 | ✅ | Certificate compression (RFC 8879) — brotli, zlib, zstd |
 | ✅ | OCSP stapling — server (`'OCSPRequest'`) and client (`requestOCSP`) |
 | ✅ | Application data in session tickets (`ticketData`, `getTicketInfo()`) |
+| ✅ | External PSK (TLS 1.3 / DTLS 1.3, psk_dhe_ke) |
+| ✅ | DTLS Connection ID (RFC 9146, RFC 9147) — with the server finding a moved peer |
+| ✅ | record_size_limit (RFC 8449) |
+| ✅ | Several certificates per server, chosen per handshake |
 
 ### ⏳ Planned
 
@@ -828,12 +947,15 @@ src/
                            checkServerIdentity, Server)
   node_options.js        - node:tls option strings (ciphers, ecdhCurve, sigalgs)
                            → code-point lists
-  secure_context.js      - PEM/DER cert/key loading
+  secure_context.js      - PEM/DER cert/key loading (cryptographic-formats reads them)
+  ca_store.js            - the default trust anchors (Node's CA bundle)
   utils.js               - array helpers, certificateObject
   dtls_session.js        - DTLS state machine
   dtls_socket.js         - DTLS socket wrapper (UDP transport)
   session/
     signing.js           - signature scheme selection + signing
+    x509.js              - certificates (read by cryptographic-formats), issuer and
+                           signature checks, RFC 5280 path checks, host names
     ecdh.js              - X25519 / P-256 / P-384 key exchange
     message.js           - high-level message build/parse
     ticket.js            - session ticket encryption

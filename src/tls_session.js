@@ -52,7 +52,9 @@ import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, SERVER_DEFAULT_GROUPS as ECD
 import { build_tls_message, parse_tls_message } from './session/message.js';
 import { encrypt_session_blob, decrypt_session_blob, encode_client_session, decode_client_session } from './session/ticket.js';
 import { parse_cert_compression, supported_cert_compression, compress_certificate_body, decompress_certificate_body, cert_compression_name } from './session/cert_compression.js';
-import { check_path, matches_host, is_ip_literal } from './session/x509.js';
+import { parse_cert, issued_by, signed_by, self_signed, valid_at, validity_error,
+         check_path, matches_host, is_ip_literal } from './session/x509.js';
+import * as PEM from 'cryptographic-formats/pem';
 import { getRootCertificates } from './ca_store.js';
 import { prepare_ech_server, server_process_client_hello, backend_client_hello, accept_confirmation, EXT_ECH,
          parse_ech_config_list, prepare_ech_client, client_hpke_setup, client_outer_ext_data, client_encode_inner,
@@ -120,9 +122,10 @@ const EARLY_REPLAY_TIMEOUT_MS = 100;
 // (local_private_key). Gone with them.
 const PRIVATE_KEY_OBJECTS = new WeakMap();
 
-function _x509(x) {
-  try { return new crypto.X509Certificate(Buffer.isBuffer(x) ? x : Buffer.from(x)); }
-  catch (e) { return null; }
+// A certificate from DER (session/x509.js), or null
+function _cert(x) {
+  if (x == null) return null;
+  return parse_cert(x instanceof Uint8Array ? x : Buffer.from(x));
 }
 // Trust anchors, parsed once. The anchors are the same certificates on every
 // handshake — the platform bundle (~150 roots) or the caller's `ca` — and
@@ -138,17 +141,27 @@ const ANCHOR_CACHE_MAX = 1024;
 const _anchorByPem = new Map();
 const _anchorByObj = new WeakMap();
 // One `ca` entry: a PEM string or Buffer may hold a whole BUNDLE — many
-// certificates, as node:tls takes them (and as a CA file is). X509Certificate
-// reads the first and stops, so only the first CA of a bundle was trusted,
-// over TLS and DTLS alike. A DER Buffer (or anything else) is one certificate.
-const PEM_CERT_RE = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+// certificates, as node:tls takes them (and as a CA file is). Only the
+// first CA of a bundle was once trusted, over TLS and DTLS alike. A DER
+// Buffer (or anything else) is one certificate. A block that is not a
+// certificate, a PEM block that does not decode, and a certificate that
+// does not read are skipped — as node:tls skips them — and named in the
+// LEMON_DEBUG log; the rest of the bundle stands.
 function _parseAnchors(a) {
   let pem = typeof a === 'string' ? a
     : (Buffer.isBuffer(a) || a instanceof Uint8Array) && a.length > 10 && a[0] === 0x2d /* '-' */ ? Buffer.from(a).toString('latin1')
     : null;
-  if (pem === null) { let x = _x509(a); return x ? [x] : []; }
-  let out = [], m = pem.match(PEM_CERT_RE) || [];
-  for (let i = 0; i < m.length; i++) { let x = _x509(m[i]); if (x) out.push(x); }
+  if (pem === null) { let x = _cert(a); return x ? [x] : []; }
+  let read;
+  try { read = PEM.decode_skipping(pem); } catch (e) { dbg('CA', 'no PEM block in a `ca` entry'); return []; }
+  for (const s of read.skipped) dbg('CA', 'skipped the ' + s.label + ' block at line ' + s.line + ': ' + s.code + ' — ' + s.detail);
+  let out = [];
+  for (let i = 0; i < read.blocks.length; i++) {
+    if (read.blocks[i].label !== 'CERTIFICATE') continue;
+    let x = _cert(read.blocks[i].der);
+    if (x) out.push(x);
+    else dbg('CA', 'skipped a certificate that does not read (block ' + (i + 1) + ')');
+  }
   return out;
 }
 function _anchorX509s(a) {
@@ -170,21 +183,14 @@ function _anchorX509s(a) {
   return [];
 }
 function _sameCert(a, b) { return a.raw.length === b.raw.length && a.raw.equals(b.raw); }
-function _validNow(x509, now) {
-  return !(now < new Date(x509.validFrom) || now > new Date(x509.validTo));
-}
-// The node:tls (OpenSSL) code for a certificate outside its validity window.
-function _validityError(x509, now) {
-  return now < new Date(x509.validFrom) ? 'CERT_NOT_YET_VALID' : 'CERT_HAS_EXPIRED';
-}
-function _selfSigned(x509) {
-  try { return !!x509.checkIssued(x509) && x509.verify(x509.publicKey); } catch (e) { return false; }
-}
 
 // The trust anchors of one `ca` (or the platform bundle), parsed and indexed
 // by subject name. Each handshake used to try every anchor against the peer's
-// chain — ~150 checkIssued calls against the platform bundle — where only the
-// ones named as the issuer can be it.
+// chain — ~150 issuer checks against the platform bundle — where only the
+// ones named as the issuer can be it. The key is cryptographic-formats' name_key:
+// equal exactly when the names match (RFC 5280 §7.1, as OpenSSL compares
+// them), so the index finds every anchor that could be the issuer and no
+// other — a printed name, normalized, could miss one in an exotic encoding.
 //
 // Cached by the anchors array's identity, and checked entry by entry on every
 // use (a pointer compare each): an application that changes the array in
@@ -192,7 +198,6 @@ function _selfSigned(x509) {
 // single anchor (not an array) is indexed afresh each time: there is little
 // to index.
 const _storeByAnchors = new WeakMap();
-function _nameKey(name) { return String(name).toLowerCase().replace(/\s+/g, ' ').trim(); }
 const NO_ANCHORS = [];
 function _trustStore(anchors) {
   let entries = anchors == null ? [] : Array.isArray(anchors) ? anchors : [anchors];
@@ -205,14 +210,14 @@ function _trustStore(anchors) {
   for (let i = 0; i < entries.length; i++) {
     let xs = _anchorX509s(entries[i]);
     for (let k = 0; k < xs.length; k++) {
-      let key = _nameKey(xs[k].subject), b = bySubject.get(key);
+      let key = xs[k].subjectKey, b = bySubject.get(key);
       if (b) b.push(xs[k]); else bySubject.set(key, [xs[k]]);
       list.push(xs[k]);
     }
   }
   let store = {
     entries: entries.slice(), list: list,
-    named: (name) => bySubject.get(_nameKey(name)) || NO_ANCHORS,
+    named: (key) => bySubject.get(key) || NO_ANCHORS,
   };
   if (cacheable) _storeByAnchors.set(anchors, store);
   return store;
@@ -220,17 +225,16 @@ function _trustStore(anchors) {
 // The first of `candidates` (anchors) that issued `current`, signed it and
 // is inside its validity window: true (pushed onto `path`). None: the
 // validity error of the first that issued it but is outside its window, or
-// null when none issued it.
-function _anchorIssuer(current, candidates, now, path) {
+// null when none issued it. One that is the issuer by name (and key
+// identifier) but whose key did not make the signature sets seen.badSignature.
+function _anchorIssuer(current, candidates, now, path, seen) {
   let expired = null;
   for (const a of candidates) {
-    try {
-      if (current.checkIssued(a) && current.verify(a.publicKey)) {
-        if (!_validNow(a, now)) { if (!expired) expired = { ok: false, error: _validityError(a, now) }; continue; }
-        path.push(a);
-        return true;
-      }
-    } catch (e) { /* try next anchor */ }
+    if (!issued_by(current, a)) continue;
+    if (!signed_by(current, a)) { seen.badSignature = true; continue; }
+    if (!valid_at(a, now)) { if (!expired) expired = { ok: false, error: validity_error(a, now) }; continue; }
+    path.push(a);
+    return true;
   }
   return expired;
 }
@@ -264,23 +268,29 @@ function _anchorIssuer(current, candidates, now, path) {
  *   UNABLE_TO_VERIFY_LEAF_SIGNATURE    the leaf alone, its issuer unknown
  *   SELF_SIGNED_CERT_IN_CHAIN          the chain ends in an untrusted root
  *   UNABLE_TO_GET_ISSUER_CERT_LOCALLY  the chain stops at an unknown issuer
+ *   CERT_SIGNATURE_FAILURE             the issuer, by name and key identifier,
+ *                                      did not make the signature (and no
+ *                                      other did) — OpenSSL's error 7
  *   CERT_HAS_EXPIRED / CERT_NOT_YET_VALID   a certificate in the path
  *   and check_path's: INVALID_CA, INVALID_PURPOSE, PATH_LENGTH_EXCEEDED,
- *   PERMITTED_VIOLATION, EXCLUDED_VIOLATION, UNHANDLED_CRITICAL_EXTENSION,
- *   UNSUPPORTED_CONSTRAINT_SYNTAX, UNSUPPORTED_NAME_SYNTAX, CA_MD_TOO_WEAK
- *   (signed with MD5 or SHA-1), and UNSPECIFIED (name constraints too costly
- *   to check — OpenSSL's NAME_CHECK_MAX)
+ *   PERMITTED_VIOLATION, EXCLUDED_VIOLATION, SUBTREE_MINMAX,
+ *   UNHANDLED_CRITICAL_EXTENSION, UNSUPPORTED_NAME_SYNTAX, CA_MD_TOO_WEAK
+ *   (signed with MD2, MD4, MD5 or SHA-1), and UNSPECIFIED (name constraints
+ *   too costly to check — OpenSSL's NAME_CHECK_MAX)
+ *
+ * The certificates are read by cryptographic-formats (session/x509.js's
+ * parse_cert); `leaf`, when given, is the leaf already read.
  */
 function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
   if (!chainDer || chainDer.length === 0) return { ok: false, error: 'NO_PEER_CERTIFICATE' };
   now = now || new Date();
 
-  leaf = leaf || _x509(chainDer[0].cert || chainDer[0]);
+  leaf = leaf || _cert(chainDer[0].cert || chainDer[0]);
   if (!leaf) return { ok: false, error: 'CERTIFICATE_PARSE_ERROR' };
 
   const pool = [];
   for (let i = 1; i < chainDer.length; i++) {
-    const x = _x509(chainDer[i].cert || chainDer[i]);
+    const x = _cert(chainDer[i].cert || chainDer[i]);
     if (x) pool.push(x);
   }
 
@@ -306,14 +316,14 @@ function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
     // Only anchors whose subject is the name in question can match (the
     // same certificate has the same subject; an issuer's subject is the
     // issuer name) — a lookup, where every anchor was tried in turn.
-    for (const a of store.named(current.subject)) if (_sameCert(current, a)) return depth === 0 ? { ok: true, depth: 0 } : done(depth);
+    for (const a of store.named(current.subjectKey)) if (_sameCert(current, a)) return depth === 0 ? { ok: true, depth: 0 } : done(depth);
 
     // A candidate outside its validity window does not end the search:
     // another may issue the same certificate (a renewed intermediate, or
     // CA, of the same name and key — OpenSSL takes the valid one). Its
     // error is the answer only when no valid issuer is found.
-    let expired = null;
-    let r = _anchorIssuer(current, store.named(current.issuer), now, path);
+    let expired = null, seen = { badSignature: false };
+    let r = _anchorIssuer(current, store.named(current.issuerKey), now, path, seen);
     if (r === true) return done(depth + 1);
     if (r) expired = r;
 
@@ -321,29 +331,25 @@ function verify_cert_chain(chainDer, anchors, now, purpose, leaf) {
     for (let i = 0; i < pool.length; i++) {
       if (used.has(i)) continue;                 // cycle guard
       const cand = pool[i];
-      try {
-        if (!current.checkIssued(cand)) continue;
-        if (!current.verify(cand.publicKey)) continue;
-        if (!_validNow(cand, now)) { if (!expired) expired = { ok: false, error: _validityError(cand, now) }; continue; }
-        used.add(i); next = cand; path.push(cand); break;
-      } catch (e) { /* try next candidate */ }
+      if (!issued_by(current, cand)) continue;
+      if (!signed_by(current, cand)) { seen.badSignature = true; continue; }
+      if (!valid_at(cand, now)) { if (!expired) expired = { ok: false, error: validity_error(cand, now) }; continue; }
+      used.add(i); next = cand; path.push(cand); break;
     }
-
-    // The name index found no anchor and the peer's chain no issuer: try
-    // every anchor, as before. Names are matched by OpenSSL on their
-    // canonical form; the key here is the printed one, normalized the same
-    // way for case and spacing, but an exotic encoding could still print
-    // differently and must not turn a valid chain into a failure. Only a
-    // chain that is about to fail pays for this.
-    if (!next) {
-      let r = _anchorIssuer(current, trusted, now, path);
-      if (r === true) return done(depth + 1);
-      if (r && !expired) expired = r;
-    }
+    // (The anchors are looked up by name_key, which is equal exactly when
+    // the names match: an anchor not in the index cannot be the issuer. A
+    // second pass over every anchor covered the printed-name key this
+    // replaced, which an exotic encoding could make miss.)
     if (!next && expired) return expired;
+    // The issuer was there — its name, and its key identifier where the
+    // certificate names one — and its key did not make the signature: a
+    // certificate altered, or signed by another key of that name. OpenSSL
+    // takes the first by name and says so (error 7); here every candidate
+    // was tried first, so a right one after a wrong one still verifies.
+    if (!next && seen.badSignature) return { ok: false, error: 'CERT_SIGNATURE_FAILURE' };
 
     if (!next) {
-      let selfSigned = _selfSigned(current);
+      let selfSigned = self_signed(current);
       return { ok: false, error: depth === 0
         ? (selfSigned ? 'DEPTH_ZERO_SELF_SIGNED_CERT' : 'UNABLE_TO_VERIFY_LEAF_SIGNATURE')
         : (selfSigned ? 'SELF_SIGNED_CERT_IN_CHAIN' : 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY') };
@@ -1575,8 +1581,8 @@ function TLSSession(options){
    * turn that into the appropriate alert for their context.
    */
   function peer_leaf_public_key() {
-    let x509 = peer_leaf_x509();
-    return x509 ? x509.publicKey : null;
+    let cert = peer_leaf_cert();
+    return cert ? cert.publicKey() : null;
   }
 
   // The peer's leaf, parsed once per certificate received. Three places read
@@ -1586,13 +1592,13 @@ function TLSSession(options){
   // bytes object itself: a new Certificate message (a new chain) is a new
   // object, and is parsed afresh. null when there is no leaf or it does not
   // parse.
-  let peer_leaf = { der: null, x509: null };
-  function peer_leaf_x509() {
+  let peer_leaf = { der: null, cert: null };
+  function peer_leaf_cert() {
     let chain = context.remote_cert_chain;
     if (!chain || chain.length === 0) return null;
     let der = chain[0].cert;
-    if (peer_leaf.der !== der) peer_leaf = { der: der, x509: _x509(der) };
-    return peer_leaf.x509;
+    if (peer_leaf.der !== der) peer_leaf = { der: der, cert: _cert(der) };
+    return peer_leaf.cert;
   }
 
   /**
@@ -4408,13 +4414,13 @@ function TLSSession(options){
         // byte or two of junk was taken without rejectUnauthorized, and the
         // handshake then failed at the CertificateVerify, as
         // unexpected_message (tlsfuzzer test-certificate-malformed). Parsed
-        // here once, and kept for the checks after it (peer_leaf_x509).
-        let leafX509 = _x509(entries[0].cert);
-        if (!leafX509) {
+        // here once, and kept for the checks after it (peer_leaf_cert).
+        let leafCert = _cert(entries[0].cert);
+        if (!leafCert) {
           fatalAlert(wire.TLS_ALERT.BAD_CERTIFICATE, 'The peer\'s certificate is not an X.509 certificate');
           return;
         }
-        peer_leaf = { der: entries[0].cert, x509: leafX509 };
+        peer_leaf = { der: entries[0].cert, cert: leafCert };
         set_context({
           remote_cert_chain: entries,
         });
@@ -7424,7 +7430,7 @@ function TLSSession(options){
    * Returns true to continue, false when the caller should stop — the failure
    * state is already recorded on context by then.
    */
-  function checkIdentity(x509) {
+  function checkIdentity(cert) {
     // ECH rejected: the server answered as the config's public_name, and
     // must prove that name (RFC 9849 §6.1.6), not the one in the inner hello.
     let expectName = context.ech.verify_name || context.local_sni;
@@ -7447,13 +7453,12 @@ function TLSSession(options){
       return true;
     }
 
-    // checkHost matches DNS names and ignores IP SANs entirely, so a
-    // connection to a literal address whose certificate carries the matching
-    // IP SAN was rejected. RFC 6066 says SNI carries host names only, but this
-    // field is populated from whatever the caller connected to, so an address
-    // does land here. X509Certificate exposes checkIP for exactly this.
+    // RFC 6066 says SNI carries host names only, but this field is populated
+    // from whatever the caller connected to, so an address does land here:
+    // matches_host compares it with the iPAddress names (a connection to a
+    // literal address was once rejected whatever its certificate said).
     // session/x509.js: the subjectAltName only, whole-label wildcards.
-    if (!matches_host(x509, expectName)) {
+    if (!matches_host(cert, expectName)) {
       context.authorizationError = 'ERR_TLS_CERT_ALTNAME_INVALID';
       context.peerAuthorized = false;
       return false;
@@ -7470,8 +7475,8 @@ function TLSSession(options){
 
     try {
       // The leaf certificate (first in chain)
-      let x509 = peer_leaf_x509();
-      if (!x509) {
+      let cert = peer_leaf_cert();
+      if (!cert) {
         context.authorizationError = 'CERTIFICATE_PARSE_ERROR';
         context.peerAuthorized = false;
         return;
@@ -7479,12 +7484,12 @@ function TLSSession(options){
 
       // Check validity dates
       let now = new Date();
-      if (now < new Date(x509.validFrom)) {
+      if (now.getTime() < cert.notBefore) {
         context.authorizationError = 'CERT_NOT_YET_VALID';
         context.peerAuthorized = false;
         return;
       }
-      if (now > new Date(x509.validTo)) {
+      if (now.getTime() > cert.notAfter) {
         context.authorizationError = 'CERT_HAS_EXPIRED';
         context.peerAuthorized = false;
         return;
@@ -7525,12 +7530,12 @@ function TLSSession(options){
       // says so with rejectUnauthorized: false.
       if (anchors == null ||
           (Array.isArray(anchors) && anchors.length === 0)) {
-        context.authorizationError = _selfSigned(x509) ? 'DEPTH_ZERO_SELF_SIGNED_CERT' : 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY';
+        context.authorizationError = self_signed(cert) ? 'DEPTH_ZERO_SELF_SIGNED_CERT' : 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY';
         context.peerAuthorized = false;
         return;
       }
 
-      let chainResult = verify_cert_chain(context.remote_cert_chain, anchors, now, context.isServer ? 'client' : 'server', x509);
+      let chainResult = verify_cert_chain(context.remote_cert_chain, anchors, now, context.isServer ? 'client' : 'server', cert);
       if (!chainResult.ok) {
         context.authorizationError = chainResult.error;
         context.peerAuthorized = false;
@@ -7546,7 +7551,7 @@ function TLSSession(options){
       // never verified — the hook author reasonably assumes the CA check
       // already happened. Running identity before the chain quietly turns
       // every such pin into the ONLY check.
-      if (!checkIdentity(x509)) return;
+      if (!checkIdentity(cert)) return;
 
       // All checks passed
       context.peerAuthorized = true;

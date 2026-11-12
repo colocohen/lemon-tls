@@ -1,14 +1,14 @@
 /**
  * CJS wrapper for lemon-tls.
  *
- * lemon-tls needs Node 24+ (package.json "engines"), where require() of an
- * ES module is built in: require('lemon-tls') returns the module itself,
- * synchronously.
+ * Where require() of an ES module is built in (Node 20.19+, 22.12+),
+ * require('lemon-tls') returns the module itself, synchronously.
  *
  *   const tls = require('lemon-tls');
  *
- * The fallback below — a Promise of the module — is for a runtime or bundler
- * whose require() cannot load ES modules; there, `await require('lemon-tls')`.
+ * The fallback below — a Promise of the module — is for Node 18 and for a
+ * runtime or bundler whose require() cannot load ES modules; there,
+ * `await require('lemon-tls')`.
  */
 
 let cached = null;

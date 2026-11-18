@@ -27,7 +27,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 
 import TLSSession from './tls_session.js';
 import createSecureContext from './secure_context.js';
@@ -137,7 +137,7 @@ var LEMON_DEBUG = typeof process !== 'undefined' && process.env &&
 // does not move) —, or the CID itself. TLSSession negotiates whatever it is.
 const SERVER_CID_LEN = 8;
 function connectionIdOption(v, isServer) {
-  if (v === true) return isServer ? new Uint8Array(crypto.randomBytes(SERVER_CID_LEN)) : new Uint8Array(0);
+  if (v === true) return isServer ? random_bytes_sync(SERVER_CID_LEN) : new Uint8Array(0);
   return v;
 }
 
@@ -740,8 +740,13 @@ function DTLSSession(options) {
         fail(new Error('DTLS: could not build outgoing record for epoch ' + r.epoch + ' — no keys installed for that epoch'), TLS_ALERT.INTERNAL_ERROR);
         return;
       }
-      let rn = recordNumber(r.epoch, seq);
-      for (let i = 0; i < r.entries.length; i++) (r.entries[i].sent || (r.entries[i].sent = [])).push(rn);
+      // The record number its entries went out in (what an ACK names) — a
+      // string, so made only for a record that has entries: not for
+      // application data, a record per send.
+      if (r.entries.length > 0) {
+        let rn = recordNumber(r.epoch, seq);
+        for (let i = 0; i < r.entries.length; i++) (r.entries[i].sent || (r.entries[i].sent = [])).push(rn);
+      }
       _ldbgTx(record, r.label || 'out');
       parts.push(record); used += record.length;
     };
@@ -2172,7 +2177,7 @@ function DTLSSession(options) {
    * deliverHandshakeMessage) before we process the handshake.
    */
   function sendHelloVerifyRequest() {
-    let cookie = new Uint8Array(crypto.randomBytes(32));
+    let cookie = random_bytes_sync(32);
     ctx.hvrCookie = cookie;
     ctx.hvrDone = true;
 

@@ -18,26 +18,34 @@
  * CertificateRequest carries the extension.
  */
 
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import zlib from 'node:zlib';
-import crypto from 'node:crypto';
 
 function brotliOptions(b) {
   return { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: b.length } };
 }
 
 // RFC 8879 §3, and the IANA registry: zlib 1, brotli 2, zstd 3.
-const ALGORITHMS = {
-  1: { name: 'zlib',
+// Each only where node:zlib has it. A runtime without it (a browser
+// polyfill without brotli, a WASM build without zlib) offers and accepts
+// fewer algorithms, or none, and sends its chain uncompressed.
+const has = (...names) => !!zlib && names.every((n) => typeof zlib[n] === 'function');
+const ALGORITHMS = {};
+if (has('deflateSync', 'deflate', 'inflateSync')) {
+  ALGORITHMS[1] = { name: 'zlib',
        compress: (b) => zlib.deflateSync(b, { level: 9 }),
        compressAsync: (b, cb) => zlib.deflate(b, { level: 9 }, cb),
-       decompress: (b, max) => zlib.inflateSync(b, { maxOutputLength: max }) },
-  2: { name: 'brotli',
+       decompress: (b, max) => zlib.inflateSync(b, { maxOutputLength: max }) };
+}
+if (has('brotliCompressSync', 'brotliCompress', 'brotliDecompressSync') && zlib.constants &&
+    zlib.constants.BROTLI_PARAM_QUALITY !== undefined) {
+  ALGORITHMS[2] = { name: 'brotli',
        compress: (b) => zlib.brotliCompressSync(b, brotliOptions(b)),
        compressAsync: (b, cb) => zlib.brotliCompress(b, brotliOptions(b), cb),
-       decompress: (b, max) => zlib.brotliDecompressSync(b, { maxOutputLength: max }) },
-};
+       decompress: (b, max) => zlib.brotliDecompressSync(b, { maxOutputLength: max }) };
+}
 // zstd where node:zlib has it (Node 22.15+, 23.8+).
-if (typeof zlib.zstdCompressSync === 'function' && typeof zlib.zstdDecompressSync === 'function') {
+if (has('zstdCompressSync', 'zstdCompress', 'zstdDecompressSync')) {
   ALGORITHMS[3] = { name: 'zstd',
     compress: (b) => zlib.zstdCompressSync(b),
     compressAsync: (b, cb) => zlib.zstdCompress(b, cb),
@@ -65,7 +73,7 @@ function parse_cert_compression(value, what) {
   const out = [];
   for (const v of value) {
     let code = typeof v === 'number' ? v : BY_NAME[String(v).toLowerCase()];
-    if (code === undefined && String(v).toLowerCase() === 'zstd') continue;   // not in this Node
+    if (code === undefined && ['zstd', 'brotli', 'zlib'].indexOf(String(v).toLowerCase()) >= 0) continue;   // not in this runtime
     if (code === undefined || (code !== 1 && code !== 2 && code !== 3)) throw new TypeError((what || 'certificateCompression') + ': unknown algorithm ' + JSON.stringify(v));
     if (ALGORITHMS[code] && out.indexOf(code) < 0) out.push(code);
   }
@@ -79,7 +87,8 @@ const cache = new Map();
 const CACHE_MAX = 64;
 
 function cache_key(body, alg) {
-  return alg + ':' + crypto.createHash('sha256').update(body).digest('hex');
+  let d = sha256_sync(body);
+  return alg + ':' + Buffer.from(d.buffer, d.byteOffset, d.length).toString('hex');
 }
 function cache_put(key, out) {
   cache.set(key, out);
@@ -93,9 +102,19 @@ function compress_certificate_body(body, alg) {
   const key = cache_key(body, alg);
   let out = cache.get(key);
   if (out) return out;
-  out = new Uint8Array(a.compress(Buffer.from(body)));
+  try { out = new Uint8Array(a.compress(Buffer.from(body))); }
+  catch (e) { drop_algorithm(alg); return null; }
   cache_put(key, out);
   return out;
+}
+
+// An algorithm whose implementation throws (a broken zlib polyfill) is
+// dropped for good: no longer offered or accepted, and the chain goes
+// uncompressed, as it would on a runtime without it.
+function drop_algorithm(alg) {
+  if (!ALGORITHMS[alg]) return;
+  delete BY_NAME[ALGORITHMS[alg].name];
+  delete ALGORITHMS[alg];
 }
 
 // The same, ahead of the first handshake and off the event loop (zlib's
@@ -117,11 +136,16 @@ function precompress_certificate_body(body, algs, callback) {
     left++;
     if (pending.has(key)) { pending.get(key).push(done); continue; }
     pending.set(key, [done]);
-    a.compressAsync(Buffer.from(body), (err, out) => {
-      if (!err && !cache.has(key)) cache_put(key, new Uint8Array(out));
+    const finish = () => {
       const waiters = pending.get(key) || []; pending.delete(key);
       for (const w of waiters) w();
-    });
+    };
+    try {
+      a.compressAsync(Buffer.from(body), (err, out) => {
+        if (!err && !cache.has(key)) cache_put(key, new Uint8Array(out));
+        finish();
+      });
+    } catch (e) { drop_algorithm(alg); finish(); }
   }
   done();
 }

@@ -27,7 +27,7 @@
  * TLS only: the DTLS variant (other hello layout, other header) is not here.
  */
 
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 import { hkdf_extract, hkdf_expand_label } from '../crypto.js';
 import { hpke_suite, is_supported_hpke_suite, setup_recipient, setup_sender,
          hpke_generate_key_pair, hpke_public_key } from './hpke.js';
@@ -197,7 +197,7 @@ function generate_ech_key(opts) {
     kem_id = typeof opts.kem === 'number' ? opts.kem : KEM_BY_NAME[String(opts.kem).toLowerCase()];
     if (!kem_id || !is_supported_hpke_suite(kem_id, 1, 1)) throw new TypeError('generateEchKey: unsupported kem ' + JSON.stringify(opts.kem));
   }
-  var configId = opts.configId == null ? crypto.randomBytes(1)[0] : opts.configId;
+  var configId = opts.configId == null ? random_bytes_sync(1)[0] : opts.configId;
   if (!(configId >= 0 && configId <= 255 && (configId | 0) === configId)) throw new TypeError('generateEchKey: configId must be 0-255');
   var maxNameLength = opts.maxNameLength == null ? 0 : opts.maxNameLength;
   if (!(maxNameLength >= 0 && maxNameLength <= 255)) throw new TypeError('generateEchKey: maxNameLength must be 0-255');
@@ -705,12 +705,12 @@ function client_seal_outer(outerMsg, hpkeContext, encoded, dtls) {
  */
 function grease_ech_state() {
   var lens = [144, 176, 208, 240];
-  return { config_id: crypto.randomBytes(1)[0], payload_len: lens[crypto.randomBytes(1)[0] & 3] + 16, ext: null };
+  return { config_id: random_bytes_sync(1)[0], payload_len: lens[random_bytes_sync(1)[0] & 3] + 16, ext: null };
 }
 function grease_ech_ext_data(g) {
   if (!g.ext) {
-    var d = client_outer_ext_data(0x0001, 0x0001, g.config_id, new Uint8Array(crypto.randomBytes(32)), g.payload_len);
-    d.set(crypto.randomBytes(g.payload_len), d.length - g.payload_len);
+    var d = client_outer_ext_data(0x0001, 0x0001, g.config_id, random_bytes_sync(32), g.payload_len);
+    d.set(random_bytes_sync(g.payload_len), d.length - g.payload_len);
     g.ext = d;
   }
   return g.ext;

@@ -7,7 +7,7 @@
 
 import net from 'node:net';
 import { getRootCertificates, setRootCertificates } from './ca_store.js';
-import crypto from 'node:crypto';
+import { randomBuffer } from './utils.js';
 import { EventEmitter } from 'node:events';
 import { TLS_CIPHER_SUITES } from './crypto.js';
 import TLSSession from './tls_session.js';
@@ -280,7 +280,7 @@ function Server(options, connectionListener) {
   }
 
   // Shared ticketKeys across all connections
-  self._ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+  self._ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : randomBuffer(48);
 
   // Encrypted Client Hello keys, checked here — a key that does not match
   // its config throws now, not as every client's handshake failing.
@@ -329,7 +329,7 @@ function Server(options, connectionListener) {
   let defaultCtx = null;
   if (options.secureContext) {
     defaultCtx = options.secureContext;
-  } else if (options.key && options.cert) {
+  } else if ((options.key && options.cert) || options.pfx != null) {
     defaultCtx = createSecureContext(options);
   }
 

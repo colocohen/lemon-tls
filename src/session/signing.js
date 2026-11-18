@@ -3,8 +3,8 @@
  * Handles scheme negotiation and signing for both TLS 1.2 and 1.3.
  */
 
-import * as crypto from 'crypto';
 import { parse_cert } from './x509.js';
+import * as keys from './keys.js';
 
 let TLS_VERSION_TLS1_2 = 0x0303;
 let TLS_VERSION_TLS1_3 = 0x0304;
@@ -43,25 +43,16 @@ const SIG_SCHEMES_MODERN = [
 ];
 
 // ML-DSA (FIPS 204), post-quantum signatures, TLS 1.3 only
-// (draft-ietf-tls-mldsa): mldsa44, mldsa65, mldsa87 — where node:crypto has
-// them (Node 24.7+, OpenSSL 3.5). Offered after the classical schemes: a
+// (draft-ietf-tls-mldsa): mldsa44, mldsa65, mldsa87. Offered after the classical schemes: a
 // server holding both an ML-DSA and a classical certificate (key/cert
 // arrays) follows the client's order, and an ML-DSA chain is 3–4× the size
 // of an ECDSA one — kilobytes more in every handshake — so a client gets it
 // when it asks for it first. Offered at all so that a server with ML-DSA
 // alone can be verified.
 const MLDSA_SCHEMES = { 0x0904: 'ml-dsa-44', 0x0905: 'ml-dsa-65', 0x0906: 'ml-dsa-87' };
-const MLDSA_AVAILABLE = (function () {
-  try {
-    for (const code in MLDSA_SCHEMES) {
-      let kp = crypto.generateKeyPairSync(MLDSA_SCHEMES[code]);
-      let sig = crypto.sign(null, Buffer.from('x'), kp.privateKey);
-      if (!crypto.verify(null, Buffer.from('x'), kp.publicKey, sig)) return false;
-    }
-    return true;
-  } catch (e) { return false; }
-})();
-const SIG_SCHEMES_MLDSA = MLDSA_AVAILABLE ? [0x0904, 0x0905, 0x0906] : [];
+// cryptographic-primitives has ML-DSA on every Node version.
+const MLDSA_AVAILABLE = true;
+const SIG_SCHEMES_MLDSA = [0x0904, 0x0905, 0x0906];
 
 const SIG_SCHEMES_LEGACY_PKCS1 = [
   0x0401, 0x0501, 0x0601,   // rsa_pkcs1_sha256/384/512
@@ -128,7 +119,7 @@ function scheme_info(version, scheme) {
   // ML-DSA: TLS 1.3 only (draft-ietf-tls-mldsa §3), pure ML-DSA with an
   // empty context string — the whole TLS 1.3 signature input, unhashed.
   if (MLDSA_SCHEMES[scheme]) {
-    if (!MLDSA_AVAILABLE || version !== TLS_VERSION_TLS1_3) return null;
+    if (version !== TLS_VERSION_TLS1_3) return null;
     return { hash: null, sig: 'mldsa', isPSS: false };
   }
 
@@ -201,35 +192,13 @@ function pick_scheme(version, certKeyObj, peerSupported, localAllowed) {
 
 /**
  * Sign data using the given scheme. Works for both TLS 1.2 and 1.3.
+ * `certKeyObj` is a session/keys.js private key; RSA-PSS salts are the
+ * hash's length (RFC 8446 §4.2.3).
  */
 function sign_with_scheme(version, scheme, tbs, certKeyObj) {
   let info = scheme_info(version, scheme);
   if (!info) return null;
-
-  if (info.sig === 'eddsa' || info.sig === 'mldsa') {
-    return new Uint8Array(crypto.sign(null, tbs, certKeyObj));
-  }
-
-  if (info.sig === 'ecdsa') {
-    return new Uint8Array(crypto.sign(info.hash, tbs, certKeyObj));
-  }
-
-  if (info.sig === 'rsa') {
-    if (info.isPSS) {
-      let saltLen = (info.hash === 'sha256') ? 32 : (info.hash === 'sha384') ? 48 : 64;
-      return new Uint8Array(crypto.sign(info.hash, tbs, {
-        key: certKeyObj,
-        padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-        saltLength: saltLen
-      }));
-    } else {
-      return new Uint8Array(crypto.sign(info.hash, tbs, {
-        key: certKeyObj,
-        padding: crypto.constants.RSA_PKCS1_PADDING
-      }));
-    }
-  }
-  return null;
+  return certKeyObj.sign(info, tbs);
 }
 
 /**
@@ -255,6 +224,8 @@ function sign_with_scheme(version, scheme, tbs, certKeyObj) {
  * Returns false for any scheme unusable at this version, so callers get
  * version filtering for free.
  */
+function hLenOf(hash) { return hash === 'sha512' ? 64 : hash === 'sha384' ? 48 : hash === 'sha256' ? 32 : 20; }
+
 function scheme_matches_key(version, scheme, keyObj) {
   let info = scheme_info(version, scheme);
   if (!info || !keyObj) return false;
@@ -270,15 +241,21 @@ function scheme_matches_key(version, scheme, keyObj) {
     let bits = 0;
     try { bits = (keyObj.asymmetricKeyDetails && keyObj.asymmetricKeyDetails.modulusLength) || 0; } catch (e) { bits = 0; }
     if (bits > 0) {
-      let hLen = info.hash === 'sha512' ? 64 : info.hash === 'sha384' ? 48 : info.hash === 'sha256' ? 32 : 20;
+      let hLen = hLenOf(info.hash);
       let need = info.isPSS ? 2 * hLen + 2 : hLen + 19 + 11;
       if (Math.ceil(bits / 8) < need) return false;
     }
     if (info.isPSS) {
       // 0x0809-0x080b are the *_pss_pss_* family; 0x0804-0x0806 are *_pss_rsae_*.
       let wantsPssKey = (scheme === 0x0809 || scheme === 0x080a || scheme === 0x080b);
-      if (wantsPssKey) return kt === 'rsa-pss';
-      return kt === 'rsa';
+      if (!wantsPssKey) return kt === 'rsa';
+      if (kt !== 'rsa-pss') return false;
+      // An RSASSA-PSS key's parameters bind it (RFC 4055 §3.1): its hash
+      // and MGF hash, and a salt of at least its saltLength. TLS signs with
+      // the hash's length as the salt.
+      let pss = keyObj.pss;
+      if (pss && (pss.hash !== info.hash || pss.mgf_hash !== info.hash || pss.salt_length > hLenOf(info.hash))) return false;
+      return true;
     }
     return kt === 'rsa';
   }
@@ -322,7 +299,7 @@ function scheme_matches_key(version, scheme, keyObj) {
  * @param version   negotiated TLS version (0x0303 / 0x0304)
  * @param scheme    SignatureScheme from the wire (NOT a locally chosen one)
  * @param tbs       the exact bytes that were signed
- * @param publicKey crypto.KeyObject of the peer's certificate public key
+ * @param publicKey the peer's certificate public key (session/keys.js)
  * @param signature signature bytes from the wire
  * @returns {boolean} true only if the signature verifies
  */
@@ -334,38 +311,8 @@ function verify_with_scheme(version, scheme, tbs, publicKey, signature) {
   // shared with pick_scheme so the two can never disagree.
   if (!scheme_matches_key(version, scheme, publicKey)) return false;
 
-  try {
-    if (info.sig === 'eddsa' || info.sig === 'mldsa') {
-      return crypto.verify(null, tbs, publicKey, signature);
-    }
-
-    if (info.sig === 'ecdsa') {
-      // node's default DER encoding is what TLS uses for ECDSA signatures.
-      return crypto.verify(info.hash, tbs, publicKey, signature);
-    }
-
-    if (info.sig === 'rsa') {
-      if (info.isPSS) {
-        let saltLen = (info.hash === 'sha256') ? 32 : (info.hash === 'sha384') ? 48 : 64;
-        return crypto.verify(info.hash, tbs, {
-          key: publicKey,
-          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-          saltLength: saltLen
-        }, signature);
-      }
-      return crypto.verify(info.hash, tbs, {
-        key: publicKey,
-        padding: crypto.constants.RSA_PKCS1_PADDING
-      }, signature);
-    }
-  } catch (e) {
-    // Malformed signature encoding (bad DER, wrong size, ...) — node throws
-    // rather than returning false. A throw here is still a verification
-    // failure, never an acceptance.
-    return false;
-  }
-
-  return false;
+  // False, never a throw, for a malformed signature.
+  return keys.verify(publicKey, info, tbs, signature);
 }
 
 // IANA's names (RFC 8446 §4.2.3; draft-ietf-tls-mldsa).

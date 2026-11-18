@@ -27,7 +27,7 @@
 //              RSA-PSS+SHA256, RSA+SHA256).
 
 import { TLS_CIPHER_SUITES, DEFAULT_CIPHER_SUITES_TLS13, DEFAULT_CIPHER_SUITES_TLS12, is_usable_cipher_suite, default_cipher_suites } from './crypto.js';
-import { SERVER_DEFAULT_GROUPS, GROUP_NAMES } from './session/ecdh.js';
+import { GROUP_NAMES } from './session/ecdh.js';
 import { MLDSA_AVAILABLE } from './session/signing.js';
 
 function splitList(s) {
@@ -131,8 +131,6 @@ function parseEcdhCurve(str) {
   for (var i = 0; i < tokens.length; i++) {
     var g = GROUPS[tokens[i].toUpperCase()];
     if (g === undefined) throw new Error('ecdhCurve: unsupported curve "' + tokens[i] + '"');
-    // The hybrid group only where node:crypto has ML-KEM (session/ecdh.js).
-    if (SERVER_DEFAULT_GROUPS.indexOf(g) < 0) throw new Error('ecdhCurve: "' + tokens[i] + '" is not available in this Node.js');
     if (out.indexOf(g) < 0) out.push(g);
   }
   if (out.length === 0) throw new Error('ecdhCurve: no curve in "' + str + '"');

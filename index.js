@@ -85,10 +85,12 @@ function precompressCertificate(secureContext, algorithms, callback) {
 import { generate_ech_key, prepare_ech_server } from './src/session/ech.js';
 import { hpke_suite, setup_sender, setup_recipient, hpke_seal, hpke_open,
          hpke_generate_key_pair, hpke_derive_key_pair } from './src/session/hpke.js';
-import nodeTls from 'node:tls';
+import * as nodeTls from 'node:tls';
 
-/** Node-compat: the shipped CA bundle, same array Node exposes. */
-const rootCertificates = nodeTls.rootCertificates;
+/** Node-compat: the shipped CA bundle, same array Node exposes. Empty where the
+ *  runtime has no node:tls (a browser polyfill, a WASM build): read at load, it
+ *  must not stop the module from loading. */
+const rootCertificates = (nodeTls && nodeTls.rootCertificates) || [];
 
 // DTLS
 import DTLSSession from './src/dtls_session.js';

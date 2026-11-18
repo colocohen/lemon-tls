@@ -21,7 +21,9 @@
  * Synchronous, like the rest of the handshake's crypto.
  */
 
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { aes_gcm_encrypt_sync, aes_gcm_decrypt_sync } from 'cryptographic-primitives/aes.js';
+import { chacha20poly1305_encrypt_sync, chacha20poly1305_decrypt_sync } from 'cryptographic-primitives/chacha.js';
 import { hkdf_extract, hkdf_expand } from '../crypto.js';
 import { CURVES } from './ecdh.js';
 
@@ -111,7 +113,7 @@ function kem_derive_key_pair(kem, ikm) {
 }
 
 function kem_generate_key_pair(kem) {
-  return kem_derive_key_pair(kem, new Uint8Array(crypto.randomBytes(kem.Nsk)));
+  return kem_derive_key_pair(kem, random_bytes_sync(kem.Nsk));
 }
 
 function kem_check_public_key(kem, pk) {
@@ -169,22 +171,16 @@ var AEADS = {
   0xffff: { id: 0xffff, algo: null,                Nk: 0,  Nn: 0,  Nt: 0 }    // export-only
 };
 
+// ciphertext || tag; open gives the plaintext, or null when it does not authenticate
 function aead_seal(aead, key, nonce, aad, pt) {
-  var c = crypto.createCipheriv(aead.algo, key, nonce, { authTagLength: aead.Nt });
-  c.setAAD(aad);
-  var a = c.update(pt), b = c.final();
-  return new Uint8Array(Buffer.concat([a, b, c.getAuthTag()]));
+  return aead.algo === 'chacha20-poly1305' ? chacha20poly1305_encrypt_sync(key, nonce, pt, aad)
+                                           : aes_gcm_encrypt_sync(key, nonce, pt, aad);
 }
 
 function aead_open(aead, key, nonce, aad, ct) {
   if (ct.length < aead.Nt) return null;
-  var d = crypto.createDecipheriv(aead.algo, key, nonce, { authTagLength: aead.Nt });
-  d.setAAD(aad);
-  d.setAuthTag(ct.subarray(ct.length - aead.Nt));
-  try {
-    var a = d.update(ct.subarray(0, ct.length - aead.Nt)), b = d.final();
-    return new Uint8Array(Buffer.concat([a, b]));
-  } catch (e) { return null; }
+  return aead.algo === 'chacha20-poly1305' ? chacha20poly1305_decrypt_sync(key, nonce, ct, aad)
+                                           : aes_gcm_decrypt_sync(key, nonce, ct, aad);
 }
 
 

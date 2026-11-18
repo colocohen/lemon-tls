@@ -6,7 +6,7 @@
 // The certificate FORMAT is cryptographic-formats': the DER, the extensions, names
 // and their comparison (RFC 5280 §7.1, as OpenSSL canonicalizes them), name
 // constraints, host names. This module holds what a TLS verifier decides on
-// top of it, and the signature check, which is node:crypto's:
+// top of it, and the signature check, which is cryptographic-primitives' (session/keys.js):
 //
 //   parse_cert         a certificate, read once per DER object
 //   issued_by          the issuer's name, and its key identifier where the
@@ -44,8 +44,8 @@
 // subtree minimum were reported as UNSUPPORTED_CONSTRAINT_SYNTAX where
 // OpenSSL matches the first and says SUBTREE_MINMAX for the second.
 
-import crypto from 'node:crypto';
 import * as X509 from 'cryptographic-formats/x509';
+import * as keys from './keys.js';
 
 const ANY_EKU = '2.5.29.37.0', SERVER_AUTH = '1.3.6.1.5.5.7.3.1', CLIENT_AUTH = '1.3.6.1.5.5.7.3.2';
 
@@ -103,8 +103,8 @@ function bytes_equal(a, b) {
  *   notAfter
  *   selfIssued   subject and issuer the same name
  *   bc, ku, eku, nc, ski, aki   the extensions' parsed values, or null
- *   publicKey()  a crypto.KeyObject, made on first use; null when node:crypto
- *                cannot use the key
+ *   publicKey()  the key (session/keys.js), made on first use; null when it
+ *                is of a kind lemon-tls cannot use
  */
 function parse_cert(der) {
   if (der == null || typeof der !== 'object') return null;
@@ -141,8 +141,8 @@ function make_cert(cf) {
     aki: ext('authorityKeyId'),
     publicKey: function () {
       if (key === undefined) {
-        try { key = crypto.createPublicKey({ key: Buffer.from(cf.public_key.der), format: 'der', type: 'spki' }); }
-        catch (e) { key = null; }
+        try { key = keys.public_key(cf.public_key); } catch (e) { key = null; }
+        if (key && key.asymmetricKeyType === null) key = null;
       }
       return key;
     },
@@ -181,34 +181,26 @@ function issued_by(cert, issuer) {
 
 /**
  * Is `cert`'s signature `issuer`'s? The algorithm as cryptographic-formats
- * describes it, the check node:crypto's. An algorithm node:crypto cannot
- * check — RSASSA-PSS whose mask hash is not its message hash (node:crypto
- * takes one hash for both), MD2 — is a signature that does not verify.
+ * describes it, checked by cryptographic-primitives (session/keys.js). One
+ * it cannot check — DSA, MD2 — is a signature that does not verify; so is
+ * PKCS#1 v1.5 by an RSASSA-PSS key, which may sign PSS only (RFC 4055 §1.2).
  */
 function signed_by(cert, issuer) {
   let key = issuer.publicKey();
   if (!key) return false;
   let p = cert.cf.signature_params, tbs = cert.cf.tbs_bytes, sig = cert.cf.signature;
-  try {
-    switch (p.scheme) {
-      case 'pkcs1':
-        return crypto.verify(p.hash, tbs, { key: key, padding: crypto.constants.RSA_PKCS1_PADDING }, sig);
-      case 'pss':
-        if (p.pss.mgf !== 'mgf1' || p.pss.mgf_hash !== p.pss.hash) return false;
-        return crypto.verify(p.pss.hash, tbs, { key: key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-                                                saltLength: p.pss.salt_length }, sig);
-      case 'ecdsa':
-      case 'dsa':
-        return crypto.verify(p.hash, tbs, key, sig);
-      case 'eddsa':
-      case 'ml-dsa':
-      case 'slh-dsa':
-        return crypto.verify(null, tbs, key, sig);
-      default:
-        return false;
-    }
-  } catch (e) {
-    return false;
+  switch (p.scheme) {
+    case 'pkcs1':
+      return key.asymmetricKeyType === 'rsa' && keys.verify(key, { sig: 'rsa', hash: p.hash, isPSS: false }, tbs, sig);
+    case 'pss':
+      if (p.pss.mgf !== 'mgf1') return false;
+      return keys.verify(key, { sig: 'rsa', hash: p.pss.hash, isPSS: true, salt_length: p.pss.salt_length,
+                                mgf_hash: p.pss.mgf_hash }, tbs, sig);
+    case 'ecdsa': return keys.verify(key, { sig: 'ecdsa', hash: p.hash }, tbs, sig);
+    case 'eddsa': return keys.verify(key, { sig: 'eddsa' }, tbs, sig);
+    case 'ml-dsa': return keys.verify(key, { sig: 'mldsa' }, tbs, sig);
+    case 'slh-dsa': return keys.verify(key, { sig: 'slh-dsa' }, tbs, sig);
+    default: return false;
   }
 }
 
@@ -294,12 +286,10 @@ function check_path(path, purpose) {
       continue;
     }
     // An issuer: a CA (a version 1 self-signed root is one by convention,
-    // as OpenSSL takes it). An intermediate that is not one fails OpenSSL's
-    // purpose check (a TLS CA) first — INVALID_PURPOSE, as node:tls reports
-    // it; an anchor that is not one, INVALID_CA.
-    if (!(p.bc && p.bc.ca) && !(p.cf.version === 1 && i === last && p.selfIssued)) {
-      return i < last ? 'INVALID_PURPOSE' : 'INVALID_CA';
-    }
+    // as OpenSSL takes it). One that is not — an intermediate or the anchor,
+    // without basicConstraints or with cA FALSE — fails OpenSSL's purpose
+    // check (a TLS CA) last: INVALID_PURPOSE, as node:tls reports it.
+    if (!(p.bc && p.bc.ca) && !(p.cf.version === 1 && i === last && p.selfIssued)) return 'INVALID_PURPOSE';
     // …allowed to sign certificates.
     if (p.ku && !p.ku.keyCertSign) return 'INVALID_CA';
     // pathLenConstraint: the intermediates below it, self-issued ones aside.

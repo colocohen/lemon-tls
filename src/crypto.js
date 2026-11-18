@@ -2,7 +2,9 @@ import {
   concatUint8Arrays
 } from './utils.js';
 
-import crypto from 'node:crypto';
+import { sha256_sync, sha384_sync, sha512_sync } from 'cryptographic-primitives/sha2.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { hkdf_extract_sync, hkdf_expand_sync, tls1_prf_sync } from 'cryptographic-primitives/kdf.js';
 
 
 // ============================================================
@@ -132,21 +134,21 @@ const TLS_CIPHER_SUITES = {
 
 
 // ============================================================
-//  Hash helpers
-//  Drop-in for noble: callable as hashFn(data) with .outputLen
+//  Hash helpers, from cryptographic-primitives
+//  Callable as hashFn(data) with .outputLen; hashFn.lib is the library's
+//  function, for its HMAC, HKDF and PRF
 // ============================================================
 
-function makeHashFn(algorithm, outputLen) {
-  let fn = function (data) {
-    return new Uint8Array(crypto.createHash(algorithm).update(data).digest());
-  };
+function makeHashFn(lib, outputLen) {
+  let fn = function (data) { return lib(data); };
   fn.outputLen = outputLen;
+  fn.lib = lib;
   return fn;
 }
 
-let sha256 = makeHashFn('sha256', 32);
-let sha384 = makeHashFn('sha384', 48);
-let sha512 = makeHashFn('sha512', 64);   // HPKE: HKDF-SHA512, DHKEM(P-521 / X448)
+let sha256 = makeHashFn(sha256_sync, 32);
+let sha384 = makeHashFn(sha384_sync, 48);
+let sha512 = makeHashFn(sha512_sync, 64);   // HPKE: HKDF-SHA512, DHKEM(P-521 / X448)
 
 function getHashFn(hashName) {
   if (hashName === 'sha256') return sha256;
@@ -165,9 +167,7 @@ function getHashLen(hashName) {
 // ============================================================
 
 function hmac(hashName, keyU8, dataU8) {
-  return new Uint8Array(
-    crypto.createHmac(hashName, keyU8).update(dataU8).digest()
-  );
+  return hmac_sync(getHashFn(hashName).lib, keyU8, dataU8);
 }
 
 
@@ -176,38 +176,19 @@ function hmac(hashName, keyU8, dataU8) {
 // ============================================================
 
 function hkdf_extract(hashName, saltU8, ikmU8) {
-  // RFC 5869 section 2.2: if salt not provided, set to HashLen zeros
-  let hashLen = getHashLen(hashName);
-  let salt = (saltU8.length === 0) ? Buffer.alloc(hashLen) : saltU8;
-  return new Uint8Array(
-    crypto.createHmac(hashName, salt).update(ikmU8).digest()
-  );
+  // RFC 5869 section 2.2: an empty salt is HashLen zeros (the library's rule too)
+  return hkdf_extract_sync(getHashFn(hashName).lib, ikmU8, saltU8);
 }
 
 function hkdf_expand(hashName, prkU8, infoU8, length) {
   let hashLen = getHashLen(hashName);
-  let N = Math.ceil(length / hashLen);
   // RFC 5869 §2.3: L <= 255*HashLen. The one-byte counter wrapped past it,
   // and the output repeated its own blocks (Wycheproof).
-  if (!Number.isInteger(length) || length < 0 || N > 255) {
+  if (!Number.isInteger(length) || length < 0 || Math.ceil(length / hashLen) > 255) {
     throw new RangeError('HKDF-Expand: length ' + length + ' is more than 255 × ' + hashLen);
   }
-  // allocUnsafe is safe here: every byte is overwritten by prev.copy() below.
-  let output = Buffer.allocUnsafe(N * hashLen);
-  let prev = Buffer.alloc(0);
-  let counter = Buffer.allocUnsafe(1);
-
-  for (let i = 1; i <= N; i++) {
-    let h = crypto.createHmac(hashName, prkU8);
-    h.update(prev);
-    h.update(infoU8);
-    counter[0] = i;
-    h.update(counter);
-    prev = h.digest();
-    prev.copy(output, (i - 1) * hashLen);
-  }
-
-  return new Uint8Array(output.buffer, output.byteOffset, length);
+  if (length === 0) return new Uint8Array(0);
+  return hkdf_expand_sync(getHashFn(hashName).lib, prkU8, length, infoU8);
 }
 
 
@@ -490,22 +471,7 @@ function derive_handshake_traffic_secrets_psk_with_hash(hashName, psk, shared_se
 // ============================================================
 
 function tls12_prf(secret, labelStr, seed, outLen, hashName) {
-  let label = new TextEncoder().encode(labelStr);
-  let fullSeed = concatUint8Arrays([label, seed]);
-
-  let a = fullSeed;
-  let out = new Uint8Array(0);
-
-  while (out.length < outLen) {
-    a = hmac(hashName, secret, a);
-    let block = hmac(hashName, secret, concatUint8Arrays([a, fullSeed]));
-    const tmp = new Uint8Array(out.length + block.length);
-    tmp.set(out, 0);
-    tmp.set(block, out.length);
-    out = tmp;
-  }
-
-  return out.slice(0, outLen);
+  return tls1_prf_sync(getHashFn(hashName).lib, secret, labelStr, seed, outLen);
 }
 
 

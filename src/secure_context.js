@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import * as PEM from 'cryptographic-formats/pem';
-import * as PKCS8 from 'cryptographic-formats/pkcs8';
 import { parse_cert } from './session/x509.js';
+import * as keys from './session/keys.js';
 
 function looksLikePath(x) {
   return typeof x === 'string' && (x.indexOf('\n') === -1) && (x.length < 4096) &&
@@ -65,74 +65,34 @@ function normalizeCA(caOption, skipped) {
 
 // node:tls's X509Certificate, for the `certObjs` this returns (an API
 // field). Everything decided here reads the certificate with cryptographic-formats.
+// undefined where the runtime has none (a browser polyfill of node:crypto, a
+// WASM build): certObjs is only an API convenience, and a server must still
+// start without it.
 function makeX509FromDerOrPem(buf) {
-  return new crypto.X509Certificate(Buffer.from(buf));
+  if (typeof crypto.X509Certificate !== 'function') return undefined;
+  try { return new crypto.X509Certificate(Buffer.from(buf)); } catch (e) { return undefined; }
 }
 
-// A certificate's public key as node:crypto exports it (SPKI DER): the form
-// a private key's public half is compared in. Through a KeyObject, so two
-// encodings of one key — named or explicit curve parameters, a compressed
-// point — compare equal, as they did.
-function certPublicKeyDer(der) {
+// A certificate's public key (session/keys.js), for pairing a private key
+// with it: keys.same_public_key compares the key, not its encoding, so a
+// compressed point and an uncompressed one are one key.
+function certPublicKey(der) {
   let cert = parse_cert(der);
   if (!cert) {
     let e = new Error('createSecureContext: the certificate does not parse');
     e.code = 'ERR_INVALID_CERTIFICATE';
     throw e;
   }
-  let key = cert.publicKey();
-  return key ? key.export({ type: 'spki', format: 'der' }) : null;
+  return cert.publicKey();
 }
 
-// The DER form of a private key, by what cryptographic-formats reads it as:
-// PKCS#8 (plain or encrypted), PKCS#1 (RSA) or SEC 1 (EC) — node:crypto is
-// told which, rather than tried with each in turn.
-function derKeyType(der) {
-  let readers = [['pkcs8', PKCS8.from_der], ['pkcs8', PKCS8.encrypted_from_der],
-                 ['pkcs1', PKCS8.pkcs1_from_der], ['sec1', PKCS8.sec1_from_der]];
-  for (let i = 0; i < readers.length; i++) {
-    try { readers[i][1](der); return readers[i][0]; } catch (e) { /* the next */ }
-  }
-  return null;
-}
-// The same, from a PEM label (RFC 7468 §10, §11; OpenSSL's traditional ones)
-const PEM_KEY_TYPES = {
-  'PRIVATE KEY': 'pkcs8', 'ENCRYPTED PRIVATE KEY': 'pkcs8',
-  'RSA PRIVATE KEY': 'pkcs1', 'EC PRIVATE KEY': 'sec1',
-};
-
+// A private key from PEM or DER of any form node:tls takes (PKCS#8, plain or
+// encrypted; PKCS#1; SEC 1; RFC 1421 encrypted PEM): its PKCS#8 DER and the
+// key that signs with it.
 function makePrivateKeyFromDerOrPem(buf, passphrase) {
-  // node:crypto rejects an explicit `passphrase: null` with ERR_INVALID_ARG_VALUE
-  // — for an unencrypted key the property must be ABSENT, not present-and-null.
-  // Callers that forward an optional option straight through would otherwise
-  // break every unencrypted key, which is the overwhelmingly common case.
-  let pass = (passphrase === null || passphrase === undefined) ? undefined : passphrase;
-  let withPass = function (o) { if (pass !== undefined) o.passphrase = pass; return o; };
-
-  let der, type;
-  if (isPEM(buf)) {
-    // The key's block (a file from `openssl ecparam -genkey` starts with an
-    // EC PARAMETERS block), read by cryptographic-formats.
-    let blocks = splitPEMBlocks(buf.toString('utf8'));
-    let block = null;
-    for (let i = 0; i < blocks.length && !block; i++) if (PEM_KEY_TYPES[blocks[i].type]) block = blocks[i];
-    if (!block) throw new Error('createSecureContext: no private key in the PEM (' +
-                                blocks.map(function (b) { return b.type; }).join(', ') + ')');
-    // RFC 1421's encrypted form (Proc-Type / DEK-Info headers): its
-    // decryption is node:crypto's, and node:crypto reads it only as PEM.
-    if (block.block.encrypted) return crypto.createPrivateKey(withPass({ key: buf, format: 'pem' }));
-    der = Buffer.from(block.der);
-    type = PEM_KEY_TYPES[block.type];
-  } else {
-    der = Buffer.from(buf);
-    type = derKeyType(der);
-    if (type === null) throw new Error('createSecureContext: the key is not PKCS#8, PKCS#1 or SEC 1 DER');
-  }
-  return crypto.createPrivateKey(withPass({ key: der, format: 'der', type: type }));
-}
-
-function exportKeyPkcs8Der(keyObj) {
-  return new Uint8Array(keyObj.export({ format: 'der', type: 'pkcs8' }));
+  let input = isPEM(buf) ? buf.toString('utf8') : new Uint8Array(buf);
+  let der = keys.private_key_pkcs8(input, passphrase == null ? null : passphrase);
+  return { der: der, key: keys.private_key(der) };
 }
 
 function u8eq(a,b){ if (a.length!==b.length) return false; for (let i=0;i<a.length;i++) if (a[i]!==b[i]) return false; return true; }
@@ -160,6 +120,25 @@ function dedupeDerArray(arr) {
 function createSecureContext(options) {
   if (!options) options = {};
 
+  // `pfx`: PKCS#12 files (a Buffer, or { buf, passphrase }; or an array of
+  // them), as node:tls takes them — each opened (session/keys.js pfx_open)
+  // into its key and its chain, added after `key` / `cert`, so the pairs
+  // below take them like any other: the first pair is the default.
+  if (options.pfx != null) {
+    let keysIn = Array.isArray(options.key) ? options.key.slice() : (options.key != null ? [options.key] : []);
+    let certsIn = Array.isArray(options.cert) ? options.cert.slice() : (options.cert != null ? [options.cert] : []);
+    let pfxs = Array.isArray(options.pfx) ? options.pfx : [options.pfx];
+    for (let i = 0; i < pfxs.length; i++) {
+      let p = pfxs[i];
+      let plain = Buffer.isBuffer(p) || p instanceof Uint8Array || typeof p === 'string';
+      let opened = keys.pfx_open(readMaybeFile(plain ? p : p.buf), !plain && p.passphrase != null ? p.passphrase : options.passphrase);
+      keysIn.push(Buffer.from(opened.key));
+      certsIn.push(opened.certs.map(function (d) { return PEM.encode(d, 'CERTIFICATE'); }).join(''));
+    }
+    options = Object.assign({}, options, { pfx: null,
+      key: keysIn.length === 1 ? keysIn[0] : keysIn, cert: certsIn.length === 1 ? certsIn[0] : certsIn });
+  }
+
   // Several key/certificate pairs — node:tls's arrays: `key` an array of
   // keys (or { pem, passphrase }), `cert` an array of chains, one per key —
   // for a server that holds certificates of more than one kind: an ML-DSA one
@@ -173,14 +152,13 @@ function createSecureContext(options) {
     let contexts = options.key.map(function (k, i) {
       let keyIn = (k && typeof k === 'object' && !Buffer.isBuffer(k) && !(k instanceof Uint8Array) && k.pem) ? k.pem : k;
       let pass = (k && typeof k === 'object' && k.passphrase != null) ? k.passphrase : options.passphrase;
-      let pub = crypto.createPublicKey(makePrivateKeyFromDerOrPem(readMaybeFile(keyIn), pass)).export({ type: 'spki', format: 'der' });
+      let pub = makePrivateKeyFromDerOrPem(readMaybeFile(keyIn), pass).key.public;
       let cert = null;
       for (let j = 0; j < certs.length && cert === null; j++) {
         let raw = readMaybeFile(certs[j]);
         let first = isPEM(raw) ? splitPEMBlocks(raw.toString('utf8')).filter(isCertificateBlock)[0] : { der: new Uint8Array(raw) };
         if (!first) continue;
-        let leafPub = certPublicKeyDer(first.der);
-        if (leafPub && Buffer.compare(Buffer.from(leafPub), Buffer.from(pub)) === 0) cert = certs[j];
+        if (keys.same_public_key(pub, certPublicKey(first.der))) cert = certs[j];
       }
       if (cert === null) throw new Error('createSecureContext: no certificate in `cert` for key ' + i);
       return createSecureContext(Object.assign({}, options, { key: keyIn, passphrase: pass, cert: cert }));
@@ -204,13 +182,15 @@ function createSecureContext(options) {
       for (let i=0;i<blocks.length;i++) {
         if (isCertificateBlock(blocks[i])) {
           certBlocksDer.push(blocks[i].der);
-          certObjs.push(makeX509FromDerOrPem(blocks[i].der));
+          let x509 = makeX509FromDerOrPem(blocks[i].der);
+          if (x509) certObjs.push(x509);
         }
       }
     } else {
       const der = new Uint8Array(cRaw);
       certBlocksDer.push(der);
-      certObjs.push(makeX509FromDerOrPem(der));
+      let x509 = makeX509FromDerOrPem(der);
+      if (x509) certObjs.push(x509);
     }
   }
 
@@ -219,24 +199,21 @@ function createSecureContext(options) {
   let privateKey = null;
   if (options.key != null) {
     let kRaw = readMaybeFile(options.key);
-    keyObj = makePrivateKeyFromDerOrPem(kRaw, options.passphrase);
-    privateKey = exportKeyPkcs8Der(keyObj);
+    let made = makePrivateKeyFromDerOrPem(kRaw, options.passphrase);
+    keyObj = made.key;
+    privateKey = made.der;
   }
 
-  // אימות בסיסי (כאשר לא משתמשים ב־PFX)
-  if (!options.pfx) {
-    if (certBlocksDer.length === 0) throw new Error('createSecureContext: missing cert.');
-    if (!privateKey) throw new Error('createSecureContext: missing private key.');
-  }
+  // אימות בסיסי (מ-PFX המפתח והתעודה כבר נלקחו למעלה)
+  if (certBlocksDer.length === 0) throw new Error('createSecureContext: missing cert.');
+  if (!privateKey) throw new Error('createSecureContext: missing private key.');
 
   // The key must be the certificate's — node:tls throws on this too
   // (KEY_VALUES_MISMATCH). Unchecked, a renewal that paired the new key with
   // the old certificate went in without a word, and every handshake after it
   // failed at the client's signature check.
   if (keyObj && certBlocksDer.length > 0) {
-    let fromKey = crypto.createPublicKey(keyObj).export({ type: 'spki', format: 'der' });
-    let fromCert = certPublicKeyDer(certBlocksDer[0]);
-    if (!fromCert || Buffer.compare(Buffer.from(fromKey), Buffer.from(fromCert)) !== 0) {
+    if (!keys.same_public_key(keyObj.public, certPublicKey(certBlocksDer[0]))) {
       let e = new Error('createSecureContext: the private key does not match the certificate');
       e.code = 'ERR_OSSL_X509_KEY_VALUES_MISMATCH';
       throw e;
@@ -279,7 +256,7 @@ function createSecureContext(options) {
 
     // עזרי debug/לוגיקה:
     certObjs: certObjs,                  // [X509Certificate...]
-    keyObj: keyObj,                      // KeyObject
+    keyObj: keyObj,                      // the signing key (session/keys.js)
     leafPublicKeyType: leafPublicKeyType,
 
     // פרמטרים פרוטוקוליים (אחסון; אתה מפרש בזמן ה-handshake):
@@ -290,8 +267,6 @@ function createSecureContext(options) {
     ecdhCurve: options.ecdhCurve || null,
     honorCipherOrder: !!options.honorCipherOrder,
 
-    // תמיכה ב־PFX אם תרצה לטפל בזה בשכבה אחרת:
-    pfx: options.pfx ? new Uint8Array(readMaybeFile(options.pfx)) : null,
     passphrase: options.passphrase ? String(options.passphrase) : null
   };
 }

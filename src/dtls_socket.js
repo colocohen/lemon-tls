@@ -20,7 +20,7 @@
 import dgram from 'node:dgram';
 import dns from 'node:dns';
 import net from 'node:net';
-import crypto from 'node:crypto';
+import { randomBuffer } from './utils.js';
 import { EventEmitter } from 'node:events';
 import DTLSSession, { SERVER_CID_LEN } from './dtls_session.js';
 import { datagramCid } from './record.js';
@@ -346,7 +346,7 @@ function createDTLSServer(options, connectionListener) {
   // opened by the connection that comes back, not the one that issued it.
   // Each DTLSSocket drew its own, so no ticket of this server could ever
   // be used (as TLSServer: tls_socket.js keeps one per server too).
-  let ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+  let ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : randomBuffer(48);
 
   // A ClientHello: an unprotected (epoch 0) handshake record whose message
   // is type 1 — the first record of the datagram, as a ClientHello comes.
@@ -357,7 +357,7 @@ function createDTLSServer(options, connectionListener) {
   function newConnection(key, rinfo) {
     let cid = null;
     if (cidOn) {
-      do { cid = crypto.randomBytes(SERVER_CID_LEN); } while (byCid[cid.toString('hex')]);
+      do { cid = randomBuffer(SERVER_CID_LEN); } while (byCid[cid.toString('hex')]);
     }
     let socket = new DTLSSocket(udpSocket, sessionOptions(options, {
       isServer: true,

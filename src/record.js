@@ -6,7 +6,8 @@
  * raw record framing, and DTLS-specific record number encryption.
  */
 
-import crypto from 'node:crypto';
+import { aes_gcm_create, aes_ecb_create, aes_ecb_encrypt_sync } from 'cryptographic-primitives/aes.js';
+import { chacha20poly1305_create, chacha20_sync } from 'cryptographic-primitives/chacha.js';
 import {
   TLS_CIPHER_SUITES,
   hkdf_expand_label,
@@ -21,7 +22,7 @@ import {
 
 // ===================== AEAD algorithm resolution =====================
 
-/** Resolve node:crypto cipher name from a TLS cipher suite code. */
+/** The AEAD of a TLS cipher suite code, by name: aes-128-gcm, aes-256-gcm, chacha20-poly1305. */
 function getAeadAlgo(cipherSuite) {
   if (cipherSuite != null) {
     let info = TLS_CIPHER_SUITES[cipherSuite];
@@ -30,6 +31,43 @@ function getAeadAlgo(cipherSuite) {
   }
   return 'aes-128-gcm';
 }
+
+// ===================== The AEAD, through cryptographic-primitives =====================
+//
+// One keyed context per traffic key: the key schedule (and GCM's hash table)
+// is computed once, where node:crypto redid it for every record. The library
+// picks the engine for each record by its size - a short one in JavaScript,
+// a long one in node:crypto - so nothing here decides that.
+//
+// Kept with the key array itself, which lives as long as its epoch's keys and
+// is never written to after it is derived (a key update derives a new array).
+
+const aeadContexts = new WeakMap();
+function aeadOf(key, algo) {
+  let c = aeadContexts.get(key);
+  if (!c) {
+    c = algo === 'chacha20-poly1305' ? chacha20poly1305_create(key) : aes_gcm_create(key);
+    aeadContexts.set(key, c);
+  }
+  return c;
+}
+
+/** Seal `pt` under `aad`: ciphertext || tag written into `out` from `off`.
+ *  `pt` may be a view of `out` itself - a record sealed in place. */
+function sealInto(key, algo, nonce, pt, aad, out, off) {
+  return aeadOf(key, algo).encrypt_into_sync(out, off, nonce, pt, aad);
+}
+
+/** Open ciphertext || tag: the plaintext, a Buffer over the library's
+ *  output (no copy). A record that does not authenticate throws, as
+ *  node:crypto's final() did, so every caller's handling stays the same. */
+function openSealed(key, algo, nonce, sealed, aad) {
+  const pt = aeadOf(key, algo).decrypt_sync(nonce, sealed, aad);
+  if (pt === null) throw new Error('Unsupported state or unable to authenticate data');
+  return Buffer.from(pt.buffer, pt.byteOffset, pt.length);
+}
+
+function gcmAlgo(key) { return key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm'; }
 
 // ===================== TLS 1.3 primitives =====================
 
@@ -73,9 +111,8 @@ function getNonce(iv, seq) {
  * allocating a fresh one. Returns the same buffer for chaining.
  *
  * Use this when you have a per-connection reusable nonce scratch buffer —
- * TLS processing is synchronous per connection, and Node's crypto.createCipheriv
- * copies the nonce into OpenSSL state, so we can safely reuse the same buffer
- * across records.
+ * TLS processing is synchronous per connection, and the AEAD reads the nonce
+ * only during the call, so we can safely reuse the same buffer across records.
  *
  * Saves 12 bytes × records of allocations. For a 10MB transfer (640 records)
  * that's ~7.7KB of garbage eliminated.
@@ -97,11 +134,8 @@ function getNonceInto(out, iv, seq) {
 
 /**
  * Encrypt a TLS 1.3 record (TLSInnerPlaintext = plaintext || inner_content_type).
- * Returns ciphertext || tag (without record header).
- *
- * Perf: uses two cipher.update() calls (plaintext, then 1-byte inner type) instead
- * of allocating and copying a +1-byte buffer. For 16KB records this saves ~16KB
- * of allocation and copy per encrypted record.
+ * Returns ciphertext || tag (without record header). The inner plaintext
+ * (content || type) is staged in the output and sealed over itself.
  */
 function encryptRecord(innerType, plaintext, key, nonce, algo) {
   const ptLen = plaintext.length;
@@ -111,25 +145,11 @@ function encryptRecord(innerType, plaintext, key, nonce, algo) {
   aad[3] = (recLen >>> 8) & 0xff;
   aad[4] = recLen & 0xff;
 
-  if (!algo) algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const isChaCha = algo === 'chacha20-poly1305';
-  const cipher = crypto.createCipheriv(algo, key, nonce, isChaCha ? { authTagLength: 16 } : undefined);
-  cipher.setAAD(aad, isChaCha ? { plaintextLength: ptLen + 1 } : undefined);
-
-  // Stream: plaintext first, then the 1-byte inner content type
-  const ct1 = cipher.update(plaintext);
-  // Reuse a single-byte scratch for inner type — tiny allocation, unavoidable
-  const innerBuf = new Uint8Array(1);
-  innerBuf[0] = innerType;
-  const ct2 = cipher.update(innerBuf);
-  cipher.final();
-  const tag = cipher.getAuthTag();
-
-  // AES-GCM and ChaCha20-Poly1305 are stream ciphers → ct1.length + ct2.length === ptLen + 1
-  const out = new Uint8Array(ct1.length + ct2.length + tag.length);
-  out.set(ct1, 0);
-  if (ct2.length > 0) out.set(ct2, ct1.length);
-  out.set(tag, ct1.length + ct2.length);
+  if (!algo) algo = gcmAlgo(key);
+  const out = new Uint8Array(recLen);
+  out.set(plaintext, 0);
+  out[ptLen] = innerType;
+  sealInto(key, algo, nonce, out.subarray(0, ptLen + 1), aad, out, 0);
   return out;
 }
 
@@ -147,34 +167,12 @@ for (let i = 0; i < 256; i++) {
  * Encrypt a TLS 1.3 record directly into a complete TLS record buffer (5-byte
  * header + ciphertext + inner type + tag), ready to hand to transport.write().
  *
- * Single-allocation + single-update hot-path version — the biggest throughput
- * optimization we have for TLS 1.3 bulk data.
- *
- * Strategy:
+ * Single allocation, the hot path for TLS 1.3 bulk data:
  *   1. Allocate rec of the full final size upfront.
- *   2. Write record header (5 bytes) — also serves as AAD (TLS 1.3 AAD == header).
- *   3. Stage plaintext + inner_type byte into rec[5 .. 5+ptLen+1]. This is a
- *      16KB copy we pay for up front but it lets us call cipher.update ONCE
- *      with a single contiguous input.
- *   4. cipher.setAAD(rec.subarray(0, 5)) — view, no alloc.
- *   5. cipher.update(rec.subarray(5, 5+ptLen+1)) — one call, returns ct of
- *      same size (AES-GCM is a stream cipher). We then copy ct back into rec,
- *      overwriting the staged plaintext with ciphertext.
- *   6. Write the 16-byte auth tag at the end.
- *
- * Why single-update beats two updates (plaintext then [inner_type]):
- *   - Each cipher.update call crosses the JS↔C boundary (~1-3μs overhead).
- *     For 640 records per 10MB transfer, skipping one call per record saves
- *     ~0.6-2ms per transfer.
- *   - Avoids the small Buffer object wrapper Node creates for the 1-byte ct2.
- *
- * Why the extra plaintext→rec copy is cheap:
- *   - memcpy throughput is ~20GB/s → a 16KB copy is ~800ns.
- *   - For 640 records, total extra copy time is ~500μs, dominated by the
- *     2-4ms of cipher.update overhead we avoid.
- *
- * Net savings per record: ~1-2μs. Per 10MB transfer: ~1-2ms on encryption
- * hot path — meaningful on top of the ~25ms actual AES work.
+ *   2. Write the record header (5 bytes) — also the AAD (TLS 1.3 AAD == header).
+ *   3. Stage plaintext + inner_type byte into rec[5 .. 5+ptLen+1].
+ *   4. Seal that range over itself: the ciphertext and the tag are written
+ *      straight into rec (encrypt_into), no intermediate buffer.
  *
  * Note: outer record type for encrypted TLS 1.3 records is ALWAYS 0x17
  * (application_data) regardless of inner type — the real type is encrypted
@@ -193,9 +191,7 @@ function encryptCompleteRecord13(innerType, plaintext, key, nonce, algo, version
   rec[3] = (payloadLen >>> 8) & 0xff;
   rec[4] = payloadLen & 0xff;
 
-  // Stage plaintext + inner_type byte at rec[5 .. 5+ptLen+1].
-  // cipher.update will read from this view, and we'll overwrite it with
-  // ciphertext immediately after.
+  // Stage plaintext + inner_type byte at rec[5 .. 5+ptLen+1]; sealed in place below.
   if (plaintext.length > 0) {
     // Buffer.prototype.copy and Uint8Array.set both work; .set is faster for Uint8Array src.
     if (plaintext.copy) plaintext.copy(rec, 5);
@@ -203,29 +199,28 @@ function encryptCompleteRecord13(innerType, plaintext, key, nonce, algo, version
   }
   rec[5 + ptLen] = innerType & 0xff;
 
-  if (!algo) algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const isChaCha = algo === 'chacha20-poly1305';
-  const cipher = crypto.createCipheriv(algo, key, nonce, isChaCha ? { authTagLength: 16 } : undefined);
-  cipher.setAAD(rec.subarray(0, 5), isChaCha ? { plaintextLength: ptLen + 1 } : undefined);
-
-  // Single update reading plaintext+innerType from rec, writing ciphertext
-  // back into rec (overwriting the staged plaintext). ct.length === ptLen + 1.
-  const ct = cipher.update(rec.subarray(5, 5 + ptLen + 1));
-  ct.copy(rec, 5);
-
-  cipher.final();
-  cipher.getAuthTag().copy(rec, 5 + ct.length);
-
+  // The library takes a plain Uint8Array as it is and copies a Buffer's view
+  // into one first: the range sealed in place goes in as a plain view of
+  // rec, and the header (the AAD) as a scratch copy of its 5 bytes, read only
+  // during the call. Two objects per record fewer than two Buffer subarrays.
+  const aad = _aadHdr5;
+  aad[0] = rec[0]; aad[1] = rec[1]; aad[2] = rec[2]; aad[3] = rec[3]; aad[4] = rec[4];
+  if (!algo) algo = gcmAlgo(key);
+  sealInto(key, algo, nonce, new Uint8Array(rec.buffer, rec.byteOffset + 5, ptLen + 1), aad, rec, 5);
   return rec;
 }
+
+// Scratch AADs, filled per record and read only during its (synchronous)
+// AEAD call, so no array of their own per record: a TLS 1.3 record header,
+// and TLS 1.2's seq || type || version || length.
+var _aadHdr5 = new Uint8Array(5), _aad12 = new Uint8Array(13);
 
 /**
  * Decrypt a TLS 1.3 record.
  * Input: raw ciphertext || tag (without record header).
  * Returns full TLSInnerPlaintext (content || content_type || padding).
  *
- * Perf: returns Node Buffer directly (which IS a Uint8Array subclass) — avoids
- * a redundant copy into a plain Uint8Array.
+ * Perf: returns a Buffer over the decrypted bytes — no copy.
  */
 function decryptRecord(ciphertext, key, nonce, algo) {
   const aad = new Uint8Array(5);
@@ -233,17 +228,7 @@ function decryptRecord(ciphertext, key, nonce, algo) {
   aad[3] = (ciphertext.length >> 8) & 0xff;
   aad[4] = ciphertext.length & 0xff;
 
-  const ct  = ciphertext.subarray(0, ciphertext.length - 16);
-  const tag = ciphertext.subarray(ciphertext.length - 16);
-
-  if (!algo) algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const isChaCha = algo === 'chacha20-poly1305';
-  const decipher = crypto.createDecipheriv(algo, key, nonce, isChaCha ? { authTagLength: 16 } : undefined);
-  decipher.setAAD(aad, isChaCha ? { plaintextLength: ct.length } : undefined);
-  decipher.setAuthTag(tag);
-  const pt = decipher.update(ct);
-  decipher.final();
-  return pt;
+  return openSealed(key, algo || gcmAlgo(key), nonce, ciphertext, aad);
 }
 
 /**
@@ -260,17 +245,14 @@ function decryptRecord(ciphertext, key, nonce, algo) {
  * ongoing effort to reduce per-record GC pressure.
  */
 function decryptRecordWithAadView(aadView, ciphertext, key, nonce, algo) {
-  const ct  = ciphertext.subarray(0, ciphertext.length - 16);
-  const tag = ciphertext.subarray(ciphertext.length - 16);
-
-  if (!algo) algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const isChaCha = algo === 'chacha20-poly1305';
-  const decipher = crypto.createDecipheriv(algo, key, nonce, isChaCha ? { authTagLength: 16 } : undefined);
-  decipher.setAAD(aadView, isChaCha ? { plaintextLength: ct.length } : undefined);
-  decipher.setAuthTag(tag);
-  const pt = decipher.update(ct);
-  decipher.final();
-  return pt;
+  // A header view of a Buffer would be copied into a new view by the library:
+  // its 5 bytes go in a scratch instead.
+  if (aadView.length === 5) {
+    const aad = _aadHdr5;
+    aad[0] = aadView[0]; aad[1] = aadView[1]; aad[2] = aadView[2]; aad[3] = aadView[3]; aad[4] = aadView[4];
+    aadView = aad;
+  }
+  return openSealed(key, algo || gcmAlgo(key), nonce, ciphertext, aadView);
 }
 
 /**
@@ -401,7 +383,11 @@ function seqToBytes(seq) {
  * Perf: inlines seqToBytes to avoid an extra allocation + copy.
  */
 function buildAad12(seqNum, recordType, plaintextLen) {
-  const aad = new Uint8Array(13);
+  return aad12Into(new Uint8Array(13), seqNum, recordType, plaintextLen);
+}
+
+/** buildAad12 into `aad` (13 bytes): the record functions' scratch. */
+function aad12Into(aad, seqNum, recordType, plaintextLen) {
   const hi = (seqNum / 0x100000000) | 0;
   const lo = seqNum >>> 0;
   aad[0] = (hi >>> 24) & 0xff;
@@ -432,24 +418,18 @@ function buildAad12(seqNum, recordType, plaintextLen) {
  * and then every record failed: the peer's Finished did not decrypt
  * (bad_record_mac), and ours could not have been read either.
  */
-function chacha12Seal(pt, key, iv12, seqNum, recordType) {
-  const cipher = crypto.createCipheriv('chacha20-poly1305', key, getChachaNonce12(iv12, seqNum), { authTagLength: 16 });
-  cipher.setAAD(buildAad12(seqNum, recordType, pt.length), { plaintextLength: pt.length });
-  const ct = cipher.update(pt);
-  cipher.final();
-  return { ct: ct, tag: cipher.getAuthTag() };
+/** ciphertext || tag written into `out` from `off`. The nonce
+ *  (getChachaNonce12's construction is getNonce's) and the AAD go in
+ *  scratches, read only during the call; chacha12Open's too. */
+function chacha12SealInto(pt, key, iv12, seqNum, recordType, out, off) {
+  return sealInto(key, 'chacha20-poly1305', getNonceInto(_nonceScratch, iv12, seqNum),
+                  pt, aad12Into(_aad12, seqNum, recordType, pt.length), out, off);
 }
 
 function chacha12Open(fragment, key, iv12, seqNum, recordType) {
   if (fragment.length < 16) throw new Error('TLS 1.2 ChaCha20 fragment too short');
-  const ct  = fragment.subarray(0, fragment.length - 16);
-  const tag = fragment.subarray(fragment.length - 16);
-  const decipher = crypto.createDecipheriv('chacha20-poly1305', key, getChachaNonce12(iv12, seqNum), { authTagLength: 16 });
-  decipher.setAAD(buildAad12(seqNum, recordType, ct.length), { plaintextLength: ct.length });
-  decipher.setAuthTag(tag);
-  const pt = decipher.update(ct);
-  decipher.final();
-  return pt;
+  return openSealed(key, 'chacha20-poly1305', getNonceInto(_nonceScratch, iv12, seqNum),
+                    fragment, aad12Into(_aad12, seqNum, recordType, fragment.length - 16));
 }
 
 /**
@@ -460,10 +440,8 @@ function chacha12Open(fragment, key, iv12, seqNum, recordType) {
  */
 function encrypt12(pt, key, salt4, seqNum, recordType) {
   if (salt4.length === 12) {
-    const sealed = chacha12Seal(pt, key, salt4, seqNum, recordType);
-    const out12 = new Uint8Array(sealed.ct.length + 16);
-    out12.set(sealed.ct, 0);
-    out12.set(sealed.tag, sealed.ct.length);
+    const out12 = new Uint8Array(pt.length + 16);
+    chacha12SealInto(pt, key, salt4, seqNum, recordType, out12, 0);
     return out12;
   }
 
@@ -493,20 +471,12 @@ function encrypt12(pt, key, salt4, seqNum, recordType) {
   aad[11] = (pt.length >>> 8) & 0xff;
   aad[12] = pt.length & 0xff;
 
-  const algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const cipher = crypto.createCipheriv(algo, key, nonce);
-  cipher.setAAD(aad);
-  const ct = cipher.update(pt);
-  cipher.final();
-  const tag = cipher.getAuthTag();
-
-  // Output: explicit_nonce(8) || ct || tag(16)
-  const out = new Uint8Array(8 + ct.length + tag.length);
+  // Output: explicit_nonce(8) || ct || tag(16), the ciphertext sealed straight into it
+  const out = new Uint8Array(8 + pt.length + 16);
   // explicit_nonce = seq bytes (nonce[4..12])
   out[0] = nonce[4]; out[1] = nonce[5]; out[2] = nonce[6]; out[3] = nonce[7];
   out[4] = nonce[8]; out[5] = nonce[9]; out[6] = nonce[10]; out[7] = nonce[11];
-  out.set(ct, 8);
-  out.set(tag, 8 + ct.length);
+  sealInto(key, gcmAlgo(key), nonce, pt, aad, out, 8);
   return out;
 }
 
@@ -530,7 +500,6 @@ function encryptCompleteRecord12(pt, key, salt4, seqNum, recordType, version) {
 
   // ChaCha20-Poly1305: header || ciphertext || tag — no explicit IV.
   if (salt4.length === 12) {
-    const sealed = chacha12Seal(pt, key, salt4, seqNum, recordType);
     const cBodyLen = ptLen + 16;
     const cVer = version || 0x0303;
     const cRec = Buffer.allocUnsafe(5 + cBodyLen);
@@ -539,8 +508,7 @@ function encryptCompleteRecord12(pt, key, salt4, seqNum, recordType, version) {
     cRec[2] = cVer & 0xff;
     cRec[3] = (cBodyLen >>> 8) & 0xff;
     cRec[4] = cBodyLen & 0xff;
-    sealed.ct.copy(cRec, 5);
-    sealed.tag.copy(cRec, 5 + ptLen);
+    chacha12SealInto(pt, key, salt4, seqNum, recordType, cRec, 5);
     return cRec;
   }
 
@@ -568,15 +536,16 @@ function encryptCompleteRecord12(pt, key, salt4, seqNum, recordType, version) {
   rec[11] = (lo >>> 8)  & 0xff;
   rec[12] =  lo         & 0xff;
 
-  // Nonce = salt4(4) || seq(8) — use the seq bytes we just wrote
-  const nonce = new Uint8Array(12);
+  // Nonce = salt4(4) || seq(8) — use the seq bytes we just wrote. The nonce
+  // and the AAD are scratches, read only during the seal.
+  const nonce = _nonceScratch;
   nonce[0] = salt4[0]; nonce[1] = salt4[1]; nonce[2] = salt4[2]; nonce[3] = salt4[3];
   nonce[4] = rec[5]; nonce[5] = rec[6]; nonce[6] = rec[7]; nonce[7] = rec[8];
   nonce[8] = rec[9]; nonce[9] = rec[10]; nonce[10] = rec[11]; nonce[11] = rec[12];
 
   // AAD = seq(8) || type(1) || 03 03 || plaintextLen(2)
   // Note: AAD uses the PLAINTEXT length, not the record body length.
-  const aad = new Uint8Array(13);
+  const aad = _aad12;
   aad[0] = rec[5]; aad[1] = rec[6]; aad[2] = rec[7]; aad[3] = rec[8];
   aad[4] = rec[9]; aad[5] = rec[10]; aad[6] = rec[11]; aad[7] = rec[12];
   aad[8]  = recordType & 0xff;
@@ -585,17 +554,8 @@ function encryptCompleteRecord12(pt, key, salt4, seqNum, recordType, version) {
   aad[11] = (ptLen >>> 8) & 0xff;
   aad[12] = ptLen & 0xff;
 
-  const algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const cipher = crypto.createCipheriv(algo, key, nonce);
-  cipher.setAAD(aad);
-  const ct = cipher.update(pt);
-  cipher.final();
-
-  // Copy ciphertext into rec[13 : 13+ptLen]
-  ct.copy(rec, 13);
-  // Copy tag into rec[13+ptLen : 13+ptLen+16]
-  cipher.getAuthTag().copy(rec, 13 + ct.length);
-
+  // ciphertext || tag sealed straight into rec[13 ..]
+  sealInto(key, gcmAlgo(key), nonce, pt, aad, rec, 13);
   return rec;
 }
 
@@ -603,27 +563,25 @@ function encryptCompleteRecord12(pt, key, salt4, seqNum, recordType, version) {
  * Decrypt a TLS 1.2 AEAD record fragment.
  * AES-GCM input: explicit_nonce(8) || ciphertext || tag(16).
  * ChaCha20-Poly1305 input: ciphertext || tag(16).
- * Perf: subarray (zero-copy views) instead of slice (copies); returns Node Buffer
- * (which IS a Uint8Array subclass) instead of re-copying to a plain Uint8Array.
+ * Perf: subarray (zero-copy views) instead of slice (copies); returns a Buffer
+ * over the decrypted bytes, no copy.
  */
 function decrypt12(fragment, key, salt4, seqNum, recordType) {
   if (salt4.length === 12) return chacha12Open(fragment, key, salt4, seqNum, recordType);
 
   if (fragment.length < 24) throw new Error('TLS 1.2 fragment too short');
 
-  // Zero-copy views over the input
-  const explicit = fragment.subarray(0, 8);
-  const ct       = fragment.subarray(8, fragment.length - 16);
-  const tag      = fragment.subarray(fragment.length - 16);
+  const ctLen    = fragment.length - 8 - 16;
 
-  // Nonce = salt4 || explicit
-  const nonce = new Uint8Array(12);
+  // Nonce = salt4 || explicit (the fragment's first 8 bytes, read where they
+  // are). The nonce and the AAD are scratches, read only during the open.
+  const nonce = _nonceScratch;
   nonce[0] = salt4[0]; nonce[1] = salt4[1]; nonce[2] = salt4[2]; nonce[3] = salt4[3];
-  nonce[4] = explicit[0]; nonce[5] = explicit[1]; nonce[6] = explicit[2]; nonce[7] = explicit[3];
-  nonce[8] = explicit[4]; nonce[9] = explicit[5]; nonce[10] = explicit[6]; nonce[11] = explicit[7];
+  nonce[4] = fragment[0]; nonce[5] = fragment[1]; nonce[6] = fragment[2]; nonce[7] = fragment[3];
+  nonce[8] = fragment[4]; nonce[9] = fragment[5]; nonce[10] = fragment[6]; nonce[11] = fragment[7];
 
   // AAD = seq(8) || type(1) || 03 03 || ct.length(2)
-  const aad = new Uint8Array(13);
+  const aad = _aad12;
   const hi = (seqNum / 0x100000000) | 0;
   const lo = seqNum >>> 0;
   aad[0] = (hi >>> 24) & 0xff;
@@ -637,17 +595,12 @@ function decrypt12(fragment, key, salt4, seqNum, recordType) {
   aad[8]  = recordType & 0xff;
   aad[9]  = 0x03;
   aad[10] = 0x03;
-  aad[11] = (ct.length >>> 8) & 0xff;
-  aad[12] = ct.length & 0xff;
+  aad[11] = (ctLen >>> 8) & 0xff;
+  aad[12] = ctLen & 0xff;
 
-  const algo = key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-  const decipher = crypto.createDecipheriv(algo, key, nonce);
-  decipher.setAAD(aad);
-  decipher.setAuthTag(tag);
-  const pt = decipher.update(ct);
-  decipher.final();
-  // Node Buffer extends Uint8Array, so callers that expect Uint8Array work unmodified.
-  return pt;
+  // ciphertext || tag: the fragment after its explicit nonce, as a plain view
+  // (a Buffer's subarray would be copied into one by the library).
+  return openSealed(key, gcmAlgo(key), nonce, new Uint8Array(fragment.buffer, fragment.byteOffset + 8, fragment.length - 8), aad);
 }
 
 // ===================== Shared: TLS 1.2 key_block =====================
@@ -713,28 +666,21 @@ function readU48(buf, off) {
 }
 
 /** AES-ECB encrypt a single 16-byte block (for DTLS 1.3 record number encryption). */
-// One AES-ECB cipher per sn_key, reused for every record's number mask
-// (RFC 9147 §4.2.3) instead of creating one per record. ECB keeps no state
-// between blocks, so update() on 16 bytes always returns exactly that block's
-// encryption. Keyed by the key object, which lives as long as its epoch's keys.
+// One keyed AES-ECB context per sn_key, reused for every record's number
+// mask (RFC 9147 §4.2.3): the key schedule once, then a block per record.
+// Keyed by the key object, which lives as long as its epoch's keys.
 var _snEcbCache = new WeakMap();
 function _snKeyEcb(key) {
   var c = _snEcbCache.get(key);
   if (!c) {
-    c = crypto.createCipheriv(key.length === 32 ? 'aes-256-ecb' : 'aes-128-ecb', key, null);
-    c.setAutoPadding(false);
+    c = aes_ecb_create(key);
     _snEcbCache.set(key, c);
   }
   return c;
 }
 
 function aesEcbEncrypt(key, block) {
-  let algo = key.length === 32 ? 'aes-256-ecb' : 'aes-128-ecb';
-  let cipher = crypto.createCipheriv(algo, key, null);
-  cipher.setAutoPadding(false);
-  let out = cipher.update(block);
-  cipher.final();
-  return new Uint8Array(out);
+  return aes_ecb_encrypt_sync(key, block);
 }
 
 
@@ -835,22 +781,16 @@ function buildDtlsAad12(epoch, seq, type, plaintextLen, cid) {
   return aad;
 }
 
-// The AEAD of a DTLS 1.2 record: the cipher (or decipher) and, for AES-GCM,
-// the 8-byte explicit nonce (the record seq). ChaCha20-Poly1305 has none on
-// the wire (RFC 7905): its nonce is iv(12) XOR (epoch(16) || seq(48)) —
-// the suite told apart by the IV's length (12 for ChaCha, a 4-byte salt for
-// GCM). One place for both directions.
-function dtls12Aead(decrypt, key, ivSalt, epoch, seq, aad, ptLen, explicit) {
-  let make = decrypt ? crypto.createDecipheriv : crypto.createCipheriv;
-  let c;
+// The AEAD of a DTLS 1.2 record: the algorithm and the nonce. AES-GCM's
+// nonce is the salt and the 8-byte explicit nonce (the record seq).
+// ChaCha20-Poly1305 has none on the wire (RFC 7905): its nonce is iv(12) XOR
+// (epoch(16) || seq(48)) — the suite told apart by the IV's length (12 for
+// ChaCha, a 4-byte salt for GCM). One place for both directions.
+function dtls12Aead(key, ivSalt, epoch, seq, explicit) {
   if (ivSalt.length === 12) {
-    c = make('chacha20-poly1305', key, getChachaNonce12(ivSalt, epoch * 0x1000000000000 + seq), { authTagLength: 16 });
-    c.setAAD(aad, { plaintextLength: ptLen });
-  } else {
-    c = make(key.length === 16 ? 'aes-128-gcm' : 'aes-256-gcm', key, getNonce12(ivSalt, explicit));
-    c.setAAD(aad);
+    return { algo: 'chacha20-poly1305', nonce: getChachaNonce12(ivSalt, epoch * 0x1000000000000 + seq) };
   }
-  return c;
+  return { algo: gcmAlgo(key), nonce: getNonce12(ivSalt, explicit) };
 }
 
 /** Build a complete protected DTLS 1.2 record: the header, then
@@ -873,13 +813,11 @@ function buildEncryptedDtls12(type, epoch, seq, plaintext, keys, cid) {
   off = w_u16(out, off, fragLen);
   let explicit = null;
   if (explicitLen) { explicit = seqToBytes(seq); out.set(explicit, off); off += 8; }
-  let cipher = dtls12Aead(false, key, ivSalt, epoch, seq, buildDtlsAad12(epoch, seq, type, innerLen, cid), innerLen, explicit);
-  let ct = cipher.update(plaintext);
-  out.set(ct, off); off += ct.length;
-  if (withCid) { let t = cipher.update(_contentTypeByte(type)); out.set(t, off); off += t.length; }
-  let fin = cipher.final();
-  if (fin.length) { out.set(fin, off); off += fin.length; }
-  out.set(cipher.getAuthTag(), off);
+  // the inner plaintext (with a CID: content || type) staged here, sealed over itself
+  out.set(plaintext, off);
+  if (withCid) out[off + plaintext.length] = type & 0xff;
+  let a = dtls12Aead(key, ivSalt, epoch, seq, explicit);
+  sealInto(key, a.algo, a.nonce, out.subarray(off, off + innerLen), buildDtlsAad12(epoch, seq, type, innerLen, cid), out, off);
   return out;
 }
 
@@ -896,15 +834,12 @@ function encryptDtls12(pt, key, ivSalt, epoch, seq, type) {
 function decryptDtls12(fragment, key, ivSalt, epoch, seq, type, cid) {
   let explicitLen = ivSalt.length === 12 ? 0 : 8;
   if (fragment.length < explicitLen + 16) throw new Error('DTLS 1.2 fragment too short');
-  // Views: only read; the plaintext comes out of the decipher as a fresh
-  // Buffer (a Uint8Array), handed on as it is, up to 'data' — no copy.
+  // Views: only read; the plaintext comes out fresh, handed on as it is, up
+  // to 'data' — no copy.
   let explicit = explicitLen ? fragment.subarray(0, 8) : null;
-  let ct = fragment.subarray(explicitLen, fragment.length - 16);
-  let decipher = dtls12Aead(true, key, ivSalt, epoch, seq, buildDtlsAad12(epoch, seq, type, ct.length, cid), ct.length, explicit);
-  decipher.setAuthTag(fragment.subarray(fragment.length - 16));
-  let pt = decipher.update(ct);
-  decipher.final();
-  return pt;
+  let ctLen = fragment.length - explicitLen - 16;
+  let a = dtls12Aead(key, ivSalt, epoch, seq, explicit);
+  return openSealed(key, a.algo, a.nonce, fragment.subarray(explicitLen), buildDtlsAad12(epoch, seq, type, ctLen, cid));
 }
 
 /** Open a protected DTLS 1.2 record: { type, content }. A tls12_cid record
@@ -976,6 +911,7 @@ function datagramCid(data, cidLen) {
  * mask = AES-ECB(snKey, ciphertext[0..15])
  * result = rnBytes XOR mask[0..len-1]
  */
+var _ZERO16 = new Uint8Array(16);
 function maskRecordNumber(snKey, rnBytes, ciphertext, algo) {
   // RFC 9147 §4.2.3: "This procedure requires the ciphertext length to be at
   // least 16 bytes. Receivers MUST reject shorter records as if they had
@@ -985,29 +921,38 @@ function maskRecordNumber(snKey, rnBytes, ciphertext, algo) {
   // for the AEADs we support, so this is a guard, not a code path.
   if (!ciphertext || ciphertext.length < 16) return null;
 
+  let mask = recordNumberMask(snKey, ciphertext, 0, algo);
+  let out = new Uint8Array(rnBytes.length);
+  for (let i = 0; i < rnBytes.length; i++) out[i] = rnBytes[i] ^ mask[i];
+  return out;
+}
+
+/** The mask itself, from the 16 bytes of `buf` at `off` (the ciphertext's
+ *  first 16; the caller has checked there are). The record builder and
+ *  decrypter XOR it into the record number bytes where they are, with no
+ *  array of their own for either. The sample is copied into a scratch,
+ *  read only during the call, rather than taken as a view per record. */
+var _rnSample = new Uint8Array(16), _rnSampleNonce = _rnSample.subarray(4, 16);
+function recordNumberMask(snKey, buf, off, algo) {
+  let sample = _rnSample;
+  for (let i = 0; i < 16; i++) sample[i] = buf[off + i];
   let mask;
   if (algo === 'chacha20-poly1305') {
     // Mask = ChaCha20(sn_key, Ciphertext[0..3], Ciphertext[4..15])
-    // — first 4 bytes are the block counter, next 12 the nonce. Node's
-    // 'chacha20' cipher takes exactly that as a 16-byte IV, so the sample is
-    // passed through unchanged and we encrypt a zero block to read off the
-    // keystream.
+    // — first 4 bytes are the block counter, next 12 the nonce: the
+    // keystream read off by encrypting zeros.
     //
     // The AES branch below is well covered by the DTLS 1.3 suites we
     // negotiate in practice; this branch is not, so cross-check it against a
     // BoringSSL peer before trusting it — in particular the counter's byte
-    // order, which the RFC states as a byte range and OpenSSL interprets as a
-    // little-endian u32.
-    let iv = Buffer.from(ciphertext.subarray(0, 16));
-    let c = crypto.createCipheriv('chacha20', snKey, iv);
-    mask = new Uint8Array(c.update(Buffer.alloc(16)));
+    // order, which the RFC states as a byte range and OpenSSL (and this, as
+    // it did when it ran on OpenSSL) reads as a little-endian u32.
+    let counter = (sample[0] | (sample[1] << 8) | (sample[2] << 16) | (sample[3] << 24)) >>> 0;
+    mask = chacha20_sync(snKey, _rnSampleNonce, _ZERO16, counter);
   } else {
-    mask = _snKeyEcb(snKey).update(ciphertext.subarray(0, 16));
+    mask = _snKeyEcb(snKey).encrypt_sync(sample);
   }
-
-  let out = new Uint8Array(rnBytes.length);
-  for (let i = 0; i < rnBytes.length; i++) out[i] = rnBytes[i] ^ mask[i];
-  return out;
+  return mask;
 }
 
 
@@ -1026,8 +971,7 @@ function maskRecordNumber(snKey, rnBytes, ciphertext, algo) {
  *            wire), or null / empty for none
  */
 function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys, cid) {
-  let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
-  let isChaCha = algo === 'chacha20-poly1305';
+  let algo = keys.algo || gcmAlgo(keys.key);
   let cidLen = cid ? cid.length : 0;
 
   // Unified header: [CID], 2-byte seq, with length
@@ -1037,14 +981,16 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys, cid) {
   // Plaintext record number
   let rn0 = (seq >>> 8) & 0xFF, rn1 = seq & 0xFF;
 
-  // Inner plaintext = content || content_type. Fed to the cipher in two
-  // pieces rather than first copied into one buffer.
+  // Inner plaintext = content || content_type, staged in the record and
+  // sealed over itself.
   let innerLen = plaintext.length + 1;
   let encLen = innerLen + 16;
 
   // AAD = the header with the PLAINTEXT record number (before RN
-  // encryption) — the CID in it (§4.2.3: the whole header).
-  let aad = new Uint8Array(hdrLen);
+  // encryption) — the CID in it (§4.2.3: the whole header). Into a scratch
+  // of its length (dtls13Aad), read only during the seal: then copied in as
+  // the record's header, whose record number is masked below.
+  let aad = dtls13Aad(hdrLen);
   aad[0] = info;
   if (cidLen) aad.set(cid, 1);
   aad[rnOff] = rn0;
@@ -1052,28 +998,20 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys, cid) {
   aad[rnOff + 2] = (encLen >>> 8) & 0xFF;
   aad[rnOff + 3] = encLen & 0xFF;
 
-  // Nonce (reuse TLS 1.3 nonce construction)
-  let nonce = getNonce(keys.iv, seq);
-
   // AEAD encrypt, written straight into the record: info(1) + encrypted
-  // rn(2) + length(2) + ciphertext. (It used to pass through three buffers:
-  // inner plaintext, ciphertext+tag, then the record.)
-  let cipher = crypto.createCipheriv(algo, keys.key, nonce,
-    isChaCha ? { authTagLength: 16 } : undefined);
-  cipher.setAAD(aad, isChaCha ? { plaintextLength: innerLen } : undefined);
+  // rn(2) + length(2) + ciphertext. The nonce (TLS 1.3's construction) is a
+  // scratch too.
   let record = new Uint8Array(hdrLen + encLen);
-  let off = hdrLen;
-  let ct1 = cipher.update(plaintext);
-  record.set(ct1, off); off += ct1.length;
-  let ct2 = cipher.update(_contentTypeByte(innerType));
-  record.set(ct2, off); off += ct2.length;
-  let ct3 = cipher.final();
-  if (ct3.length) { record.set(ct3, off); off += ct3.length; }
-  record.set(cipher.getAuthTag(), off);
-  let ciphertext = record.subarray(hdrLen);
+  record.set(plaintext, hdrLen);
+  record[hdrLen + plaintext.length] = innerType & 0xff;
+  sealInto(keys.key, algo, getNonceInto(_nonceScratch, keys.iv, seq),
+           record.subarray(hdrLen, hdrLen + innerLen), aad, record, hdrLen);
+  record.set(aad, 0);
 
-  // Encrypt record number
-  let encRn = maskRecordNumber(keys.snKey, [rn0, rn1], ciphertext, algo);
+  // Encrypt record number: its two bytes XORed in place.
+  let mask = recordNumberMask(keys.snKey, record, hdrLen, algo);
+  record[rnOff] = rn0 ^ mask[0];
+  record[rnOff + 1] = rn1 ^ mask[1];
 
   // ── DIAGNOSTIC (LEMON_DEBUG=1 / WEBRTC_DEBUG=1) ──────────────────────
   // Everything a peer needs to PARSE this record, printed as we build it.
@@ -1091,28 +1029,25 @@ function buildEncryptedDtls13(innerType, plaintext, seq, epoch, keys, cid) {
         ' [C=' + ((info >> 4) & 1) + ' S=' + ((info >> 3) & 1) +
         ' L=' + ((info >> 2) & 1) + ' epoch=' + (info & 0x03) + ']' +
         ' seqPlain=' + _h(rn0) + _h(rn1) +
-        ' seqMasked=' + _h(encRn[0]) + _h(encRn[1]) +
-        ' declaredLen=' + ciphertext.length +
-        ' aadLen=' + aad.length +
+        ' seqMasked=' + _h(record[rnOff]) + _h(record[rnOff + 1]) +
+        ' declaredLen=' + encLen +
+        ' aadLen=' + hdrLen +
         ' snKey=' + (keys.snKey ? 'set' : 'MISSING'));
     } catch (_e) {}
   }
   // ─────────────────────────────────────────────────────────────────────
 
-  record.set(aad, 0);
-  record[rnOff] = encRn[0];
-  record[rnOff + 1] = encRn[1];
   return record;
 }
 
+// The nonce of the DTLS 1.3 record being sealed or opened: one array for all
+// (getNonceInto), as TLSSocket keeps per connection. Safe because sealing
+// and opening are synchronous and the AEAD reads the nonce only during the
+// call; nothing keeps it.
+var _nonceScratch = new Uint8Array(12);
+
 var _REC_DEBUG = typeof process !== 'undefined' && process.env &&
   (process.env.LEMON_DEBUG === '1' || process.env.WEBRTC_DEBUG === '1');
-
-// The one-byte content type appended to a DTLS 1.3 inner plaintext.
-var _CT_BYTES = [];
-function _contentTypeByte(t) {
-  return _CT_BYTES[t] || (_CT_BYTES[t] = new Uint8Array([t]));
-}
 
 /**
  * Reconstruct a full DTLS 1.3 record sequence number from its truncated wire
@@ -1191,51 +1126,68 @@ function resolveReadEpoch(epochBits, keysByEpoch) {
  * Returns { epoch, seq, type, content } or null on failure.
  */
 function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
-  if (data.length < 1) return null;
+  return openDtls13At(data, 0, keys, fullEpoch, cid, cidRequired);
+}
 
-  let hdr = parseUnifiedHdr(data[0]);
-  let off = 1;
+/** decryptEncryptedDtls13 for the record at data[start..]: what
+ *  parseDtlsDatagram calls for each record of a datagram, without a view of
+ *  the rest of it per record. total_length counts from `start`. */
+function openDtls13At(data, start, keys, fullEpoch, cid, cidRequired) {
+  let end = data.length;
+  if (end - start < 1) return null;
+
+  // The unified header's bits, read here (parseUnifiedHdr's object, per
+  // record, was garbage).
+  let first = data[start];
+  let hasCid = (first & 0x10) !== 0, seqLen2 = (first & 0x08) !== 0, hasLength = (first & 0x04) !== 0;
+  let off = start + 1;
   let cidLen = cid ? cid.length : 0;
 
-  if (hdr.hasCid) {
-    if (cidLen === 0 || data.length < 1 + cidLen) return null;
-    for (let i = 0; i < cidLen; i++) if (data[1 + i] !== cid[i]) return null;
+  if (hasCid) {
+    if (cidLen === 0 || end - start < 1 + cidLen) return null;
+    for (let i = 0; i < cidLen; i++) if (data[off + i] !== cid[i]) return null;
     off += cidLen;
   } else if (cidRequired && fullEpoch !== 1) {
     return null;
   }
 
-  let rnLen = hdr.seqLen2 ? 2 : 1;
-  if (off + rnLen > data.length) return null;
-  let encRn = data.slice(off, off + rnLen);
+  // The masked record number, read where it is.
+  let rnLen = seqLen2 ? 2 : 1;
+  if (off + rnLen > end) return null;
+  let rnOff = off;
   off += rnLen;
 
   let ctLen;
-  if (hdr.hasLength) {
-    if (off + 2 > data.length) return null;
+  if (hasLength) {
+    if (off + 2 > end) return null;
     ctLen = readU16(data, off);
     off += 2;
   } else {
-    ctLen = data.length - off;
+    ctLen = end - off;
   }
 
-  if (off + ctLen > data.length) return null;
+  if (off + ctLen > end) return null;
   if (ctLen > DTLS13_MAX_CIPHERTEXT) return null;
+  // RFC 9147 §4.2.3: a ciphertext under 16 bytes has no sample for the
+  // record-number mask; rejected as a deprotection failure (as
+  // maskRecordNumber does).
+  if (ctLen < 16) return null;
   // A view: only read here (record-number mask, AEAD input); the plaintext
-  // comes out of the decipher as a fresh buffer.
-  let ciphertext = data.subarray(off, off + ctLen);
+  // comes out of the decipher as a fresh buffer. A plain Uint8Array over
+  // the same memory, not data.subarray(): a Buffer's would be copied into
+  // such a view by the library anyway, a second object per record.
+  let ciphertext = new Uint8Array(data.buffer, data.byteOffset + off, ctLen);
 
   // Resolve the AEAD before unmasking: the record-number mask is built with
   // the same primitive as the AEAD (AES-ECB vs ChaCha20), so `algo` is needed
   // here, not just at deprotection time further down.
-  let algo = keys.algo || (keys.key.length === 32 ? 'aes-256-gcm' : 'aes-128-gcm');
-  let isChaCha = algo === 'chacha20-poly1305';
+  let algo = keys.algo || gcmAlgo(keys.key);
 
-  // Decrypt record number. Returns null for a ciphertext under 16 bytes, which
-  // RFC 9147 §4.2.3 requires us to reject as a deprotection failure.
-  let rn = maskRecordNumber(keys.snKey, encRn, ciphertext, algo);
-  if (rn === null) return null;
-  let truncated = hdr.seqLen2 ? ((rn[0] << 8) | rn[1]) : rn[0];
+  // Decrypt record number.
+  let mask = recordNumberMask(keys.snKey, data, off, algo);
+  let rn0 = data[rnOff] ^ mask[0];
+  let rn1 = seqLen2 ? data[rnOff + 1] ^ mask[1] : 0;
+  let truncated = seqLen2 ? ((rn0 << 8) | rn1) : rn0;
 
   // RFC 9147 §4.2.2: the wire carries only the low 8 or 16 bits of the record
   // sequence number. Reconstruct the full value by choosing the candidate
@@ -1246,23 +1198,22 @@ function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
   // keys.maxReadSeq holds the highest full seq accepted so far (per-epoch key
   // object). It starts undefined → treated as -1 so the first record maps to
   // its own truncated value.
-  let seq = reconstructDtlsSeq(truncated, hdr.seqLen2 ? 16 : 8,
+  let seq = reconstructDtlsSeq(truncated, seqLen2 ? 16 : 8,
                                (keys.maxReadSeq === undefined ? -1 : keys.maxReadSeq));
 
   // Rebuild AAD with plaintext RN. AAD depends only on the wire bytes (the
   // decrypted record number + length), NOT on the reconstructed full seq —
-  // so it's computed once and reused across seq candidates below.
-  let rnOff = off - rnLen - (hdr.hasLength ? 2 : 0);
-  let aad = new Uint8Array(off);
-  aad.set(data.subarray(0, rnOff), 0);   // the first byte, and the CID
-  for (let i = 0; i < rnLen; i++) aad[rnOff + i] = rn[i];
-  if (hdr.hasLength) {
-    aad[rnOff + rnLen]     = (ctLen >>> 8) & 0xFF;
-    aad[rnOff + rnLen + 1] = ctLen & 0xFF;
+  // so it's computed once and reused across seq candidates below. Into a
+  // scratch of its length (dtls13Aad): read only by the AEAD calls below.
+  let aadLen = off - start, hRn = rnOff - start;
+  let aad = dtls13Aad(aadLen);
+  for (let i = 0; i < hRn; i++) aad[i] = data[start + i];   // the first byte, and the CID
+  aad[hRn] = rn0;
+  if (seqLen2) aad[hRn + 1] = rn1;
+  if (hasLength) {
+    aad[hRn + rnLen]     = (ctLen >>> 8) & 0xFF;
+    aad[hRn + rnLen + 1] = ctLen & 0xFF;
   }
-
-  let ct = ciphertext.subarray(0, ciphertext.length - 16);
-  let tag = ciphertext.subarray(ciphertext.length - 16);
 
   // The wire carries only the low bits of the record seq. reconstructDtlsSeq
   // returns the most-likely full value, but under large gaps or reordering
@@ -1270,28 +1221,20 @@ function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
   // depends on the full seq (AAD does not), so try the neighbouring
   // candidates on AEAD failure before giving up — this is what lets
   // DTLS-Replay-TLS13 / -LargeGaps / -NonMonotonic deprotect instead of
-  // failing as "bad record MAC". Candidates are deduped and non-negative.
-  let window = hdr.seqLen2 ? 65536 : 256;
-  let candidates = [seq];
-  if (seq - window >= 0) candidates.push(seq - window);
-  candidates.push(seq + window);
-
+  // failing as "bad record MAC". Candidates, in this order: seq, seq - window
+  // (when not negative), seq + window.
+  let window = seqLen2 ? 65536 : 256;
+  let aead = aeadOf(keys.key, algo);
   let pt = null, acceptedSeq = -1;
-  for (let ci = 0; ci < candidates.length; ci++) {
-    let cand = candidates[ci];
-    let nonce = getNonce(keys.iv, cand);
-    try {
-      let decipher = crypto.createDecipheriv(algo, keys.key, nonce,
-        isChaCha ? { authTagLength: 16 } : undefined);
-      decipher.setAAD(aad, isChaCha ? { plaintextLength: ct.length } : undefined);
-      decipher.setAuthTag(tag);
-      let out = decipher.update(ct);
-      decipher.final();
-      pt = out; acceptedSeq = cand;
+  for (let ci = 0; ci < 3; ci++) {
+    let cand = ci === 0 ? seq : ci === 1 ? seq - window : seq + window;
+    if (cand < 0) continue;
+    let out = aead.decrypt_sync(getNonceInto(_nonceScratch, keys.iv, cand), ciphertext, aad);
+    if (out !== null) {
+      pt = Buffer.from(out.buffer, out.byteOffset, out.length); acceptedSeq = cand;
       break;
-    } catch (e) {
-      // try next candidate
     }
+    // not this candidate: try the next
   }
 
   if (pt === null) return null;
@@ -1307,15 +1250,25 @@ function decryptEncryptedDtls13(data, keys, fullEpoch, cid, cidRequired) {
     if (!acceptRecordSeq(keys, seq)) return null;
 
     return {
-      // The caller resolves the full epoch (resolveReadEpoch); hdr.epoch is
-      // only its low 2 bits and must never escape this function as an epoch.
-      epoch: (fullEpoch === undefined || fullEpoch === null) ? hdr.epoch : fullEpoch,
+      // The caller resolves the full epoch (resolveReadEpoch); the header
+      // holds only its low 2 bits, which must never escape this function as
+      // an epoch.
+      epoch: (fullEpoch === undefined || fullEpoch === null) ? (first & 0x03) : fullEpoch,
       seq: seq,
       type: inner.type,
       content: inner.content,
-      total_length: off + ctLen,
+      total_length: off + ctLen - start,
     };
   }
+}
+
+// The AAD of the DTLS 1.3 record being sealed or opened, one array per
+// length (1 + CID + 1 or 2 + 0 or 2 bytes: a few hundred at most, and a
+// connection uses one or two): rebuilt for each record and read only during
+// its AEAD calls, so a new array per record was garbage.
+var _aad13 = [];
+function dtls13Aad(len) {
+  return _aad13[len] || (_aad13[len] = new Uint8Array(len));
 }
 
 
@@ -1344,10 +1297,11 @@ function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
     let first = data[off];
 
     if (isUnifiedHdr(first)) {
-      let hdr = parseUnifiedHdr(first);
-      if (hdr.hasCid && cidLen === 0) break;
+      // parseUnifiedHdr's fields, read off the byte: no object per record.
+      let hasCid = (first & 0x10) !== 0, epochBits = first & 0x03;
+      if (hasCid && cidLen === 0) break;
       // Header carries 2 epoch bits; map them back to a real epoch first.
-      let fullEpoch = resolveReadEpoch(hdr.epoch, keysByEpoch);
+      let fullEpoch = resolveReadEpoch(epochBits, keysByEpoch);
       let keys = (fullEpoch === null) ? null : keysByEpoch[fullEpoch];
 
       if (!keys) {
@@ -1361,9 +1315,9 @@ function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
         // Keep the raw bytes and mark the record deferred; the caller retries
         // it after processing each earlier record, once the keys exist. This
         // generalises the CCS-only re-decrypt that DTLS 1.2 already had.
-        let skip = 1 + (hdr.hasCid ? cidLen : 0) + (hdr.seqLen2 ? 2 : 1);
+        let skip = 1 + (hasCid ? cidLen : 0) + ((first & 0x08) ? 2 : 1);
         let total;
-        if (hdr.hasLength && off + skip + 2 <= data.length) {
+        if ((first & 0x04) && off + skip + 2 <= data.length) {
           total = skip + 2 + readU16(data, off + skip);
         } else {
           total = data.length - off;
@@ -1374,8 +1328,8 @@ function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
           // Unresolvable epoch: keep the raw bits so the deferred retry can
           // resolve again once keys for that generation are installed.
           type: null,
-          epoch: hdr.epoch,
-          epochBits: hdr.epoch,
+          epoch: epochBits,
+          epochBits: epochBits,
           seq: null,
           content: null,
           encrypted: false,
@@ -1386,7 +1340,7 @@ function parseDtlsDatagram(data, keysByEpoch, cid, cidRequired) {
         continue;
       }
 
-      let result = decryptEncryptedDtls13(data.subarray(off), keys, fullEpoch, cid, cidRequired);
+      let result = openDtls13At(data, off, keys, fullEpoch, cid, cidRequired);
       if (result) {
         records.push({
           type: result.type,

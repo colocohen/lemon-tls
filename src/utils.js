@@ -1,4 +1,6 @@
-import crypto from 'node:crypto';
+import { x509_info } from './session/cert_info.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { equal_sync } from 'cryptographic-primitives/ct.js';
 
 function concatUint8Arrays(arrays) {
     let totalLength = 0;
@@ -109,19 +111,25 @@ function uint8Equal(a, b) {
  * exploitable as an oracle: Finished verify_data, PSK binders, ticket key_name,
  * and any MAC/tag comparison.
  *
- * Returns false immediately (and safely) on length mismatch — that's public
- * information, not a secret, so short-circuiting there is fine.
- *
- * Note: crypto.timingSafeEqual requires two equal-length Buffers. We wrap the
- * inputs as Buffer views over the same memory (no copy) via byteOffset/length.
+ * False for two lengths that differ (public information, not a secret) and
+ * for a missing array.
  */
 function timingSafeEqualU8(a, b) {
   if (a == null || b == null) return false;
-  if (a.length !== b.length) return false;
-  if (a.length === 0) return true;
-  let ba = Buffer.isBuffer(a) ? a : Buffer.from(a.buffer, a.byteOffset, a.length);
-  let bb = Buffer.isBuffer(b) ? b : Buffer.from(b.buffer, b.byteOffset, b.length);
-  return crypto.timingSafeEqual(ba, bb);
+  return equal_sync(a, b);
+}
+
+/** n random bytes as a Buffer (a view, no copy), where a Buffer is what goes
+ *  out: ticket keys (as node:tls's getTicketKeys gives them), a hex map key. */
+function randomBuffer(n) {
+  let r = random_bytes_sync(n);
+  return Buffer.from(r.buffer, r.byteOffset, r.length);
+}
+
+/** A random unsigned 32-bit integer. */
+function randomUint32() {
+  let r = random_bytes_sync(4);
+  return ((r[0] << 24) | (r[1] << 16) | (r[2] << 8) | r[3]) >>> 0;
 }
 
 
@@ -129,8 +137,9 @@ function timingSafeEqualU8(a, b) {
  * Parse an X509Certificate DN string into the object shape Node's certificate
  * objects use.
  *
- * crypto.X509Certificate gives `subject`/`issuer` as newline-separated
- * "KEY=value" text, but Node documents them on a certificate object as objects
+ * X509Certificate (and x509_info, which writes the same text) gives
+ * `subject`/`issuer` as newline-separated "KEY=value" text, but Node
+ * documents them on a certificate object as objects
  * keyed by RDN type: { C, ST, L, O, OU, CN }. Passing the raw string through
  * meant tls.checkServerIdentity() — which reads cert.subject.CN — could never
  * find a Common Name, so any certificate without a SAN was rejected outright
@@ -173,7 +182,7 @@ function parseDN(dn) {
 function certificateObject(der) {
   if (!der) return null;
   try {
-    let x = new crypto.X509Certificate(der);
+    let x = x509_info(der);
     return {
       subject: parseDN(x.subject),
       issuer: parseDN(x.issuer),
@@ -197,5 +206,7 @@ export {
   arraysEqual,
   uint8Equal,
   timingSafeEqualU8,
+  randomBuffer,
+  randomUint32,
   parseDN
 };

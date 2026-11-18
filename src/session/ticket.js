@@ -15,7 +15,8 @@
  *    user is responsible for secure storage (same convention as Node.js).
  */
 
-import * as crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { aes_gcm_encrypt_sync, aes_gcm_decrypt_sync } from 'cryptographic-primitives/aes.js';
 import { timingSafeEqualU8 } from '../utils.js';
 
 /* =========================================================================
@@ -53,14 +54,12 @@ function encrypt_session_blob(state, ticketKeys) {
     // Serialize state → JSON with Uint8Array fields base64-encoded
     let serialized = Buffer.from(JSON.stringify(serialize_state(state)));
 
-    let iv = crypto.randomBytes(IV_LEN);
-    let cipher = crypto.createCipheriv('aes-256-gcm', aes_key, iv);
-    let ct = cipher.update(serialized);
-    cipher.final();
-    let tag = cipher.getAuthTag();
+    let iv = random_bytes_sync(IV_LEN);
+    let sealed = aes_gcm_encrypt_sync(aes_key, iv, serialized);   // ct || tag
 
-    let out = Buffer.concat([key_name, iv, ct, tag]);
-    return new Uint8Array(out);
+    let out = new Uint8Array(KEY_NAME_LEN + IV_LEN + sealed.length);
+    out.set(key_name, 0); out.set(iv, KEY_NAME_LEN); out.set(sealed, KEY_NAME_LEN + IV_LEN);
+    return out;
 }
 
 /**
@@ -75,10 +74,9 @@ function decrypt_session_blob(blob, ticketKeys) {
         if (!blob || blob.length < KEY_NAME_LEN + IV_LEN + TAG_LEN) return null;
         let buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob);
 
-        let blob_key_name = buf.slice(0, KEY_NAME_LEN);
-        let iv            = buf.slice(KEY_NAME_LEN, KEY_NAME_LEN + IV_LEN);
-        let tag           = buf.slice(buf.length - TAG_LEN);
-        let ct            = buf.slice(KEY_NAME_LEN + IV_LEN, buf.length - TAG_LEN);
+        let blob_key_name = buf.subarray(0, KEY_NAME_LEN);
+        let iv            = buf.subarray(KEY_NAME_LEN, KEY_NAME_LEN + IV_LEN);
+        let sealed        = buf.subarray(KEY_NAME_LEN + IV_LEN);   // ct || tag
 
         let { key_name, aes_key } = split_ticket_keys(ticketKeys);
 
@@ -88,12 +86,10 @@ function decrypt_session_blob(blob, ticketKeys) {
         // still using uint8Equal, which returns on the first differing byte.
         if (!timingSafeEqualU8(blob_key_name, key_name)) return null;
 
-        let decipher = crypto.createDecipheriv('aes-256-gcm', aes_key, iv);
-        decipher.setAuthTag(tag);
-        let pt = decipher.update(ct);
-        decipher.final(); // throws on tag mismatch
+        let pt = aes_gcm_decrypt_sync(aes_key, iv, sealed);
+        if (pt === null) return null;   // tampered, or another key
 
-        let state = deserialize_state(JSON.parse(pt.toString('utf8')));
+        let state = deserialize_state(JSON.parse(new TextDecoder().decode(pt)));
         return state;
     } catch (e) {
         return null;

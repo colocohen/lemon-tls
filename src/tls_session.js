@@ -1,5 +1,6 @@
-import * as crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 import { EventEmitter } from 'node:events';
+import { sha256_sync, sha256_create, sha384_create, sha512_create } from 'cryptographic-primitives/sha2.js';
 
 import {
   TLS_CIPHER_SUITES,
@@ -39,6 +40,8 @@ import {
   uint8Equal,
   timingSafeEqualU8,
   certificateObject,
+  randomBuffer,
+  randomUint32,
 } from './utils.js';
 
 import * as wire from './wire.js';
@@ -46,7 +49,8 @@ import * as wire from './wire.js';
 // Extracted modules
 import { pick_scheme, sign_with_scheme, verify_with_scheme, default_signature_schemes, scheme_name, cert_allows_signing, ec_key_group, scheme_info, scheme_matches_key } from './session/signing.js';
 import createSecureContext from './secure_context.js';
-import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, SERVER_DEFAULT_GROUPS as ECDH_SERVER_DEFAULT_GROUPS, generate_keypair as ecdh_generate_keypair, get_shared_secret as ecdh_get_shared_secret, is_supported_group,
+import { private_key as signing_key } from './session/keys.js';
+import { SUPPORTED_GROUPS as ECDH_SUPPORTED_GROUPS, SERVER_DEFAULT_GROUPS as ECDH_SERVER_DEFAULT_GROUPS, generate_keypair as ecdh_generate_keypair, get_shared_secret as ecdh_get_shared_secret, wipe_private_key as ecdh_wipe_private_key, is_supported_group,
   is_kem_group, kem_server_exchange, group_name as ecdh_group_name
 } from './session/ecdh.js';
 import { build_tls_message, parse_tls_message } from './session/message.js';
@@ -59,6 +63,10 @@ import { getRootCertificates } from './ca_store.js';
 import { prepare_ech_server, server_process_client_hello, backend_client_hello, accept_confirmation, EXT_ECH,
          parse_ech_config_list, prepare_ech_client, client_hpke_setup, client_outer_ext_data, client_encode_inner,
          client_seal_outer, client_hello_ech_ext, grease_ech_state, grease_ech_ext_data, hrr_ech_offset } from './session/ech.js';
+
+// The transcript hash's running context, by the suite's hash name.
+const HASH_CREATE = { sha256: sha256_create, sha384: sha384_create, sha512: sha512_create };
+function sha256_hex(x) { let d = sha256_sync(x); return Buffer.from(d.buffer, d.byteOffset, d.length).toString('hex'); }
 
 // RFC 8446 §4.1.3 downgrade-protection sentinels. A TLS 1.3-capable server that
 // negotiates a lower version stamps one of these into the last 8 bytes of
@@ -117,10 +125,6 @@ function defaultEarlyReplay(id, ttl, cb) {
   cb(null, true);
 }
 const EARLY_REPLAY_TIMEOUT_MS = 100;
-
-// Our certificate's private key, parsed: by the bytes it was parsed from
-// (local_private_key). Gone with them.
-const PRIVATE_KEY_OBJECTS = new WeakMap();
 
 // A certificate from DER (session/x509.js), or null
 function _cert(x) {
@@ -643,7 +647,7 @@ function TLSSession(options){
     transcript: [],
     transcriptHook: null,  // DTLSSession sets this to transform transcript entries
 
-    // Incremental transcript hash — running crypto.Hash object that we update
+    // Incremental transcript hash — a running hash context that we update
     // each time a handshake message is pushed. Replaces the previous pattern of
     // `concatUint8Arrays(transcript)` + `hashFn(...)` on every key-derivation
     // step, which re-hashed and re-allocated the entire transcript each time
@@ -652,7 +656,7 @@ function TLSSession(options){
     // The array `transcript` is still maintained in parallel for cases that
     // need it (HRR rewind, TLS 1.2 EMS snapshot via transcript.length, logging).
     // Only the HASH path uses this incremental object. Reset on HRR.
-    transcriptHash: null,          // crypto.Hash object (lazy init when hashName is known)
+    transcriptHash: null,          // a running hash context (lazy init when hashName is known)
     transcriptHashName: null,      // hash algorithm currently tracked ('sha256' / 'sha384')
 
 
@@ -1286,7 +1290,7 @@ function TLSSession(options){
   function is_grease_u8(v) { return GREASE_U8.indexOf(v) >= 0; }
 
   function pick_from(table) {
-    return table[crypto.randomBytes(4).readUInt32BE(0) % table.length];
+    return table[randomUint32() % table.length];
   }
 
   /**
@@ -1326,7 +1330,7 @@ function TLSSession(options){
     if (!hasGreaseExt) {
       // Body length is deliberately varied: a peer that tolerates an unknown
       // extension only when it is empty is still ossified.
-      let n = crypto.randomBytes(1)[0] % 3;
+      let n = random_bytes_sync(1)[0] % 3;
       extensions.push({ type: pick_from(GREASE_U16), value: new Uint8Array(n) });
     }
 
@@ -1454,7 +1458,7 @@ function TLSSession(options){
     // weaker signal than no shuffle at all.
     let out = list.slice();
     for (let i = out.length - 1; i > 0; i--) {
-      let j = crypto.randomBytes(4).readUInt32BE(0) % (i + 1);
+      let j = randomUint32() % (i + 1);
       let tmp = out[i]; out[i] = out[j]; out[j] = tmp;
     }
 
@@ -1569,7 +1573,7 @@ function TLSSession(options){
   }
 
   /**
-   * The peer's leaf-certificate public key, as a crypto.KeyObject.
+   * The peer's leaf-certificate public key (session/keys.js).
    *
    * Single place that turns remote_cert_chain[0] into a usable key. Both the
    * TLS 1.3 CertificateVerify path and the TLS 1.2 ServerKeyExchange path need
@@ -1894,8 +1898,8 @@ function TLSSession(options){
           echSplit.outerPsk = {
             type: 'PRE_SHARED_KEY',
             value: {
-              identities: [{ identity: new Uint8Array(crypto.randomBytes(po.identity.length)), age: crypto.randomBytes(4).readUInt32BE(0) }],
-              binders: [new Uint8Array(crypto.randomBytes(hashLen))]
+              identities: [{ identity: random_bytes_sync(po.identity.length), age: randomUint32() }],
+              binders: [random_bytes_sync(hashLen)]
             }
           };
         }
@@ -2200,7 +2204,7 @@ function TLSSession(options){
   }
 
   /**
-   * Our certificate's private key as a crypto.KeyObject.
+   * Our certificate's private key (session/keys.js).
    *
    * The DER/pkcs8 encoding of `cert_private_key` is an internal storage
    * detail; four sites repeated the same three-line construction to undo it.
@@ -2212,17 +2216,10 @@ function TLSSession(options){
     return private_key_object(context.cert_private_key);
   }
   function private_key_object(der) {
-    if (!der) return null;
-    // Parsed once per key, not once per handshake: the bytes come from the
-    // secure context (or the SNICallback's), the same array for every
-    // session that uses it, and a KeyObject is immutable. Parsing the PKCS#8
-    // was a few percent of a server's CPU per connection.
-    let keyObj = PRIVATE_KEY_OBJECTS.get(der);
-    if (!keyObj) {
-      keyObj = crypto.createPrivateKey({ key: Buffer.from(der), format: 'der', type: 'pkcs8' });
-      PRIVATE_KEY_OBJECTS.set(der, keyObj);
-    }
-    return keyObj;
+    // keys.private_key reads a PKCS#8 once per array, not once per
+    // handshake: the bytes come from the secure context (or the
+    // SNICallback's), the same array for every session that uses it.
+    return der ? signing_key(der) : null;
   }
 
   /**
@@ -2285,7 +2282,7 @@ function TLSSession(options){
     }
     let secret = derive_client_early_traffic_secret(hashName, context.psk_offered.psk, get_transcript_hash(hashName), label_prefix());
     let candidate = { cipher: pskResult.cipher, alpn: e.alpn, secret: secret, context: e.context || '' };
-    let id = crypto.createHash('sha256').update(pskIdentity.identity).digest('hex');
+    let id = sha256_hex(pskIdentity.identity);
     let ttl = 2 * context.earlyDataMaxAge;
     let store = context.earlyDataReplay || defaultEarlyReplay;
     let sync = true, done = false;
@@ -2642,7 +2639,7 @@ function TLSSession(options){
     let hashName = negotiated_hash();
     let ticket_nonce = new Uint8Array([context.ticket_nonce_counter++]);
     let psk = derive_psk(hashName, context.resumption_master_secret, ticket_nonce, label_prefix());
-    let ticket_age_add = crypto.randomBytes(4).readUInt32BE(0);
+    let ticket_age_add = randomUint32();
     let ticket_lifetime = context.ticketLifetime;
 
     dbg('SRV-NST', 'issuing TLS 1.3 NST — cipher:', '0x' + context.selected_cipher_suite.toString(16),
@@ -2656,7 +2653,7 @@ function TLSSession(options){
 
     // Ensure ticketKeys is 48 bytes (key_name + aes_key)
     if (!context.ticketKeys || context.ticketKeys.length !== 48) {
-      context.ticketKeys = crypto.randomBytes(48);
+      context.ticketKeys = randomBuffer(48);
     }
 
     // Encrypt session state into opaque ticket (unified format: key_name(16) | IV(12) | CT | Tag(16))
@@ -2870,16 +2867,16 @@ function TLSSession(options){
   function get_transcript_hash(hashName) {
 
     if (context.transcriptHash !== null && context.transcriptHashName === hashName) {
-      return new Uint8Array(context.transcriptHash.copy().digest());
+      return context.transcriptHash.copy().digest();
     }
     // Lazy init: create a fresh hash and replay existing transcript into it.
     // After this, pushTranscript() updates the hash incrementally.
-    context.transcriptHash = crypto.createHash(hashName);
+    context.transcriptHash = HASH_CREATE[hashName]();
     context.transcriptHashName = hashName;
     for (let i = 0; i < context.transcript.length; i++) {
       context.transcriptHash.update(context.transcript[i]);
     }
-    return new Uint8Array(context.transcriptHash.copy().digest());
+    return context.transcriptHash.copy().digest();
   }
 
   /**
@@ -2888,7 +2885,7 @@ function TLSSession(options){
    * hash must be restarted to match.
    */
   function reset_transcript_hash(hashName) {
-    context.transcriptHash = crypto.createHash(hashName);
+    context.transcriptHash = HASH_CREATE[hashName]();
     context.transcriptHashName = hashName;
     for (let i = 0; i < context.transcript.length; i++) {
       context.transcriptHash.update(context.transcript[i]);
@@ -5324,7 +5321,15 @@ function TLSSession(options){
       }
 
       //select selected_cipher...
-      if (context.selected_cipher_suite == null && context.local_supported_cipher_suites.length > 0 && context.remote_supported_cipher_suites.length > 0) {
+      // A server's in the pass that picks the version, or after it: the
+      // suite belongs to one version, and the TLS 1.2 resumption below (the
+      // ticket's suite, then the abbreviated handshake) is set up only in the
+      // pass the suite is chosen in. With `ciphers` given, the suite list is
+      // there from the start, before the server is configured and a version
+      // chosen: the suite was picked a pass early, and a TLS 1.2 session
+      // never resumed.
+      if (context.selected_cipher_suite == null && context.local_supported_cipher_suites.length > 0 && context.remote_supported_cipher_suites.length > 0 &&
+          (!context.isServer || pending('selected_version') != null)) {
         
         // If resuming TLS 1.2, force cipher to match stored state (if client still offers it)
         if (context.isServer && context.tls12_resume_state &&
@@ -5838,6 +5843,11 @@ function TLSSession(options){
           } catch (e) {
             fatalAlert(wire.TLS_ALERT.ILLEGAL_PARAMETER, 'Invalid peer key share for group 0x' + context.selected_group.toString(16) + ': ' + e.message);
             return;
+          } finally {
+            // The one shared secret this handshake computes: every ephemeral
+            // key — the share used and any other one sent — is done with.
+            // Their public keys stay (the ServerHello still carries one).
+            for (let g in context.local_key_groups) ecdh_wipe_private_key(context.local_key_groups[g].private_key);
           }
 
         }
@@ -5905,7 +5915,7 @@ function TLSSession(options){
             // bytes, so a retry looks the same either way (§7.1, §10.10.4).
             // Last in the message, so they are its last 8 bytes.
             other_exts: context.ech.status ? [{ type: EXT_ECH, data: context.ech.status === 'accepted'
-              ? new Uint8Array(8) : new Uint8Array(crypto.randomBytes(8)) }] : undefined,
+              ? new Uint8Array(8) : random_bytes_sync(8) }] : undefined,
           });
           let hrr_data = wire.build_message(wire.TLS_MESSAGE_TYPE.SERVER_HELLO, hrr_body);
           if (context.ech.status === 'accepted') {
@@ -5982,7 +5992,7 @@ function TLSSession(options){
         if(can_send_hello==true){
 
           if(context.local_random==null){
-            context.local_random=new Uint8Array(crypto.randomBytes(32));
+            context.local_random=random_bytes_sync(32);
 
             // RFC 8446 §4.1.3: if we support TLS 1.3 but negotiated something
             // lower, stamp the downgrade sentinel into the last 8 bytes of the
@@ -6162,7 +6172,7 @@ function TLSSession(options){
               sid_to_send = new Uint8Array(0);   // nothing would keep it: see sessionIdStore
             } else {
               if (!context.tls12_session_id_for_store) {
-                context.tls12_session_id_for_store = new Uint8Array(crypto.randomBytes(32));
+                context.tls12_session_id_for_store = random_bytes_sync(32);
               }
               sid_to_send = context.tls12_session_id_for_store;
             }
@@ -6800,7 +6810,7 @@ function TLSSession(options){
 
           // Ensure ticketKeys is 48 bytes
           if (!context.ticketKeys || context.ticketKeys.length !== 48) {
-            context.ticketKeys = crypto.randomBytes(48);
+            context.ticketKeys = randomBuffer(48);
           }
 
           // Build session state to encrypt into ticket
@@ -6892,11 +6902,7 @@ function TLSSession(options){
           // (version, scheme, tbs, keyObject). They were being passed a raw
           // DER key and shuffled arguments, so client-certificate auth could
           // never produce a valid signature.
-          let clientKeyObj = crypto.createPrivateKey({
-            key: Buffer.from(certCtx.privateKey),
-            format: 'der',
-            type: 'pkcs8',
-          });
+          let clientKeyObj = private_key_object(certCtx.privateKey);
           let peerSigAlgs = peer_requested_sig_algs();
 
           let scheme = pick_scheme(wire.TLS_VERSION.TLS1_3, clientKeyObj, peerSigAlgs, context.local_supported_signature_algorithms);
@@ -7339,7 +7345,7 @@ function TLSSession(options){
 
           // Ensure ticketKeys is 48 bytes (used to encrypt stored session data)
           if (!context.ticketKeys || context.ticketKeys.length !== 48) {
-            context.ticketKeys = crypto.randomBytes(48);
+            context.ticketKeys = randomBuffer(48);
           }
 
           let stored_blob = encrypt_session_blob({
@@ -7646,11 +7652,11 @@ function TLSSession(options){
   function send_client_hello(){
 
     if(context.local_random==null){
-      context.local_random=new Uint8Array(crypto.randomBytes(32));
+      context.local_random=random_bytes_sync(32);
     }
 
     if(context.local_session_id==null){
-      context.local_session_id=new Uint8Array(crypto.randomBytes(32));
+      context.local_session_id=random_bytes_sync(32);
     }
 
     // TLS 1.3-only mode (QUIC and any client that offers no other version):
@@ -7765,7 +7771,7 @@ function TLSSession(options){
     let echSplit = null;
     if (ech_on()) {
       context.ech.inner_random = context.local_random;
-      context.ech.outer_random = new Uint8Array(crypto.randomBytes(32));
+      context.ech.outer_random = random_bytes_sync(32);
       echSplit = ech_split(extensions);
     }
 
@@ -7854,8 +7860,8 @@ function TLSSession(options){
         echSplit.outerPsk = {
           type: 'PRE_SHARED_KEY',
           value: {
-            identities: [{ identity: new Uint8Array(crypto.randomBytes(sessionData.ticket.length)), age: crypto.randomBytes(4).readUInt32BE(0) }],
-            binders: [new Uint8Array(crypto.randomBytes(hashLen))]
+            identities: [{ identity: random_bytes_sync(sessionData.ticket.length), age: randomUint32() }],
+            binders: [random_bytes_sync(hashLen)]
           }
         };
       }
@@ -7935,7 +7941,7 @@ function TLSSession(options){
         sid = sessionData.session_id;
         context.local_session_id = sid;
       } else if (presentTicket && dtlsTicket && !context.tls12_ticket_blind && (!sid || sid.length === 0)) {
-        sid = new Uint8Array(crypto.randomBytes(32));
+        sid = random_bytes_sync(32);
         context.local_session_id = sid;
       }
 
@@ -8145,7 +8151,7 @@ function TLSSession(options){
    *  by convention rather than to the digest of the empty string. */
   function fp_trunc_sha256(input) {
     if (input === '') return '000000000000';
-    return crypto.createHash('sha256').update(input).digest('hex').substring(0, 12);
+    return sha256_hex(input).substring(0, 12);
   }
 
   /* ----------------------------- the computations ------------------------- */
@@ -8323,7 +8329,7 @@ function TLSSession(options){
       let cInput  = sigList ? (extList + '_' + sigList) : extList;
 
       let groups = fp_no_grease(hello.supported_groups || []).map(fp_hex4).sort().join(',');
-      let d = groups ? crypto.createHash('sha256').update(groups).digest('hex').substring(0, 12) : '';
+      let d = groups ? sha256_hex(groups).substring(0, 12) : '';
 
       return {
         hash: a + '_' + fp_trunc_sha256(cipherList) + '_' + fp_trunc_sha256(cInput) + '_' + d,
@@ -8591,7 +8597,7 @@ function TLSSession(options){
       if (!ctxOrOpts) return;
       let sc = ctxOrOpts;
       if (!sc.certificateChain || !sc.privateKey) {
-        if (!ctxOrOpts.key || !ctxOrOpts.cert) return;
+        if ((!ctxOrOpts.key || !ctxOrOpts.cert) && ctxOrOpts.pfx == null) return;
         sc = createSecureContext(ctxOrOpts);
       }
       if (sc.certificateChain) context.local_cert_chain = sc.certificateChain;

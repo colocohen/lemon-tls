@@ -1,3 +1,4 @@
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import TLSSession from './tls_session.js';
 
 import crypto from 'node:crypto';
@@ -6,7 +7,10 @@ import { Duplex } from 'node:stream';
 import { TLS_CIPHER_SUITES } from './crypto.js';
 import { TLS_CONTENT_TYPE as CT, TLS_ALERT_LEVEL, TLS_ALERT, peer_alert_error, read_peer_alert, MAX_WARNING_ALERTS, MAX_RECORD_PLAINTEXT, local_alert_error, version_name } from './wire.js';
 import { group_name as ecdh_group_name, dh_group_info } from './session/ecdh.js';
-import { certificateObject } from './utils.js';
+import { certificateObject, randomBuffer } from './utils.js';
+import { x509_info } from './session/cert_info.js';
+import createSecureContext from './secure_context.js';
+import * as PEM from 'cryptographic-formats/pem';
 import { versionsInRange, localLists, pskOptions } from './node_options.js';
 
 import {
@@ -76,6 +80,15 @@ function TLSSocket(duplex, options){
   if (!(this instanceof TLSSocket)) return new TLSSocket(duplex, options);
   options = options || {};
 
+  // `pfx` (PKCS#12) without `key` / `cert`: its key and chain, read once
+  // here (createSecureContext), stand for them — a server's certificate or
+  // a client's.
+  if (options.pfx != null && !(options.key && options.cert)) {
+    let sc = createSecureContext({ pfx: options.pfx, passphrase: options.passphrase });
+    options = Object.assign({}, options, { pfx: null, passphrase: undefined, key: sc.privateKey,
+      cert: sc.certificateChain.map(function (c) { return PEM.encode(c.cert, 'CERTIFICATE'); }).join('') });
+  }
+
   // The versions to offer (client) or take (server), newest first — checked
   // here, at construction (node_options.js: one reading for TLS and DTLS).
   const localVersions = versionsInRange(options.minVersion, options.maxVersion, false);
@@ -106,7 +119,7 @@ function TLSSocket(duplex, options){
   });
   const self = this;
 
-    let _ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : crypto.randomBytes(48);
+    let _ticketKeys = options.ticketKeys ? Buffer.from(options.ticketKeys) : randomBuffer(48);
 
     /**
      * Read a credential out of a caller-supplied `secureContext` (Node parity).
@@ -217,8 +230,8 @@ function TLSSocket(duplex, options){
     app_read_aead: null,
 
     // Reusable 12-byte nonce scratch buffers — one per direction. Populated
-    // in-place per record from (iv XOR seq) and handed to createCipheriv which
-    // copies it into OpenSSL state. Saves 12-byte allocation per record —
+    // in-place per record from (iv XOR seq); the AEAD reads it only during
+    // the call. Saves 12-byte allocation per record —
     // ~7.7KB per 10MB transfer, less GC pressure.
     _nonceEncScratch: new Uint8Array(12),
     _nonceDecScratch: new Uint8Array(12),
@@ -1617,7 +1630,8 @@ function TLSSocket(duplex, options){
         if (!context.isServer && context.pins && context.pins.length > 0) {
             let chain = session.getPeerCertificate();
             let leaf = chain && chain.length > 0 ? chain[0].cert : null;
-            let hash = leaf ? 'sha256/' + crypto.createHash('sha256').update(leaf).digest('base64') : null;
+            let digest = leaf ? sha256_sync(leaf) : null;
+            let hash = digest ? 'sha256/' + Buffer.from(digest.buffer, digest.byteOffset, digest.length).toString('base64') : null;
             if (hash === null || !context.pins.includes(hash)) {
                 abort(TLS_ALERT.BAD_CERTIFICATE, 'Certificate pin mismatch: ' + (hash || 'no peer certificate'), 'ERR_TLS_CERT_PIN_MISMATCH');
                 return;
@@ -2250,7 +2264,7 @@ function TLSSocket(duplex, options){
         if (!localChain || localChain.length === 0) return {};
         try {
             let der = localChain[0].cert || localChain[0];
-            let x509 = new crypto.X509Certificate(der);
+            let x509 = x509_info(der);
             return {
                 subject: x509.subject,
                 issuer: x509.issuer,
